@@ -1,0 +1,38 @@
+# ── Python ──────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+build/
+dist/
+*.spec.bak
+
+# ── 設定ファイル（パスワード含むため除外） ──────────────────
+manga_server_config.json
+
+# ── サムネイルキャッシュ（大量ファイル） ────────────────────
+cache/
+
+# ── Flutter / Dart ───────────────────────────────────────
+comicserver_app/.dart_tool/
+comicserver_app/.flutter-plugins
+comicserver_app/.flutter-plugins-dependencies
+comicserver_app/.metadata
+comicserver_app/build/
+comicserver_app/android/.gradle/
+comicserver_app/android/local.properties
+comicserver_app/android/key.properties
+comicserver_app/ios/.symlinks/
+comicserver_app/ios/Pods/
+comicserver_app/ios/Flutter/Flutter.framework
+comicserver_app/ios/Flutter/Flutter.podspec
+comicserver_app/pubspec.lock
+comicserver_app/**/*.g.dart
+comicserver_app/**/*.freezed.dart
+
+# ── PyInstaller ──────────────────────────────────────────
+comicserver_app/__pycache__/
+*.egg-info/
+
+# ── Windows ──────────────────────────────────────────────
+Thumbs.db
+desktop.ini

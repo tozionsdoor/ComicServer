@@ -1,0 +1,1191 @@
+"""
+manga_server_app.py - 自炊ファイル配信サーバー（GUI版）
+ZIP / RAR / CBZ / PDF をスキャンして FastAPI + uvicorn で配信する
+Android クライアントから Basic 認証で接続して閲覧できる
+"""
+import sys
+sys.path.insert(0, r"C:\keiri_python\python_embed\Lib\site-packages")
+
+import asyncio
+import hashlib
+import io
+import json
+import logging
+import queue
+import re
+import socket
+import threading
+import zipfile
+from pathlib import Path
+
+import rarfile
+import pymupdf
+from PIL import Image
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+
+from fastapi import FastAPI, HTTPException, Depends
+from fastapi.responses import Response, HTMLResponse
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
+import secrets
+import uvicorn
+
+# ─── 定数 ────────────────────────────────────────────────────────────────────
+UNRAR_PATH      = r"C:\Program Files\WinRAR\UnRAR.exe"
+UNRAR_AVAILABLE = Path(UNRAR_PATH).exists()
+if UNRAR_AVAILABLE:
+    rarfile.UNRAR_TOOL = UNRAR_PATH
+
+IMAGE_EXT    = {'.jpg', '.jpeg', '.png', '.webp', '.bmp', '.gif'}
+ARCHIVE_EXT  = {'.zip', '.rar', '.cbz', '.cbr', '.pdf'}
+COVER_W, COVER_H = 200, 280
+PAGE_MAX     = 1800   # 長辺の最大ピクセル（スマホ向けリサイズ）
+
+CONFIG_PATH = Path(__file__).parent / "manga_server_config.json"
+CACHE_DIR   = Path.home() / ".manga_server" / "cache"  # ローカルに保存（NAS越しI/O回避）
+
+DEFAULT_CONFIG: dict = {
+    "scan_dirs": [],
+    "username":  "admin",
+    "password":  "comicafe",
+    "port":      8765,
+    "host":      "0.0.0.0",
+}
+
+# ─── グローバル状態（GUI ↔ API 共有） ─────────────────────────────────────────
+_books: dict[str, dict] = {}    # book_id -> {path, title, folder, pages}
+_preloading: bool       = False # キャッシュ生成スレッドが走っているか
+_config: dict           = {}
+_log_queue: queue.Queue = queue.Queue()
+
+# ─── ユーティリティ ────────────────────────────────────────────────────────────
+def load_config() -> dict:
+    if CONFIG_PATH.exists():
+        cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        for k, v in DEFAULT_CONFIG.items():
+            cfg.setdefault(k, v)
+        return cfg
+    return DEFAULT_CONFIG.copy()
+
+def save_config(cfg: dict) -> None:
+    CONFIG_PATH.write_text(
+        json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+def natural_key(s: str) -> list:
+    """'第99巻' → ['第', 99, '巻'] のように数字を整数化して自然順ソートに使う"""
+    return [int(c) if c.isdigit() else c.lower()
+            for c in re.split(r'(\d+)', s)]
+
+def book_id(path: Path) -> str:
+    return hashlib.md5(str(path).encode("utf-8")).hexdigest()[:12]
+
+def open_archive(path: Path):
+    if path.suffix.lower() in ('.rar', '.cbr'):
+        if not UNRAR_AVAILABLE:
+            raise RuntimeError(
+                "RAR ファイルの読み込みには WinRAR が必要です。\n"
+                f"インストールされていないか、場所が異なります: {UNRAR_PATH}"
+            )
+        return rarfile.RarFile(path, 'r')
+    return zipfile.ZipFile(path, 'r')
+
+def get_page_list(path: Path) -> list[str]:
+    """アーカイブ内の画像ファイル名（またはPDFページ番号）一覧を返す"""
+    if path.suffix.lower() == '.pdf':
+        doc = pymupdf.open(str(path))
+        return [str(i) for i in range(len(doc))]
+    with open_archive(path) as af:
+        return sorted(f for f in af.namelist()
+                      if Path(f).suffix.lower() in IMAGE_EXT)
+
+def read_raw_image(path: Path, page_id: str) -> bytes:
+    """指定ページの画像データを bytes で返す"""
+    if path.suffix.lower() == '.pdf':
+        doc = pymupdf.open(str(path))
+        pix = doc[int(page_id)].get_pixmap(matrix=pymupdf.Matrix(2, 2))
+        return pix.tobytes("jpeg")
+    with open_archive(path) as af:
+        with af.open(page_id) as f:
+            return f.read()
+
+def resize_jpeg(data: bytes, max_side: int = PAGE_MAX, quality: int = 85) -> bytes:
+    img = Image.open(io.BytesIO(data)).convert("RGB")
+    w, h = img.size
+    if max(w, h) > max_side:
+        r = max_side / max(w, h)
+        img = img.resize((int(w * r), int(h * r)), Image.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, "JPEG", quality=quality)
+    return buf.getvalue()
+
+def scan_books(dirs: list[str]) -> int:
+    global _books
+    _books = {}
+    scan_roots = [Path(d) for d in dirs if Path(d).exists()]
+    for root in scan_roots:
+        for f in sorted(root.rglob("*"), key=lambda p: [natural_key(x) for x in p.parts]):
+            if f.suffix.lower() in ARCHIVE_EXT:
+                bid = book_id(f)
+                # スキャンルートからの相対フォルダパス（"." / "作品A" / "ジャンル1/作品A"）
+                rel = f.relative_to(root).parent.as_posix()
+                _books[bid] = {"path": f, "title": f.stem, "rel": rel}
+    return len(_books)
+
+def _preload_covers_bg(book_ids: list[str]) -> None:
+    """全表紙をディスクにキャッシュ保存。既存ファイルはスキップして途中再開できる。"""
+    global _preloading
+    total = len(book_ids)
+    # ディレクトリを一括スキャンして set を作る（ファイルごとの exists() × N を避ける）
+    cached_ids = {p.stem for p in CACHE_DIR.glob("*.jpg")} if CACHE_DIR.exists() else set()
+    uncached   = [bid for bid in book_ids if bid not in cached_ids]
+    skipped    = total - len(uncached)
+    if skipped:
+        _log_queue.put(f"[キャッシュ] {skipped} 冊はキャッシュ済み（スキップ）")
+    done = skipped
+    try:
+        for bid in uncached:
+            info = _books.get(bid)
+            if not info:
+                done += 1
+                continue
+            try:
+                if "pages" not in info:
+                    info["pages"] = get_page_list(info["path"])
+                if info["pages"]:
+                    data = read_raw_image(info["path"], info["pages"][0])
+                    img  = Image.open(io.BytesIO(data)).convert("RGB")
+                    img.thumbnail((COVER_W, COVER_H), Image.LANCZOS)
+                    buf  = io.BytesIO()
+                    img.save(buf, "JPEG", quality=80)
+                    _cover_put(bid, buf.getvalue())
+            except Exception:
+                pass
+            done += 1
+            if done % 100 == 0 or done == total:
+                _log_queue.put(f"[キャッシュ] {done}/{total} 冊完了")
+        _log_queue.put(f"[キャッシュ] 完了 ({CACHE_DIR})")
+    finally:
+        _preloading = False
+
+def start_preload() -> None:
+    global _preloading
+    if _preloading:
+        _log_queue.put("[キャッシュ] 生成は既に実行中です（スキップ）")
+        return
+    _preloading = True
+    threading.Thread(
+        target=_preload_covers_bg, args=(list(_books.keys()),), daemon=True
+    ).start()
+
+def _cover_path(bid: str) -> Path:
+    return CACHE_DIR / f"{bid}.jpg"
+
+def _cover_get(bid: str) -> bytes | None:
+    p = _cover_path(bid)
+    return p.read_bytes() if p.exists() else None
+
+def _cover_put(bid: str, data: bytes) -> None:
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    _cover_path(bid).write_bytes(data)
+
+def _placeholder_jpeg() -> bytes:
+    """表紙取得失敗時に返すグレーのダミー画像"""
+    img = Image.new("RGB", (COVER_W, COVER_H), color=(49, 50, 68))
+    buf = io.BytesIO()
+    img.save(buf, "JPEG", quality=70)
+    return buf.getvalue()
+
+_cover_errors: set[str] = set()  # 同じエラーを1回だけログに出すため
+
+def get_local_ip() -> str:
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    finally:
+        s.close()
+
+# ─── FastAPI アプリ ────────────────────────────────────────────────────────────
+api       = FastAPI(title="MangaServer", docs_url=None, redoc_url=None)
+_security = HTTPBasic()
+
+def _check_auth(cred: HTTPBasicCredentials = Depends(_security)) -> str:
+    ok = (
+        secrets.compare_digest(cred.username, _config.get("username", "admin")) and
+        secrets.compare_digest(cred.password, _config.get("password", "comicafe"))
+    )
+    if not ok:
+        raise HTTPException(
+            status_code=401, detail="Unauthorized",
+            headers={"WWW-Authenticate": "Basic"}
+        )
+    return cred.username
+
+@api.get("/")
+def root(_: str = Depends(_check_auth)):
+    return HTMLResponse("""<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MangaServer</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#1e1e2e;color:#cdd6f4;font-family:'Yu Gothic UI',sans-serif}
+header{background:#181825;padding:10px 14px;display:flex;align-items:center;gap:10px;position:sticky;top:0;z-index:10;box-shadow:0 2px 8px #00000055;flex-wrap:wrap}
+#logo{font-size:1.1em;color:#89b4fa;cursor:pointer;font-weight:bold;white-space:nowrap}
+#logo:hover{color:#cba6f7}
+#bread{font-size:12px;color:#a6adc8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1;min-width:0}
+#bread button{background:#313244;border:none;color:#89b4fa;padding:2px 8px;border-radius:4px;cursor:pointer;font-size:12px;margin:0 2px}
+#bread button:hover{background:#45475a}
+#bread span.cur{color:#cdd6f4}
+#search{width:200px;background:#313244;border:none;color:#cdd6f4;padding:6px 12px;border-radius:6px;font-size:13px;outline:none}
+#search::placeholder{color:#585b70}
+#cnt{color:#a6adc8;font-size:12px;white-space:nowrap}
+#shelf{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:10px;padding:12px;align-items:start}
+.fc{background:#181825;border-radius:10px;padding:8px;cursor:pointer;transition:transform .15s,box-shadow .15s}
+.fc:hover{transform:scale(1.04);box-shadow:0 4px 16px #00000077}
+.pv{display:grid;grid-template-columns:1fr 1fr;gap:2px;border-radius:6px;overflow:hidden;aspect-ratio:4/3;background:#313244}
+.pv img{width:100%;height:100%;object-fit:cover;display:block}
+.pv.c1{grid-template-columns:1fr}
+.fn{font-size:12px;margin-top:6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.fct{font-size:10px;color:#585b70;margin-top:2px}
+.bc{background:#181825;border-radius:8px;overflow:hidden;transition:transform .15s;cursor:pointer}
+.bc:hover{transform:scale(1.05)}
+.cv{width:100%;aspect-ratio:5/7;object-fit:cover;display:block;background:#313244}
+.tt{padding:4px 6px;font-size:10px;color:#a6adc8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#msg{text-align:center;padding:60px;color:#585b70}
+/* ── リーダー ── */
+#reader{display:none;position:fixed;inset:0;background:#000;z-index:200;align-items:center;justify-content:center;overflow:hidden}
+#rpa{overflow:hidden;width:100%;height:100%;position:relative}
+#rpt{display:flex;width:300vw;height:100%;transform:translateX(-100vw);will-change:transform;touch-action:pan-y}
+.rps{width:100vw;flex:0 0 100vw;display:flex;align-items:center;justify-content:center}
+.rp{max-height:100vh;object-fit:contain;user-select:none}
+.rp.single{max-width:100vw}
+.rp.spread{max-width:50vw}
+#rzl{position:absolute;left:0;top:0;width:30%;height:80%;cursor:pointer;z-index:1}
+#rzc{position:absolute;left:30%;top:10%;width:40%;height:80%;cursor:default;z-index:1}
+#rzr{position:absolute;right:0;top:0;width:30%;height:80%;cursor:pointer;z-index:1}
+#rui-top{display:none;position:absolute;top:0;left:0;right:0;height:20%;background:linear-gradient(#000c,transparent);align-items:center;gap:8px;padding:12px 16px;z-index:2}
+#rui-bot{display:none;position:absolute;bottom:0;left:0;right:0;background:linear-gradient(transparent,#000d);flex-direction:column;align-items:center;padding:6px 0 10px;gap:6px;z-index:2}
+.rbtn{background:rgba(30,30,46,.9);border:1px solid #45475a;color:#cdd6f4;padding:5px 12px;border-radius:6px;cursor:pointer;font-size:12px;white-space:nowrap}
+.rbtn:hover{background:rgba(255,255,255,.12)}
+.rbtn.on{border-color:#89b4fa;color:#89b4fa}
+#rtitle-d{flex:1;color:#cdd6f4;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
+#rpager-d{color:#a6adc8;font-size:12px;white-space:nowrap}
+#rslider{flex:1;accent-color:#89b4fa;min-width:0}
+/* フィルムストリップ */
+#rfilm-wrap{width:100%;overflow-x:auto;scroll-behavior:smooth}
+#rfilm-wrap::-webkit-scrollbar{height:4px}
+#rfilm-wrap::-webkit-scrollbar-thumb{background:#45475a;border-radius:2px}
+#rfilm{display:flex;gap:4px;padding:6px 14px;align-items:flex-end;min-height:222px}
+.rft{flex:0 0 144px;cursor:pointer;border:2px solid transparent;border-radius:4px;overflow:hidden;background:#313244;transition:border-color .1s}
+.rft img{width:144px;height:198px;object-fit:cover;display:block}
+.rft.cur{border-color:#89b4fa}
+.rft:hover{border-color:#585b70}
+</style>
+</head>
+<body>
+<header>
+  <span id="logo" onclick="go('')">MangaServer</span>
+  <span id="bread"></span>
+  <input id="search" type="text" placeholder="タイトル検索..." oninput="doSearch()">
+  <span id="cnt"></span>
+</header>
+<div id="msg">読み込み中...<br><small id="dbg" style="color:#585b70;font-size:11px"></small></div>
+<div id="shelf"></div>
+
+<div id="reader">
+  <div id="rpa">
+    <div id="rpt">
+      <div class="rps" id="rsp"><img class="rp" alt=""><img class="rp" alt=""></div>
+      <div class="rps" id="rsc"><img class="rp" alt=""><img class="rp" alt=""></div>
+      <div class="rps" id="rsn"><img class="rp" alt=""><img class="rp" alt=""></div>
+    </div>
+  </div>
+  <div id="rzl" onclick="rLeftClick()"></div>
+  <div id="rzc" onclick="rToggleUI()"></div>
+  <div id="rzr" onclick="rRightClick()"></div>
+  <div id="rui-top">
+    <button class="rbtn" onclick="rClose()">← 本棚</button>
+    <span id="rtitle-d"></span>
+    <button class="rbtn on" id="rbtn-dir" onclick="rToggleDir()">RTL ←</button>
+    <button class="rbtn" id="rbtn-spr" onclick="rToggleSpread()">単ページ</button>
+    <button class="rbtn" id="rbtn-fs" onclick="rToggleFS()">⛶ 全画面</button>
+    <button class="rbtn" onclick="rHideUI()" style="margin-left:auto">✕</button>
+  </div>
+  <div id="rui-bot">
+    <div id="rfilm-wrap"><div id="rfilm"></div></div>
+    <div style="display:flex;align-items:center;gap:10px;width:96%;max-width:1200px">
+      <input id="rslider" type="range" min="0" value="0"
+             oninput="rSeekInput(this.value)" onchange="rSeekChange(this.value)">
+      <span id="rpager-d"></span>
+    </div>
+  </div>
+</div>
+<script>
+const dbg=s=>{document.getElementById('dbg').textContent=s;};
+let allBooks=[], curPath='', searching=false;
+const x=s=>s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+
+// パスへ遷移
+async function go(path){
+  if(!_skipPush) history.pushState({v:'f', path}, '');
+  if(searching){document.getElementById('search').value='';searching=false;}
+  curPath=path;
+  document.getElementById('cnt').textContent='読み込み中...';
+  updateBread(path);
+  dbg('fetch開始...');
+  try{
+    const r=await fetch('/api/folders?path='+encodeURIComponent(path));
+    dbg('HTTP '+r.status);
+    if(!r.ok){
+      document.getElementById('msg').textContent='APIエラー: HTTP '+r.status;
+      return;
+    }
+    const d=await r.json();
+    dbg('JSON受信 folders='+JSON.stringify(d.folders?.length));
+    if(!Array.isArray(d.folders)){
+      document.getElementById('msg').textContent='レスポンス異常: '+JSON.stringify(d).slice(0,200);
+      return;
+    }
+    render(d.folders, d.books||[]);
+  }catch(e){
+    document.getElementById('msg').textContent='接続エラー: '+e;
+    dbg('catch: '+e);
+  }
+}
+
+function render(folders, books){
+  document.getElementById('msg').style.display='none';
+  const fc=folders.map(f=>{
+    const cls='c'+Math.min(f.ids.length,4);
+    const imgs=f.ids.slice(0,4).map(id=>`<img src="/api/books/${x(id)}/cover" loading="lazy">`).join('');
+    return `<div class="fc" data-path="${x(f.path)}" onclick="go(this.dataset.path)">
+      <div class="pv ${cls}">${imgs}</div>
+      <div class="fn">${x(f.name)}</div>
+      <div class="fct">${f.count} 冊</div></div>`;
+  }).join('');
+  const bc=books.map(b=>
+    `<div class="bc" title="${x(b.title)}" data-id="${x(b.id)}" data-title="${x(b.title)}" onclick="rOpen(this.dataset.id,this.dataset.title)">
+      <img class="cv" src="/api/books/${x(b.id)}/cover" loading="lazy">
+      <div class="tt">${x(b.title)}</div></div>`
+  ).join('');
+  document.getElementById('shelf').innerHTML=fc+bc;
+  document.getElementById('cnt').textContent=
+    (folders.length?folders.length+' フォルダ':'')+(folders.length&&books.length?' / ':'')+
+    (books.length?books.length+' 冊':'');
+}
+
+function updateBread(path){
+  if(!path){document.getElementById('bread').innerHTML='';return;}
+  const parts=path.split('/');
+  let html='<button data-path="" onclick="go(this.dataset.path)">⌂ 本棚</button>';
+  let acc='';
+  parts.forEach((p,i)=>{
+    acc=acc?acc+'/'+p:p;
+    html+=' / '+(i<parts.length-1
+      ?`<button data-path="${x(acc)}" onclick="go(this.dataset.path)">${x(p)}</button>`
+      :`<span class="cur">${x(p)}</span>`);
+  });
+  document.getElementById('bread').innerHTML=html;
+}
+
+// 全タイトル検索
+function doSearch(){
+  const q=document.getElementById('search').value.trim().toLowerCase();
+  if(!q){searching=false;go(curPath);return;}
+  searching=true;
+  document.getElementById('bread').innerHTML='<span style="color:#585b70">検索結果</span>';
+  const hit=allBooks.filter(b=>b.title.toLowerCase().includes(q));
+  document.getElementById('cnt').textContent=hit.length+' 冊';
+  document.getElementById('msg').style.display='none';
+  document.getElementById('shelf').innerHTML=hit.map(b=>
+    `<div class="bc" title="${x(b.title)}">
+      <img class="cv" src="/api/books/${x(b.id)}/cover" loading="lazy">
+      <div class="tt">${x(b.title)}</div></div>`
+  ).join('');
+}
+
+// ── リーダー ────────────────────────────────────────────
+let rId='', rPage=0, rTotal=0;
+let rRtl=true, rSpread=false, rUiOn=false, rIsOpen=false;
+let _skipPush=false; // popstate 経由のナビゲーション中は履歴を積まない
+let rThumbTimer=null, rObs=null;
+
+// ── スロット管理 ─────────────────────────────────────────
+function rSetSlot(slotId,n){
+  const slot=document.getElementById(slotId);
+  const [ia,ib]=slot.querySelectorAll('img');
+  if(n<0||n>=rTotal||!rId){
+    ia.src='';ib.src='';ia.style.display='none';ib.style.display='';return;
+  }
+  ib.style.display='';
+  ib.src='/api/books/'+rId+'/pages/'+n;
+  if(rSpread&&n+1<rTotal){
+    ia.style.display='';
+    ia.src='/api/books/'+rId+'/pages/'+(n+1);
+    ib.className='rp spread'; ia.className='rp spread';
+    ib.style.order=rRtl?'2':'1'; ia.style.order=rRtl?'1':'2';
+  } else {
+    ia.src='';ia.style.display='none';
+    ib.className='rp single'; ib.style.order='1';
+  }
+}
+function rUpdateSlots(){
+  // RTL: 次ページは左側から来るのでleftスロットに入れる
+  // LTR: 次ページは右側から来るのでrightスロットに入れる
+  rSetSlot('rsp', rRtl ? rPage+rStep() : rPage-rStep());
+  rSetSlot('rsc', rPage);
+  rSetSlot('rsn', rRtl ? rPage-rStep() : rPage+rStep());
+}
+
+// ── トラック操作 ──────────────────────────────────────────
+function rPtSet(dx,animate){
+  const t=document.getElementById('rpt');
+  t.style.transition=animate?'transform 0.25s ease-out':'none';
+  t.style.transform='translateX(calc(-100vw + '+dx+'px))';
+}
+
+async function rOpen(id,title){
+  if(!_skipPush) history.pushState({v:'r', id, title}, '');
+  rId=id; rPage=0; rTotal=0;
+  document.getElementById('rtitle-d').textContent=title;
+  rIsOpen=true;
+  document.getElementById('reader').style.display='flex';
+  document.body.style.overflow='hidden';
+  rPtSet(0,false);
+  rHideUI();
+  const info=await fetch('/api/books/'+id+'/info').then(r=>r.json());
+  rTotal=info.count;
+  document.getElementById('rslider').max=rTotal-1;
+  rBuildFilm();
+  rLoad(0);
+}
+
+function rCloseUI(){
+  // UIだけ閉じる（履歴操作なし）
+  rIsOpen=false;
+  document.getElementById('reader').style.display='none';
+  document.body.style.overflow='';
+  ['rsp','rsc','rsn'].forEach(id=>{
+    document.getElementById(id).querySelectorAll('img').forEach(i=>{i.src='';});
+  });
+  rPtSet(0,false);
+  rHideUI();
+}
+function rClose(){
+  // ボタン・Esc からの明示的な閉じる → 履歴を戻す
+  history.back();
+}
+
+function rStep(){ return rSpread?2:1; }
+
+function rLoad(n){
+  if(rTotal===0) return;
+  n=Math.max(0,Math.min(n,rTotal-1));
+  rPage=n;
+  rUpdateSlots();
+  const label=(n+1)+(rSpread&&n+1<rTotal?'-'+(n+2):'')+' / '+rTotal;
+  document.getElementById('rslider').value=n;
+  document.getElementById('rpager-d').textContent=label;
+  rFilmHL(n);
+}
+
+// 読む方向に応じたクリック
+function rLeftClick(){  rLoad(rPage+(rRtl?+rStep():-rStep())); }
+function rRightClick(){ rLoad(rPage+(rRtl?-rStep():+rStep())); }
+
+// 切り替え
+function rToggleDir(){
+  rRtl=!rRtl;
+  const b=document.getElementById('rbtn-dir');
+  b.textContent=rRtl?'RTL ←':'LTR →';
+  b.classList.toggle('on',rRtl);
+  rUpdateSlots();
+  rApplyRtlLayout();
+  rFilmHL(rPage);
+}
+
+function rToggleSpread(){
+  rSpread=!rSpread;
+  const b=document.getElementById('rbtn-spr');
+  b.textContent=rSpread?'見開き':'単ページ';
+  b.classList.toggle('on',rSpread);
+  rLoad(rPage);
+}
+
+function rApplyMode(){ rUpdateSlots(); }
+
+// フィルム・スライダーの向き適用
+function rApplyRtlLayout(){
+  // dir="rtl" だけで flex items が右始まりになる。row-reverse と併用すると打ち消し合うので使わない
+  const wrap=document.getElementById('rfilm-wrap');
+  const slider=document.getElementById('rslider');
+  wrap.dir   = rRtl ? 'rtl' : 'ltr';
+  slider.dir = rRtl ? 'rtl' : 'ltr';
+}
+
+// フィルムストリップ
+function rBuildFilm(){
+  if(rObs){rObs.disconnect();rObs=null;}
+  const film=document.getElementById('rfilm');
+  film.innerHTML='';
+  const wrap=document.getElementById('rfilm-wrap');
+  for(let i=0;i<rTotal;i++){
+    const d=document.createElement('div');
+    d.className='rft'; d.dataset.page=i;
+    const pg=i; d.onclick=()=>rLoad(pg);
+    const img=document.createElement('img');
+    img.alt=''; img.dataset.src='/api/books/'+rId+'/pages/'+i;
+    d.appendChild(img); film.appendChild(d);
+  }
+  rApplyRtlLayout();
+  rObs=new IntersectionObserver(entries=>{
+    entries.forEach(e=>{
+      if(e.isIntersecting){
+        const img=e.target.querySelector('img');
+        if(img&&img.dataset.src){img.src=img.dataset.src;delete img.dataset.src;}
+      }
+    });
+  },{root:wrap,rootMargin:'0px 400px'});
+  film.querySelectorAll('.rft').forEach(d=>rObs.observe(d));
+}
+
+function rFilmHL(n){
+  const film=document.getElementById('rfilm');
+  film.querySelectorAll('.rft.cur').forEach(d=>d.classList.remove('cur'));
+  const cur=film.querySelector('[data-page="'+n+'"]');
+  if(cur){cur.classList.add('cur');cur.scrollIntoView({inline:'center',block:'nearest',behavior:'smooth'});}
+}
+
+// UI 表示/非表示（中央クリックのみ、自動消去なし）
+function rShowUI(){
+  rUiOn=true;
+  document.getElementById('rui-top').style.display='flex';
+  document.getElementById('rui-bot').style.display='flex';
+}
+function rHideUI(){
+  rUiOn=false;
+  document.getElementById('rui-top').style.display='none';
+  document.getElementById('rui-bot').style.display='none';
+}
+function rToggleUI(){ rUiOn?rHideUI():rShowUI(); }
+
+// スライダー（ドラッグ中はページ番号更新、離したらジャンプ）
+function rSeekInput(v){
+  const n=parseInt(v);
+  document.getElementById('rpager-d').textContent=(n+1)+' / '+rTotal;
+  rFilmHL(n);
+}
+function rSeekChange(v){ rLoad(parseInt(v)); }
+
+// マウスホイール（リーダー表示中のみ）
+document.addEventListener('wheel',e=>{
+  if(!rIsOpen) return;
+  e.preventDefault();
+  rLoad(rPage+(e.deltaY>0?+rStep():-rStep()));
+},{passive:false});
+
+// ミドルクリック → 見開き切り替え
+document.addEventListener('mousedown',e=>{
+  if(!rIsOpen) return;
+  if(e.button===1){e.preventDefault();rToggleSpread();}
+});
+
+// ── スムーズスワイプ（カルーセル） ───────────────────────────
+let rDragX=null, rDragY=null, rDragging=false;
+const rdr=document.getElementById('reader');
+rdr.addEventListener('touchstart',e=>{
+  if(e.target.closest('#rui-top,#rui-bot')) return;
+  rDragX=e.touches[0].clientX;
+  rDragY=e.touches[0].clientY;
+  rDragging=false;
+  rPtSet(0,false);
+},{passive:true});
+rdr.addEventListener('touchmove',e=>{
+  if(rDragX===null) return;
+  const dx=e.touches[0].clientX-rDragX;
+  const dy=e.touches[0].clientY-rDragY;
+  if(!rDragging){
+    if(Math.abs(dx)<8&&Math.abs(dy)<8) return;
+    if(Math.abs(dy)>=Math.abs(dx)){rDragX=null;return;}
+    rDragging=true;
+  }
+  e.preventDefault();
+  rPtSet(dx,false);
+},{passive:false});
+rdr.addEventListener('touchend',e=>{
+  if(rDragX===null) return;
+  const dx=e.changedTouches[0].clientX-rDragX;
+  const wasDrag=rDragging;
+  rDragX=null; rDragging=false;
+  if(!wasDrag) return;
+  const W=window.innerWidth;
+  // RTL: 右スワイプ(dx>0)=次ページ  LTR: 左スワイプ(dx<0)=次ページ
+  const advance = rRtl ? (dx>0) : (dx<0);
+  const target  = rPage + (advance ? rStep() : -rStep());
+  if(Math.abs(dx)>W*0.4&&target>=0&&target<rTotal){
+    // advance===rRtl のとき +W(右へスライド=左スロット表示)、それ以外は -W
+    rPtSet((advance===rRtl)?W:-W, true);
+    document.getElementById('rpt').addEventListener('transitionend',()=>{
+      rLoad(target);
+      rPtSet(0,false);
+    },{once:true});
+  } else {
+    rPtSet(0,true);
+  }
+},{passive:true});
+
+// 全画面
+function rToggleFS(){
+  const el=document.documentElement;
+  const isFs=document.fullscreenElement||document.webkitFullscreenElement;
+  if(!isFs){
+    const fn=el.requestFullscreen||el.webkitRequestFullscreen;
+    if(fn) fn.call(el);
+  } else {
+    const fn=document.exitFullscreen||document.webkitExitFullscreen;
+    if(fn) fn.call(document);
+  }
+}
+document.addEventListener('fullscreenchange',()=>{
+  const b=document.getElementById('rbtn-fs');
+  if(b) b.textContent=document.fullscreenElement?'⛶ 縮小':'⛶ 全画面';
+});
+document.addEventListener('webkitfullscreenchange',()=>{
+  const b=document.getElementById('rbtn-fs');
+  if(b) b.textContent=document.webkitFullscreenElement?'⛶ 縮小':'⛶ 全画面';
+});
+
+// キーボード
+document.addEventListener('keydown',e=>{
+  if(!rIsOpen) return;
+  if(e.key==='ArrowRight') rLoad(rPage+(rRtl?-rStep():+rStep()));
+  else if(e.key==='ArrowLeft')  rLoad(rPage+(rRtl?+rStep():-rStep()));
+  else if(e.key==='ArrowDown')  rLoad(rPage+rStep());
+  else if(e.key==='ArrowUp')    rLoad(rPage-rStep());
+  else if(e.key==='Escape') rClose();
+});
+
+// 戻るボタン対応
+window.addEventListener('popstate', e=>{
+  const st=e.state;
+  _skipPush=true;
+  if(rIsOpen) rCloseUI();
+  if(!st||st.v==='f') go(st?.path??'');
+  else if(st.v==='r') rOpen(st.id, st.title);
+  setTimeout(()=>{_skipPush=false;},0);
+});
+
+async function init(){
+  dbg('JS起動');
+  try{
+    // 初回は replaceState（初期状態として記録。pushState しない）
+    history.replaceState({v:'f', path:''}, '');
+    _skipPush=true;
+    await go('');
+    _skipPush=false;
+    fetch('/api/books').then(r=>r.json()).then(d=>{allBooks=d;});
+  }catch(e){document.getElementById('msg').textContent='初期化エラー: '+e;}
+}
+init();
+</script>
+</body>
+</html>""", headers={"Cache-Control": "no-store"})
+
+@api.get("/api/status")
+def status(_: str = Depends(_check_auth)):
+    return {
+        "books": len(_books),
+        "unrar": UNRAR_AVAILABLE,
+        "version": "1.0",
+    }
+
+@api.get("/api/books")
+def list_books(_: str = Depends(_check_auth)):
+    """本棚一覧（相対パス付き）。Android の書棚画面・全文検索で使う。"""
+    return [
+        {"id": bid, "title": info["title"], "rel": info.get("rel", ".")}
+        for bid, info in _books.items()
+    ]
+
+@api.get("/api/folders")
+def list_folders(path: str = "", _: str = Depends(_check_auth)):
+    """
+    指定パス直下のサブフォルダ一覧と直置き本を返す。
+    path="" → ルート, path="ジャンル1" → その直下
+    """
+    subfolders: dict[str, dict] = {}
+    direct_books: list[dict]    = []
+
+    for bid, info in _books.items():
+        rel = info.get("rel", ".")
+
+        if path == "":
+            if rel == ".":
+                direct_books.append({"id": bid, "title": info["title"]})
+            else:
+                top = rel.split("/")[0]
+                if top not in subfolders:
+                    subfolders[top] = {"name": top, "path": top, "count": 0, "ids": []}
+                subfolders[top]["count"] += 1
+                if len(subfolders[top]["ids"]) < 4:
+                    subfolders[top]["ids"].append(bid)
+        else:
+            if rel == path:
+                direct_books.append({"id": bid, "title": info["title"]})
+            elif rel.startswith(path + "/"):
+                rest = rel[len(path) + 1:]
+                sub  = rest.split("/")[0]
+                full = path + "/" + sub
+                if sub not in subfolders:
+                    subfolders[sub] = {"name": sub, "path": full, "count": 0, "ids": []}
+                subfolders[sub]["count"] += 1
+                if len(subfolders[sub]["ids"]) < 4:
+                    subfolders[sub]["ids"].append(bid)
+
+    return {
+        "path":    path,
+        "folders": sorted(subfolders.values(), key=lambda x: natural_key(x["name"])),
+        "books":   sorted(direct_books,        key=lambda b: natural_key(b["title"])),
+    }
+
+@api.get("/api/books/{bid}/info")
+def book_info(bid: str, _: str = Depends(_check_auth)):
+    """ページ数など詳細情報。初回アクセス時にページ一覧をキャッシュする。"""
+    info = _books.get(bid)
+    if not info:
+        raise HTTPException(404, "Book not found")
+    if "pages" not in info:
+        info["pages"] = get_page_list(info["path"])
+    return {"id": bid, "title": info["title"], "count": len(info["pages"])}
+
+@api.get("/api/books/{bid}/cover")
+def book_cover(bid: str, _: str = Depends(_check_auth)):
+    """表紙サムネイル JPEG を返す。失敗時はグレー画像を返す（500は出さない）。"""
+    cached = _cover_get(bid)
+    if cached:
+        return Response(cached, media_type="image/jpeg")
+    info = _books.get(bid)
+    if not info:
+        return Response(_placeholder_jpeg(), media_type="image/jpeg")
+    try:
+        if "pages" not in info:
+            info["pages"] = get_page_list(info["path"])
+        if not info["pages"]:
+            return Response(_placeholder_jpeg(), media_type="image/jpeg")
+        data = read_raw_image(info["path"], info["pages"][0])
+        img  = Image.open(io.BytesIO(data)).convert("RGB")
+        img.thumbnail((COVER_W, COVER_H), Image.LANCZOS)
+        buf  = io.BytesIO()
+        img.save(buf, "JPEG", quality=80)
+        _cover_put(bid, buf.getvalue())
+        return Response(buf.getvalue(), media_type="image/jpeg")
+    except Exception as e:
+        # 同じエラーは1回だけログに出す
+        key = f"{type(e).__name__}:{str(e)[:80]}"
+        if key not in _cover_errors:
+            _cover_errors.add(key)
+            _log_queue.put(f"[WARN] 表紙取得失敗 ({info.get('title','')[:30]}): {e}")
+        return Response(_placeholder_jpeg(), media_type="image/jpeg")
+
+@api.get("/api/books/{bid}/pages/{n}")
+def get_page(bid: str, n: int, _: str = Depends(_check_auth)):
+    """n ページ目の画像 JPEG を返す（スマホ向けにリサイズ済み）。"""
+    info = _books.get(bid)
+    if not info:
+        raise HTTPException(404, "Book not found")
+    if "pages" not in info:
+        info["pages"] = get_page_list(info["path"])
+    if n < 0 or n >= len(info["pages"]):
+        raise HTTPException(404, f"Page {n} out of range (0-{len(info['pages'])-1})")
+    try:
+        data = read_raw_image(info["path"], info["pages"][n])
+        return Response(resize_jpeg(data), media_type="image/jpeg")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+@api.post("/api/scan")
+def api_scan(_: str = Depends(_check_auth)):
+    """本棚を再スキャンする。"""
+    n = scan_books(_config.get("scan_dirs", []))
+    return {"books": n}
+
+# ─── Uvicorn スレッド ──────────────────────────────────────────────────────────
+class _NoSignalServer(uvicorn.Server):
+    """スレッド内で動かすため、シグナルハンドラ登録をスキップする"""
+    def install_signal_handlers(self) -> None:
+        pass
+
+class _UvicornThread(threading.Thread):
+    def __init__(self, host: str, port: int):
+        super().__init__(daemon=True)
+        self._srv = _NoSignalServer(
+            uvicorn.Config(api, host=host, port=port,
+                           log_config=None)  # pythonw.exe は stdout=None なので uvicorn のログ設定をスキップ
+        )
+        self.error: str = ""
+
+    def run(self) -> None:
+        import traceback
+        try:
+            asyncio.run(self._srv.serve())
+        except Exception as e:
+            tb = traceback.format_exc()
+            self.error = str(e)
+            _log_queue.put(f"[ERROR] サーバー起動失敗: {e}")
+            _log_queue.put(f"[ERROR] {tb}")
+
+    def stop(self) -> None:
+        self._srv.should_exit = True
+
+_server_thread: _UvicornThread | None = None
+
+# uvicorn のログを _log_queue に流す
+class _QueueHandler(logging.Handler):
+    def emit(self, record: logging.LogRecord) -> None:
+        if record.name == "uvicorn.access":
+            msg = record.getMessage()
+            if '" 200' in msg or '" 304' in msg or 'favicon.ico' in msg:
+                return  # 正常アクセス・faviconは表示しない
+        _log_queue.put(f"[{record.levelname}] {record.getMessage()}")
+
+_q_handler = _QueueHandler()
+_q_handler.setLevel(logging.INFO)
+# 親の "uvicorn" だけにハンドラを付ける。子は propagate で親に流れるので重複しない
+_uv_root = logging.getLogger("uvicorn")
+_uv_root.addHandler(_q_handler)
+_uv_root.setLevel(logging.INFO)
+# 子ロガーは親に任せる（propagate=True はデフォルトなので設定不要）
+for _n in ("uvicorn.access", "uvicorn.error"):
+    logging.getLogger(_n).setLevel(logging.INFO)
+
+# ─── カラーパレット ────────────────────────────────────────────────────────────
+BG       = "#1e1e2e"
+PANEL    = "#181825"
+FG       = "#cdd6f4"
+FG_DIM   = "#a6adc8"
+FG_GREEN = "#a6e3a1"
+FG_RED   = "#f38ba8"
+ACCENT   = "#89b4fa"
+
+# ─── GUI アプリ ────────────────────────────────────────────────────────────────
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("MangaServer")
+        self.geometry("720x560")
+        self.minsize(620, 480)
+        self.configure(bg=BG)
+
+        global _config
+        _config = load_config()
+
+        self._build()
+        self._update_dir_list()
+        self._log(f"MangaServer 起動 | Python {sys.version.split()[0]}")
+        if not UNRAR_AVAILABLE:
+            self._log(f"[警告] WinRAR が見つかりません（RAR/CBR は使用不可）: {UNRAR_PATH}")
+
+    # ── UI 構築 ────────────────────────────────────────────────────────────────
+    def _build(self):
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(2, weight=1)
+        self._build_header()
+        self._build_main()
+        self._build_log()
+        self._build_toolbar()
+        self.after(100, self._poll_log)
+
+    def _build_header(self):
+        f = tk.Frame(self, bg=PANEL, pady=8)
+        f.grid(row=0, column=0, sticky="ew")
+        f.columnconfigure(2, weight=1)
+
+        tk.Label(f, text="MangaServer", bg=PANEL, fg=FG,
+                 font=("Yu Gothic UI", 13, "bold")).grid(row=0, column=0, padx=14)
+
+        self._dot = tk.Label(f, text="●", bg=PANEL, fg=FG_RED, font=("", 16))
+        self._dot.grid(row=0, column=1, padx=(0, 4))
+
+        self._status_lbl = tk.Label(f, text="停止中", bg=PANEL, fg=FG_DIM,
+                                     font=("Yu Gothic UI", 10))
+        self._status_lbl.grid(row=0, column=2, sticky="w")
+
+    def _build_main(self):
+        main = tk.Frame(self, bg=BG)
+        main.grid(row=1, column=0, sticky="ew", padx=10, pady=(10, 0))
+        main.columnconfigure(0, weight=3)
+        main.columnconfigure(1, weight=2)
+
+        # 左: スキャンフォルダ
+        lf = tk.LabelFrame(main, text=" スキャンフォルダ ", bg=BG, fg=FG,
+                            font=("Yu Gothic UI", 9), pady=4)
+        lf.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        lf.columnconfigure(0, weight=1)
+        lf.rowconfigure(0, weight=1)
+
+        self._dir_lb = tk.Listbox(
+            lf, bg=PANEL, fg=FG, selectbackground=ACCENT,
+            selectforeground=BG, font=("Consolas", 9),
+            height=5, borderwidth=0, highlightthickness=0)
+        self._dir_lb.grid(row=0, column=0, columnspan=2, sticky="ew", padx=6, pady=2)
+
+        btn_f = tk.Frame(lf, bg=BG)
+        btn_f.grid(row=1, column=0, columnspan=2, sticky="w", padx=4)
+        tk.Button(btn_f, text="＋ 追加", bg="#2a2a4a", fg=FG, relief="flat",
+                  font=("Yu Gothic UI", 9), padx=8,
+                  command=self._add_dir).pack(side=tk.LEFT, padx=2)
+        tk.Button(btn_f, text="－ 削除", bg="#2a2a4a", fg=FG, relief="flat",
+                  font=("Yu Gothic UI", 9), padx=8,
+                  command=self._remove_dir).pack(side=tk.LEFT, padx=2)
+
+        self._books_lbl = tk.Label(lf, text="登録: 0 冊", bg=BG, fg=FG_DIM,
+                                    font=("Yu Gothic UI", 8))
+        self._books_lbl.grid(row=2, column=0, columnspan=2, sticky="w", padx=6, pady=2)
+
+        # 右: 設定
+        rf = tk.LabelFrame(main, text=" 接続設定 ", bg=BG, fg=FG,
+                           font=("Yu Gothic UI", 9), pady=4)
+        rf.grid(row=0, column=1, sticky="nsew")
+        rf.columnconfigure(1, weight=1)
+
+        fields = [
+            ("ユーザー名", "username", False),
+            ("パスワード",  "password", True),
+            ("ポート番号",  "port",     False),
+        ]
+        self._entries: dict[str, tk.Entry] = {}
+        for i, (label, key, masked) in enumerate(fields):
+            tk.Label(rf, text=label, bg=BG, fg=FG_DIM,
+                     font=("Yu Gothic UI", 9)).grid(row=i, column=0, padx=8, pady=5, sticky="w")
+            e = tk.Entry(rf, bg=PANEL, fg=FG, insertbackground=FG,
+                         relief="flat", font=("Consolas", 10),
+                         show="●" if masked else "")
+            e.insert(0, str(_config.get(key, "")))
+            e.grid(row=i, column=1, padx=(0, 8), pady=5, sticky="ew")
+            self._entries[key] = e
+
+        tk.Button(rf, text="設定を保存", bg="#2a2a4a", fg=FG, relief="flat",
+                  font=("Yu Gothic UI", 9), padx=8,
+                  command=self._save_settings).grid(
+            row=3, column=0, columnspan=2, pady=(8, 4))
+
+    def _build_log(self):
+        f = tk.Frame(self, bg=BG)
+        f.grid(row=2, column=0, sticky="nsew", padx=10, pady=6)
+        f.rowconfigure(0, weight=1)
+        f.columnconfigure(0, weight=1)
+
+        self._log_box = tk.Text(
+            f, bg="#0d0d1a", fg="#d4d4d4",
+            font=("Consolas", 8), state=tk.DISABLED,
+            borderwidth=0, highlightthickness=0, height=10)
+        vsb = ttk.Scrollbar(f, command=self._log_box.yview)
+        self._log_box.configure(yscrollcommand=vsb.set)
+        self._log_box.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+
+    def _build_toolbar(self):
+        f = tk.Frame(self, bg=BG)
+        f.grid(row=3, column=0, pady=8)
+
+        self._start_btn = tk.Button(
+            f, text="▶  サーバー起動", width=16,
+            bg="#1a472a", fg=FG_GREEN, activebackground="#155724",
+            font=("Yu Gothic UI", 10, "bold"), relief="flat", pady=6,
+            command=self._start_server)
+        self._start_btn.pack(side=tk.LEFT, padx=8)
+
+        self._stop_btn = tk.Button(
+            f, text="■  停止", width=10,
+            bg="#3a0a0a", fg=FG_RED, activebackground="#2d0808",
+            font=("Yu Gothic UI", 10), relief="flat", pady=6,
+            state=tk.DISABLED, command=self._stop_server)
+        self._stop_btn.pack(side=tk.LEFT, padx=4)
+
+        tk.Button(
+            f, text="再スキャン", width=10,
+            bg="#2a2a4a", fg=FG, relief="flat",
+            font=("Yu Gothic UI", 10), pady=6,
+            command=self._do_scan).pack(side=tk.LEFT, padx=8)
+
+    # ── フォルダ操作 ───────────────────────────────────────────────────────────
+    def _add_dir(self):
+        d = filedialog.askdirectory(title="スキャンするフォルダを選択")
+        if d and d not in _config["scan_dirs"]:
+            _config["scan_dirs"].append(d)
+            save_config(_config)
+            self._update_dir_list()
+            self._log(f"フォルダ追加: {d}")
+
+    def _remove_dir(self):
+        sel = self._dir_lb.curselection()
+        if not sel:
+            return
+        d = _config["scan_dirs"][sel[0]]
+        _config["scan_dirs"].pop(sel[0])
+        save_config(_config)
+        self._update_dir_list()
+        self._log(f"フォルダ削除: {d}")
+
+    def _update_dir_list(self):
+        self._dir_lb.delete(0, tk.END)
+        for d in _config.get("scan_dirs", []):
+            self._dir_lb.insert(tk.END, d)
+
+    # ── 設定保存 ───────────────────────────────────────────────────────────────
+    def _save_settings(self):
+        _config["username"] = self._entries["username"].get().strip()
+        _config["password"] = self._entries["password"].get().strip()
+        try:
+            _config["port"] = int(self._entries["port"].get().strip())
+        except ValueError:
+            messagebox.showerror("エラー", "ポート番号は整数で入力してください")
+            return
+        save_config(_config)
+        self._log("設定を保存しました")
+
+    # ── スキャン ───────────────────────────────────────────────────────────────
+    def _do_scan(self):
+        if not _config.get("scan_dirs"):
+            messagebox.showwarning("警告", "スキャンするフォルダを追加してください")
+            return
+        threading.Thread(target=self._scan_bg, daemon=True).start()
+
+    def _scan_bg(self):
+        self._log("スキャン開始...")
+        n = scan_books(_config.get("scan_dirs", []))
+        self._log(f"スキャン完了: {n} 冊登録")
+        self.after(0, lambda: self._books_lbl.configure(text=f"登録: {n} 冊"))
+
+    # ── ポート確認 ─────────────────────────────────────────────────────────────
+    @staticmethod
+    def _port_available(port: int) -> bool:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.bind(("", port))
+                return True
+            except OSError:
+                return False
+
+    # ── サーバー起動/停止 ──────────────────────────────────────────────────────
+    def _start_server(self):
+        if not _config.get("scan_dirs"):
+            if not messagebox.askyesno(
+                    "確認", "スキャンフォルダが未設定です。\nこのまま起動しますか？"):
+                return
+
+        port = _config.get("port", 8765)
+        if not self._port_available(port):
+            messagebox.showerror("エラー",
+                f"ポート {port} は既に使用中です。\n"
+                "前回のサーバーが完全に停止していないか、\n"
+                "別のアプリが使用しています。\n\n"
+                "しばらく待つか、ポート番号を変更してください。")
+            return
+
+        # UIを即更新してからバックグラウンドで起動処理（スキャンがあるのでメインスレッドをブロックしない）
+        self._start_btn.configure(state=tk.DISABLED)
+        self._stop_btn.configure(state=tk.NORMAL)
+        self._dot.configure(fg="#f9e2af")
+        self._status_lbl.configure(text="準備中...", fg="#f9e2af")
+        threading.Thread(target=self._start_server_bg, daemon=True).start()
+
+    def _start_server_bg(self):
+        import traceback
+        global _server_thread
+        try:
+            if not _books:
+                self._log("スキャン中（初回）...")
+                n = scan_books(_config.get("scan_dirs", []))
+                self._log(f"スキャン完了: {n} 冊")
+                self.after(0, lambda: self._books_lbl.configure(text=f"登録: {n} 冊"))
+            else:
+                n = len(_books)
+                self._log(f"スキャン済み: {n} 冊")
+
+            self._log("[DEBUG] UvicornThread 作成中...")
+            host = _config.get("host", "0.0.0.0")
+            port = _config.get("port", 8765)
+            _server_thread = _UvicornThread(host, port)
+            self._log("[DEBUG] start() 呼び出し...")
+            _server_thread.start()
+            self._log("[DEBUG] start() 完了")
+
+            self._log("[DEBUG] IPアドレス取得中...")
+            ip  = get_local_ip()
+            url = f"http://{ip}:{port}"
+            self.after(0, lambda: self._status_lbl.configure(
+                text=f"起動中...  {url}", fg="#f9e2af"))
+            self._log(f"サーバー起動中: {url}")
+            self._log(f"  ユーザー名: {_config.get('username', 'admin')}")
+            self._log(f"  登録冊数: {n} 冊")
+            self.after(5000, lambda: self._check_server_alive(url))
+
+        except Exception as e:
+            tb = traceback.format_exc()
+            self._log(f"[ERROR] 起動処理でエラー: {e}")
+            self._log(f"[ERROR] {tb}")
+            self.after(0, lambda: self._dot.configure(fg=FG_RED))
+            self.after(0, lambda: self._status_lbl.configure(text="起動失敗", fg=FG_RED))
+            self.after(0, lambda: self._start_btn.configure(state=tk.NORMAL))
+            self.after(0, lambda: self._stop_btn.configure(state=tk.DISABLED))
+            self.after(0, lambda: messagebox.showerror(
+                "起動エラー", f"サーバーの起動に失敗しました。\n\n{e}"))
+
+    def _check_server_alive(self, url: str):
+        """起動5秒後にスレッドが生きているか確認。成功後にキャッシュ生成を開始する。"""
+        if _server_thread and _server_thread.is_alive():
+            self._dot.configure(fg=FG_GREEN)
+            self._status_lbl.configure(text=f"稼働中  {url}", fg=FG_GREEN)
+            self._log("サーバー起動完了")
+            # サーバー起動確認後にキャッシュ生成を開始
+            if _books and not _preloading:
+                self._log("バックグラウンドでサムネイルキャッシュを生成します...")
+                start_preload()
+        else:
+            err = (_server_thread.error if _server_thread and _server_thread.error
+                   else "不明なエラー（ログを確認してください）")
+            self._dot.configure(fg=FG_RED)
+            self._status_lbl.configure(text="起動失敗", fg=FG_RED)
+            self._start_btn.configure(state=tk.NORMAL)
+            self._stop_btn.configure(state=tk.DISABLED)
+            self._log(f"[ERROR] サーバーが起動できませんでした: {err}")
+            messagebox.showerror("サーバー起動失敗",
+                f"サーバーを起動できませんでした。\n\n{err}")
+
+    def _stop_server(self):
+        global _server_thread
+        if _server_thread:
+            _server_thread.stop()
+            _server_thread = None
+        self._dot.configure(fg=FG_RED)
+        self._status_lbl.configure(text="停止中", fg=FG_DIM)
+        self._start_btn.configure(state=tk.NORMAL)
+        self._stop_btn.configure(state=tk.DISABLED)
+        self._log("サーバーを停止しました")
+
+    # ── ログ ───────────────────────────────────────────────────────────────────
+    def _log(self, msg: str) -> None:
+        _log_queue.put(msg)
+
+    def _poll_log(self) -> None:
+        try:
+            while True:
+                msg = _log_queue.get_nowait()
+                self._log_box.configure(state=tk.NORMAL)
+                self._log_box.insert(tk.END, msg + "\n")
+                self._log_box.see(tk.END)
+                self._log_box.configure(state=tk.DISABLED)
+        except queue.Empty:
+            pass
+        self.after(100, self._poll_log)
+
+
+if __name__ == "__main__":
+    App().mainloop()
