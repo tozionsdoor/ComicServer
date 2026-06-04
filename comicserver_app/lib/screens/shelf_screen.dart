@@ -30,9 +30,9 @@ class _ShelfScreenState extends State<ShelfScreen> {
 
   Future<void> _loadAllBooks() async {
     try {
-      // 検索用に全冊リストを取得
-      final res = await widget.api.getFolders('');
-      // getFolders で全冊は取れないので暫定でスキップ
+      // 検索用に全冊リスト（全フォルダ横断）を取得
+      final all = await widget.api.getBooks();
+      if (mounted) setState(() => _allBooks = all);
     } catch (_) {}
   }
 
@@ -57,10 +57,20 @@ class _ShelfScreenState extends State<ShelfScreen> {
     _load(prev);
   }
 
-  void _openBook(BookItem book) {
-    Navigator.push(context,
-        MaterialPageRoute(
-            builder: (_) => ReaderScreen(api: widget.api, book: book)));
+  void _openBook(BookItem book, {List<BookItem>? siblings}) {
+    final books = siblings ?? _contents?.books ?? <BookItem>[];
+    final idx   = books.indexWhere((b) => b.id == book.id);
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => ReaderScreen(
+          api:       widget.api,
+          book:      book,
+          siblings:  books,
+          bookIndex: idx >= 0 ? idx : 0,
+        ),
+      ),
+    );
   }
 
   String get _currentPath => _contents?.path ?? '';
@@ -144,13 +154,30 @@ class _ShelfScreenState extends State<ShelfScreen> {
     }
     if (_contents == null) return const SizedBox();
 
-    final query = _searchCtrl.text.toLowerCase();
-    final folders = _searching
-        ? _contents!.folders.where((f) => f.name.toLowerCase().contains(query)).toList()
-        : _contents!.folders;
-    final books = _searching
-        ? _contents!.books.where((b) => b.title.toLowerCase().contains(query)).toList()
-        : _contents!.books;
+    // 検索中は全フォルダ横断（_allBooks）からタイトル一致を表示する
+    if (_searching) {
+      final query = _searchCtrl.text.toLowerCase();
+      final hits = _allBooks
+          .where((b) => b.title.toLowerCase().contains(query))
+          .toList();
+      if (hits.isEmpty) {
+        return const Center(
+            child: Text('見つかりません', style: TextStyle(color: Color(0xFF585b70))));
+      }
+      return GridView.builder(
+        padding: const EdgeInsets.all(10),
+        gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
+            maxCrossAxisExtent: 160,
+            crossAxisSpacing: 8,
+            mainAxisSpacing: 8,
+            childAspectRatio: 0.72),
+        itemCount: hits.length,
+        itemBuilder: (context, i) => _bookCard(hits[i], siblings: hits),
+      );
+    }
+
+    final folders = _contents!.folders;
+    final books = _contents!.books;
 
     if (folders.isEmpty && books.isEmpty) {
       return const Center(
@@ -233,9 +260,9 @@ class _ShelfScreenState extends State<ShelfScreen> {
     );
   }
 
-  Widget _bookCard(BookItem book) {
+  Widget _bookCard(BookItem book, {List<BookItem>? siblings}) {
     return GestureDetector(
-      onTap: () => _openBook(book),
+      onTap: () => _openBook(book, siblings: siblings),
       child: Container(
         decoration: BoxDecoration(
             color: const Color(0xFF181825),

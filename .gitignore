@@ -33,6 +33,11 @@ comicserver_app/**/*.freezed.dart
 comicserver_app/__pycache__/
 *.egg-info/
 
+# ── ビルド生成物・配布バイナリ（NAS上に配置、gitには入れない） ──
+app-release.apk
+*.apk
+cloudflared.exe
+
 # ── Windows ──────────────────────────────────────────────
 Thumbs.db
 desktop.ini

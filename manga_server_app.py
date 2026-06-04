@@ -11,6 +11,7 @@ import hashlib
 import io
 import json
 import logging
+import os
 import queue
 import re
 import socket
@@ -24,10 +25,10 @@ from PIL import Image
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, Header
 from fastapi.responses import Response, HTMLResponse
-from fastapi.security import HTTPBasic, HTTPBasicCredentials
 import secrets
+import base64
 import uvicorn
 
 # ─── 定数 ────────────────────────────────────────────────────────────────────
@@ -38,19 +39,25 @@ if UNRAR_AVAILABLE:
 
 IMAGE_EXT    = {'.jpg', '.jpeg', '.png', '.webp', '.bmp', '.gif'}
 ARCHIVE_EXT  = {'.zip', '.rar', '.cbz', '.cbr', '.pdf'}
+MIN_FOLDER_IMAGES = 3   # この枚数以上の画像が直置きされたフォルダは「1冊の本」とみなす
 COVER_W, COVER_H = 200, 280
 PAGE_MAX     = 1800   # 長辺の最大ピクセル（スマホ向けリサイズ）
 
 CONFIG_PATH = Path(__file__).parent / "manga_server_config.json"
 CACHE_DIR   = Path.home() / ".manga_server" / "cache"  # ローカルに保存（NAS越しI/O回避）
+PAGE_CACHE_DIR = CACHE_DIR / "pages"   # リサイズ済み本文ページのディスクキャッシュ
+PAGE_CACHE_MAX = 4000                  # 本文ページキャッシュの最大ファイル数（超過分は古い順に削除）
 
 DEFAULT_CONFIG: dict = {
     "scan_dirs": [],
-    "username":  "admin",
-    "password":  "comicafe",
+    "token":     "",      # 認証トークン（初回起動時にランダム生成。LANペアリングで端末に渡す）
     "port":      8765,
     "host":      "0.0.0.0",
 }
+
+def _new_token() -> str:
+    """推測不能な認証トークンを生成（URLセーフ・約43文字）。"""
+    return secrets.token_urlsafe(32)
 
 # ─── グローバル状態（GUI ↔ API 共有） ─────────────────────────────────────────
 _books: dict[str, dict] = {}    # book_id -> {path, title, folder, pages}
@@ -64,8 +71,16 @@ def load_config() -> dict:
         cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
         for k, v in DEFAULT_CONFIG.items():
             cfg.setdefault(k, v)
-        return cfg
-    return DEFAULT_CONFIG.copy()
+        # 旧版の固定ユーザー名/パスワードは廃止（トークン認証へ一本化）
+        cfg.pop("username", None)
+        cfg.pop("password", None)
+    else:
+        cfg = DEFAULT_CONFIG.copy()
+    # トークン未設定（新規インストール or 旧版からの移行）なら生成して保存
+    if not cfg.get("token"):
+        cfg["token"] = _new_token()
+        save_config(cfg)
+    return cfg
 
 def save_config(cfg: dict) -> None:
     CONFIG_PATH.write_text(
@@ -91,7 +106,12 @@ def open_archive(path: Path):
     return zipfile.ZipFile(path, 'r')
 
 def get_page_list(path: Path) -> list[str]:
-    """アーカイブ内の画像ファイル名（またはPDFページ番号）一覧を返す"""
+    """アーカイブ内の画像ファイル名（またはPDFページ番号・画像直置きフォルダのファイル名）一覧を返す"""
+    if path.is_dir():
+        # 画像直置きフォルダ: 直下の画像を自然順で並べる
+        return sorted((c.name for c in path.iterdir()
+                       if c.is_file() and c.suffix.lower() in IMAGE_EXT),
+                      key=natural_key)
     if path.suffix.lower() == '.pdf':
         doc = pymupdf.open(str(path))
         return [str(i) for i in range(len(doc))]
@@ -101,6 +121,8 @@ def get_page_list(path: Path) -> list[str]:
 
 def read_raw_image(path: Path, page_id: str) -> bytes:
     """指定ページの画像データを bytes で返す"""
+    if path.is_dir():
+        return (path / page_id).read_bytes()
     if path.suffix.lower() == '.pdf':
         doc = pymupdf.open(str(path))
         pix = doc[int(page_id)].get_pixmap(matrix=pymupdf.Matrix(2, 2))
@@ -124,12 +146,23 @@ def scan_books(dirs: list[str]) -> int:
     _books = {}
     scan_roots = [Path(d) for d in dirs if Path(d).exists()]
     for root in scan_roots:
+        img_dir_counts: dict[Path, int] = {}  # 画像が直置きされたフォルダ -> 直下の画像枚数
         for f in sorted(root.rglob("*"), key=lambda p: [natural_key(x) for x in p.parts]):
-            if f.suffix.lower() in ARCHIVE_EXT:
+            suf = f.suffix.lower()
+            if suf in ARCHIVE_EXT:
                 bid = book_id(f)
                 # スキャンルートからの相対フォルダパス（"." / "作品A" / "ジャンル1/作品A"）
                 rel = f.relative_to(root).parent.as_posix()
                 _books[bid] = {"path": f, "title": f.stem, "rel": rel}
+            elif suf in IMAGE_EXT:
+                img_dir_counts[f.parent] = img_dir_counts.get(f.parent, 0) + 1
+        # アーカイブ化されておらず画像が直置きされたフォルダを1冊の本として登録
+        for d, cnt in img_dir_counts.items():
+            if cnt < MIN_FOLDER_IMAGES:
+                continue   # 表紙画像など数枚だけのフォルダは本扱いしない
+            bid = book_id(d)
+            rel = d.relative_to(root).parent.as_posix()
+            _books[bid] = {"path": d, "title": d.name, "rel": rel}
     return len(_books)
 
 def _preload_covers_bg(book_ids: list[str]) -> None:
@@ -189,6 +222,156 @@ def _cover_put(bid: str, data: bytes) -> None:
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     _cover_path(bid).write_bytes(data)
 
+# ─── 本文ページのディスクキャッシュ ───────────────────────────────────────────
+def _page_cache_path(bid: str, n: int) -> Path:
+    # PAGE_MAX を含めることでリサイズ設定を変えた時に古いキャッシュと混ざらない
+    return PAGE_CACHE_DIR / f"{bid}_{n}_{PAGE_MAX}.jpg"
+
+_page_cache_writes = 0  # 数百回に1回だけ掃除するためのカウンタ
+
+def _page_cache_put(path: Path, data: bytes) -> None:
+    """一時ファイル→アトミック rename で保存（同時アクセスでの破損・競合を回避）。"""
+    global _page_cache_writes
+    PAGE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.stem}.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        tmp.write_bytes(data)
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        return
+    _page_cache_writes += 1
+    if _page_cache_writes % 200 == 0:
+        _trim_page_cache()
+
+def _trim_page_cache() -> None:
+    """キャッシュ数が上限を超えたら、更新時刻の古いファイルから削除する。"""
+    try:
+        files = sorted(PAGE_CACHE_DIR.glob("*.jpg"), key=lambda p: p.stat().st_mtime)
+        for p in files[: max(0, len(files) - PAGE_CACHE_MAX)]:
+            try:
+                p.unlink()
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+# ─── 本文ページのバックグラウンド先読み（本を開いた瞬間に全ページを温める） ───
+WARM_MAX_CONCURRENT = 2          # 同時に温める本の最大数（CPU占有を防ぐ）
+_warming: set[str]    = set()    # 現在温め中の book_id
+_warming_lock         = threading.Lock()
+
+def _warm_book_cache(bid: str) -> None:
+    """書庫を1回だけ開き、未キャッシュのページだけを順に生成・保存する（既存はスキップ）。"""
+    try:
+        info = _books.get(bid)
+        if not info:
+            return
+        if "pages" not in info:
+            info["pages"] = get_page_list(info["path"])
+        path  = info["path"]
+        pages = info["pages"]
+        is_pdf = (not path.is_dir()) and path.suffix.lower() == ".pdf"
+        is_dir = path.is_dir()
+        doc = pymupdf.open(str(path)) if is_pdf else None
+        af  = None if (is_pdf or is_dir) else open_archive(path)
+        try:
+            for n, page_id in enumerate(pages):
+                cp = _page_cache_path(bid, n)
+                if cp.exists():
+                    continue   # オンデマンドや前回温めで既に生成済み
+                try:
+                    if is_pdf:
+                        pix = doc[int(page_id)].get_pixmap(matrix=pymupdf.Matrix(2, 2))
+                        raw = pix.tobytes("jpeg")
+                    elif is_dir:
+                        raw = (path / page_id).read_bytes()
+                    else:
+                        with af.open(page_id) as f:
+                            raw = f.read()
+                    _page_cache_put(cp, resize_jpeg(raw))
+                except Exception:
+                    pass   # 1ページ失敗しても続行
+        finally:
+            if doc is not None:
+                doc.close()
+            if af is not None:
+                af.close()
+        _log_queue.put(f"[キャッシュ] 本文先読み完了: {info.get('title','')[:30]} ({len(pages)}p)")
+    finally:
+        with _warming_lock:
+            _warming.discard(bid)
+
+def start_warm(bid: str) -> None:
+    """本を開いた合図でバックグラウンド先読みを開始（多重起動・過負荷を防ぐ）。"""
+    with _warming_lock:
+        if bid in _warming or len(_warming) >= WARM_MAX_CONCURRENT:
+            return
+        _warming.add(bid)
+    threading.Thread(target=_warm_book_cache, args=(bid,), daemon=True).start()
+
+# ─── LAN自動発見（UDPブロードキャスト応答） ──────────────────────────────────
+# アプリが LAN にブロードキャストした探索パケットに、このサーバーの接続情報を返す。
+# TCPポート（変更可）とは独立した固定UDPポートで待つので、ポートを変えても発見できる。
+DISCOVERY_PORT     = 8770
+DISCOVERY_PROBE    = b"COMICSERVER_DISCOVER"
+_discovery_started = False
+
+def get_global_ipv6() -> str:
+    """インターネットへ出る際の送信元グローバルIPv6を返す（無ければ空文字）。"""
+    try:
+        s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+        s.connect(("2001:4860:4860::8888", 80))   # 実際には送信しない（経路確認のみ）
+        ip = s.getsockname()[0]
+        s.close()
+        if ip and not ip.startswith("fe80") and ip != "::1":
+            return ip.split("%")[0]
+    except OSError:
+        pass
+    return ""
+
+def _connection_info() -> dict:
+    return {
+        "service": "comicserver",
+        "name":    socket.gethostname(),
+        "host":    get_local_ip(),
+        "port":    int(_config.get("port", 8765)),
+        "ipv6":    get_global_ipv6(),
+        "token":   _config.get("token", ""),   # LANペアリングで端末へ自動受け渡し
+    }
+
+def _discovery_responder() -> None:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        sock.bind(("", DISCOVERY_PORT))
+    except OSError as e:
+        _log_queue.put(f"[発見] UDP {DISCOVERY_PORT} を確保できません: {e}")
+        return
+    _log_queue.put(f"[発見] LAN自動発見を待機中（UDP {DISCOVERY_PORT}）")
+    while True:
+        try:
+            data, addr = sock.recvfrom(1024)
+        except OSError:
+            break
+        if data.strip() != DISCOVERY_PROBE:
+            continue
+        try:
+            sock.sendto(json.dumps(_connection_info()).encode("utf-8"), addr)
+        except OSError:
+            pass
+
+def start_discovery_responder() -> None:
+    """発見応答スレッドを起動（多重起動防止）。サーバー再起動後も生かしたまま。"""
+    global _discovery_started
+    if _discovery_started:
+        return
+    _discovery_started = True
+    threading.Thread(target=_discovery_responder, daemon=True).start()
+
 def _placeholder_jpeg() -> bytes:
     """表紙取得失敗時に返すグレーのダミー画像"""
     img = Image.new("RGB", (COVER_W, COVER_H), color=(49, 50, 68))
@@ -208,19 +391,36 @@ def get_local_ip() -> str:
 
 # ─── FastAPI アプリ ────────────────────────────────────────────────────────────
 api       = FastAPI(title="MangaServer", docs_url=None, redoc_url=None)
-_security = HTTPBasic()
 
-def _check_auth(cred: HTTPBasicCredentials = Depends(_security)) -> str:
-    ok = (
-        secrets.compare_digest(cred.username, _config.get("username", "admin")) and
-        secrets.compare_digest(cred.password, _config.get("password", "comicafe"))
-    )
-    if not ok:
+def _extract_token(authorization: str | None) -> str:
+    """Authorization ヘッダからトークンを取り出す（2方式に対応）。
+    - `Bearer <token>`           : アプリが送る形式
+    - `Basic base64(任意:token)` : ブラウザ内蔵ビューワーのBasic認証ダイアログ用。
+      ユーザー名は無視し、パスワード部をトークンとして扱う。
+    """
+    if not authorization:
+        return ""
+    scheme, _, value = authorization.partition(" ")
+    scheme = scheme.lower()
+    if scheme == "bearer":
+        return value.strip()
+    if scheme == "basic":
+        try:
+            decoded = base64.b64decode(value.strip()).decode("utf-8", "replace")
+        except Exception:
+            return ""
+        return decoded.partition(":")[2]   # password 部
+    return ""
+
+def _check_auth(authorization: str | None = Header(None)) -> str:
+    token = _config.get("token", "")
+    supplied = _extract_token(authorization)
+    if not (token and supplied and secrets.compare_digest(supplied, token)):
         raise HTTPException(
             status_code=401, detail="Unauthorized",
-            headers={"WWW-Authenticate": "Basic"}
+            headers={"WWW-Authenticate": "Basic"},
         )
-    return cred.username
+    return "ok"
 
 @api.get("/")
 def root(_: str = Depends(_check_auth)):
@@ -760,7 +960,13 @@ def book_info(bid: str, _: str = Depends(_check_auth)):
         raise HTTPException(404, "Book not found")
     if "pages" not in info:
         info["pages"] = get_page_list(info["path"])
+    start_warm(bid)   # 本を開いた合図 → 全ページをバックグラウンドで温め始める
     return {"id": bid, "title": info["title"], "count": len(info["pages"])}
+
+@api.get("/api/connection-info")
+def api_connection_info(_: str = Depends(_check_auth)):
+    """外部接続用の接続情報（LAN内でアプリが受け取り保存する。Phase 2でroomId/トークンも追加予定）。"""
+    return _connection_info()
 
 @api.get("/api/books/{bid}/cover")
 def book_cover(bid: str, _: str = Depends(_check_auth)):
@@ -793,7 +999,7 @@ def book_cover(bid: str, _: str = Depends(_check_auth)):
 
 @api.get("/api/books/{bid}/pages/{n}")
 def get_page(bid: str, n: int, _: str = Depends(_check_auth)):
-    """n ページ目の画像 JPEG を返す（スマホ向けにリサイズ済み）。"""
+    """n ページ目の画像 JPEG を返す（スマホ向けにリサイズ済み・ディスクキャッシュ付き）。"""
     info = _books.get(bid)
     if not info:
         raise HTTPException(404, "Book not found")
@@ -801,13 +1007,26 @@ def get_page(bid: str, n: int, _: str = Depends(_check_auth)):
         info["pages"] = get_page_list(info["path"])
     if n < 0 or n >= len(info["pages"]):
         raise HTTPException(404, f"Page {n} out of range (0-{len(info['pages'])-1})")
+
+    # ── キャッシュ命中: アーカイブを開かず・リサイズせずディスクから即返す ──
+    cache_path = _page_cache_path(bid, n)
+    if cache_path.exists():
+        try:
+            return Response(cache_path.read_bytes(), media_type="image/jpeg")
+        except OSError:
+            pass  # 壊れていれば下で作り直す
+
+    # ── キャッシュ未命中: 生成 → 保存 → 配信 ──
     try:
         data = read_raw_image(info["path"], info["pages"][n])
-        return Response(resize_jpeg(data), media_type="image/jpeg")
+        jpeg = resize_jpeg(data)
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(500, str(e))
+
+    _page_cache_put(cache_path, jpeg)   # 保存失敗時も内部で握りつぶし、配信は成功させる
+    return Response(jpeg, media_type="image/jpeg")
 
 @api.post("/api/scan")
 def api_scan(_: str = Depends(_check_auth)):
@@ -954,26 +1173,41 @@ class App(tk.Tk):
         rf.grid(row=0, column=1, sticky="nsew")
         rf.columnconfigure(1, weight=1)
 
-        fields = [
-            ("ユーザー名", "username", False),
-            ("パスワード",  "password", True),
-            ("ポート番号",  "port",     False),
-        ]
-        self._entries: dict[str, tk.Entry] = {}
-        for i, (label, key, masked) in enumerate(fields):
-            tk.Label(rf, text=label, bg=BG, fg=FG_DIM,
-                     font=("Yu Gothic UI", 9)).grid(row=i, column=0, padx=8, pady=5, sticky="w")
-            e = tk.Entry(rf, bg=PANEL, fg=FG, insertbackground=FG,
-                         relief="flat", font=("Consolas", 10),
-                         show="●" if masked else "")
-            e.insert(0, str(_config.get(key, "")))
-            e.grid(row=i, column=1, padx=(0, 8), pady=5, sticky="ew")
-            self._entries[key] = e
+        # ポート番号
+        tk.Label(rf, text="ポート番号", bg=BG, fg=FG_DIM,
+                 font=("Yu Gothic UI", 9)).grid(row=0, column=0, padx=8, pady=5, sticky="w")
+        self._port_entry = tk.Entry(rf, bg=PANEL, fg=FG, insertbackground=FG,
+                                    relief="flat", font=("Consolas", 10))
+        self._port_entry.insert(0, str(_config.get("port", 8765)))
+        self._port_entry.grid(row=0, column=1, padx=(0, 8), pady=5, sticky="ew")
+
+        # 認証トークン（読み取り専用・コピー/再生成）
+        tk.Label(rf, text="認証トークン", bg=BG, fg=FG_DIM,
+                 font=("Yu Gothic UI", 9)).grid(row=1, column=0, padx=8, pady=5, sticky="w")
+        self._token_var = tk.StringVar(value=_config.get("token", ""))
+        self._token_entry = tk.Entry(rf, textvariable=self._token_var,
+                                     bg=PANEL, fg=FG_GREEN, readonlybackground=PANEL,
+                                     relief="flat", font=("Consolas", 9), state="readonly")
+        self._token_entry.grid(row=1, column=1, padx=(0, 8), pady=5, sticky="ew")
+
+        tok_btn_f = tk.Frame(rf, bg=BG)
+        tok_btn_f.grid(row=2, column=1, sticky="w", padx=(0, 8))
+        tk.Button(tok_btn_f, text="コピー", bg="#2a2a4a", fg=FG, relief="flat",
+                  font=("Yu Gothic UI", 9), padx=8,
+                  command=self._copy_token).pack(side=tk.LEFT, padx=(0, 4))
+        tk.Button(tok_btn_f, text="再生成", bg="#3a0a0a", fg=FG_RED, relief="flat",
+                  font=("Yu Gothic UI", 9), padx=8,
+                  command=self._regen_token).pack(side=tk.LEFT, padx=4)
+
+        tk.Label(rf, text="※ アプリは同じWi-Fiで「LAN内を探す」と自動でトークンを受け取ります",
+                 bg=BG, fg=FG_DIM, font=("Yu Gothic UI", 8),
+                 wraplength=240, justify="left").grid(
+            row=3, column=0, columnspan=2, sticky="w", padx=8, pady=(2, 0))
 
         tk.Button(rf, text="設定を保存", bg="#2a2a4a", fg=FG, relief="flat",
                   font=("Yu Gothic UI", 9), padx=8,
                   command=self._save_settings).grid(
-            row=3, column=0, columnspan=2, pady=(8, 4))
+            row=4, column=0, columnspan=2, pady=(8, 4))
 
     def _build_log(self):
         f = tk.Frame(self, bg=BG)
@@ -1040,15 +1274,32 @@ class App(tk.Tk):
 
     # ── 設定保存 ───────────────────────────────────────────────────────────────
     def _save_settings(self):
-        _config["username"] = self._entries["username"].get().strip()
-        _config["password"] = self._entries["password"].get().strip()
         try:
-            _config["port"] = int(self._entries["port"].get().strip())
+            _config["port"] = int(self._port_entry.get().strip())
         except ValueError:
             messagebox.showerror("エラー", "ポート番号は整数で入力してください")
             return
         save_config(_config)
         self._log("設定を保存しました")
+
+    # ── 認証トークン ─────────────────────────────────────────────────────────────
+    def _copy_token(self):
+        self.clipboard_clear()
+        self.clipboard_append(_config.get("token", ""))
+        self._log("トークンをクリップボードにコピーしました")
+
+    def _regen_token(self):
+        if not messagebox.askyesno(
+                "トークン再生成",
+                "新しいトークンを生成します。\n"
+                "ペアリング済みの端末は再接続できなくなり、もう一度LANで"
+                "「LAN内を探す」操作（または手動でトークン入力）が必要になります。\n\n"
+                "続行しますか？"):
+            return
+        _config["token"] = _new_token()
+        save_config(_config)
+        self._token_var.set(_config["token"])
+        self._log("認証トークンを再生成しました（全端末の再ペアリングが必要です）")
 
     # ── スキャン ───────────────────────────────────────────────────────────────
     def _do_scan(self):
@@ -1116,6 +1367,7 @@ class App(tk.Tk):
             self._log("[DEBUG] start() 呼び出し...")
             _server_thread.start()
             self._log("[DEBUG] start() 完了")
+            start_discovery_responder()   # LAN自動発見の応答を開始
 
             self._log("[DEBUG] IPアドレス取得中...")
             ip  = get_local_ip()
@@ -1123,7 +1375,7 @@ class App(tk.Tk):
             self.after(0, lambda: self._status_lbl.configure(
                 text=f"起動中...  {url}", fg="#f9e2af"))
             self._log(f"サーバー起動中: {url}")
-            self._log(f"  ユーザー名: {_config.get('username', 'admin')}")
+            self._log(f"  認証トークン: {_config.get('token', '')[:8]}…（設定欄でコピー可）")
             self._log(f"  登録冊数: {n} 冊")
             self.after(5000, lambda: self._check_server_alive(url))
 

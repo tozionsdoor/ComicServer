@@ -45,22 +45,32 @@ class _StartScreenState extends State<_StartScreen> {
 
   Future<void> _autoLogin() async {
     final prefs = await SharedPreferences.getInstance();
-    final url  = prefs.getString('url');
-    final user = prefs.getString('user');
-    final pass = prefs.getString('pass');
+    final url   = prefs.getString('url');
+    final token = prefs.getString('token');
+    final ipv6  = prefs.getString('ipv6');
 
-    if (!mounted) return;
-
-    if (url != null && user != null && pass != null) {
-      final api = ApiService(baseUrl: url, username: user, password: pass);
-      final ok  = await api.testConnection();
+    if (url != null && token != null && token.isNotEmpty) {
+      // 候補（LAN直 / IPv6）を同時に試し、最初に応答したもので接続
+      final candidates =
+          buildCandidates(primaryUrl: url, ipv6: ipv6);
+      final working = await ApiService.resolveBaseUrl(candidates, token);
       if (!mounted) return;
-      if (ok) {
+      if (working != null) {
+        final api = ApiService(
+            baseUrl: working, token: token,
+            candidates: candidates);
+        // 次回のため最新の ipv6 を保存（fire-and-forget）
+        api.getConnectionInfo().then((info) async {
+          if (info == null) return;
+          final v6 = (info['ipv6'] ?? '').toString();
+          if (v6.isNotEmpty) await prefs.setString('ipv6', v6);
+        });
         Navigator.pushReplacement(context,
             MaterialPageRoute(builder: (_) => ShelfScreen(api: api)));
         return;
       }
     }
+    if (!mounted) return;
     Navigator.pushReplacement(context,
         MaterialPageRoute(builder: (_) => const LoginScreen()));
   }
