@@ -1,0 +1,20 @@
+{
+  "rules": {
+    "rooms": {
+      "$room_id": {
+        // room_id を知っている（=LANペアリング済み）端末・サーバーだけが
+        // その部屋配下を読み書きできる。匿名認証必須。
+        // room_id 自体が推測不能な鍵なので、部屋を限定すれば十分に安全。
+        ".read": "auth != null",
+        ".write": "auth != null",
+        "sessions": {
+          "$session_id": {
+            // セッションは作成後しばらくで不要になる。
+            // 古いノードはクライアント/サーバーが切断時に削除する。
+            ".validate": "newData.hasChildren(['offer']) || newData.hasChildren(['answer'])"
+          }
+        }
+      }
+    }
+  }
+}

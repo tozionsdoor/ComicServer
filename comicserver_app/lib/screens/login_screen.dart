@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../services/api_service.dart';
 import '../services/discovery_service.dart';
+import '../services/webrtc_service.dart';
 import 'shelf_screen.dart';
 
 class LoginScreen extends StatefulWidget {
@@ -13,9 +14,14 @@ class LoginScreen extends StatefulWidget {
 class _LoginScreenState extends State<LoginScreen> {
   final _urlCtrl   = TextEditingController(text: 'http://192.168.0.25:8765');
   final _tokenCtrl = TextEditingController();
+  // TURN（任意・STUNで繋がらない少数派向け。標準は空＝STUN-only）
+  final _turnUrlCtrl  = TextEditingController();
+  final _turnUserCtrl = TextEditingController();
+  final _turnCredCtrl = TextEditingController();
   bool _loading = false;
   bool _discovering = false;
   bool _obscure = true;
+  bool _showTurn = false;   // TURN詳細設定の開閉
   String _error = '';
 
   @override
@@ -24,11 +30,24 @@ class _LoginScreenState extends State<LoginScreen> {
     _loadSaved();
   }
 
+  @override
+  void dispose() {
+    _urlCtrl.dispose();
+    _tokenCtrl.dispose();
+    _turnUrlCtrl.dispose();
+    _turnUserCtrl.dispose();
+    _turnCredCtrl.dispose();
+    super.dispose();
+  }
+
   Future<void> _loadSaved() async {
     final prefs = await SharedPreferences.getInstance();
     setState(() {
-      _urlCtrl.text   = prefs.getString('url')   ?? _urlCtrl.text;
-      _tokenCtrl.text = prefs.getString('token') ?? '';
+      _urlCtrl.text       = prefs.getString('url')   ?? _urlCtrl.text;
+      _tokenCtrl.text     = prefs.getString('token') ?? '';
+      _turnUrlCtrl.text   = prefs.getString('turn_url')        ?? '';
+      _turnUserCtrl.text  = prefs.getString('turn_username')   ?? '';
+      _turnCredCtrl.text  = prefs.getString('turn_credential') ?? '';
     });
   }
 
@@ -80,20 +99,25 @@ class _LoginScreenState extends State<LoginScreen> {
     if (selected != null && mounted) {
       setState(() {
         _urlCtrl.text   = selected.baseUrl;
-        _tokenCtrl.text = selected.token;   // LANペアリングで受け取ったトークン
+        _tokenCtrl.text = selected.token;
       });
       final prefs = await SharedPreferences.getInstance();
-      await prefs.setString('ipv6', selected.ipv6);       // 外出先用IPv6
+      await prefs.setString('ipv6', selected.ipv6);
+      // room_id もLANペアリングで受け取る（WebRTC部屋ID）
+      if (selected.roomId.isNotEmpty) {
+        await prefs.setString('room_id', selected.roomId);
+      }
     }
   }
 
-  // 接続後、最新の ipv6 を保存しておく
   void _refreshConnInfo(ApiService api) {
     api.getConnectionInfo().then((info) async {
       if (info == null) return;
       final pr = await SharedPreferences.getInstance();
       final v6 = (info['ipv6'] ?? '').toString();
       if (v6.isNotEmpty) await pr.setString('ipv6', v6);
+      final rid = (info['room_id'] ?? '').toString();
+      if (rid.isNotEmpty) await pr.setString('room_id', rid);
     });
   }
 
@@ -103,26 +127,56 @@ class _LoginScreenState extends State<LoginScreen> {
     final token = _tokenCtrl.text.trim();
 
     final prefs  = await SharedPreferences.getInstance();
-    final ipv6   = prefs.getString('ipv6');     // 発見時に保存された外出先用IPv6
-    final candidates =
-        buildCandidates(primaryUrl: url, ipv6: ipv6);
+    // TURN設定を保存（任意。空ならSTUN-only）
+    await prefs.setString('turn_url',        _turnUrlCtrl.text.trim());
+    await prefs.setString('turn_username',   _turnUserCtrl.text.trim());
+    await prefs.setString('turn_credential', _turnCredCtrl.text.trim());
+    final ipv6   = prefs.getString('ipv6');
+    final roomId = prefs.getString('room_id') ?? '';
+    final candidates = buildCandidates(primaryUrl: url, ipv6: ipv6);
     final working = await ApiService.resolveBaseUrl(candidates, token);
 
     if (!mounted) return;
     if (working != null) {
-      await prefs.setString('url',   url);     // 家のLANアドレスを正として保存
+      await prefs.setString('url',   url);
       await prefs.setString('token', token);
+      if (!mounted) return;
       final api = ApiService(
           baseUrl: working, token: token, candidates: candidates);
       _refreshConnInfo(api);
       Navigator.pushReplacement(context,
           MaterialPageRoute(builder: (_) => ShelfScreen(api: api)));
-    } else {
-      setState(() {
-        _loading = false;
-        _error   = '接続できませんでした。URLとトークンを確認してください。';
-      });
+      return;
     }
+
+    // HTTP全滅 → WebRTC P2P フォールバック
+    if (roomId.isNotEmpty) {
+      setState(() { _error = 'HTTP接続失敗。WebRTC P2Pで試みています...'; });
+      final webRtc = WebRtcService.instance;
+      final localUrl = await webRtc.connect(
+        roomId: roomId,
+        authToken: token,
+        turnUrl:        prefs.getString('turn_url'),
+        turnUsername:   prefs.getString('turn_username'),
+        turnCredential: prefs.getString('turn_credential'),
+      );
+      if (!mounted) return;
+      if (localUrl != null) {
+        await prefs.setString('url',   url);
+        await prefs.setString('token', token);
+        if (!mounted) return;
+        final api = ApiService(
+            baseUrl: localUrl, token: token, candidates: [localUrl]);
+        Navigator.pushReplacement(context,
+            MaterialPageRoute(builder: (_) => ShelfScreen(api: api)));
+        return;
+      }
+    }
+
+    setState(() {
+      _loading = false;
+      _error   = '接続できませんでした。URLとトークンを確認してください。';
+    });
   }
 
   @override
@@ -163,6 +217,8 @@ class _LoginScreenState extends State<LoginScreen> {
                 ),
                 const SizedBox(height: 6),
                 _field(_tokenCtrl, '認証トークン', Icons.key, true),
+                const SizedBox(height: 12),
+                _buildTurnSection(),
                 const SizedBox(height: 24),
                 if (_error.isNotEmpty)
                   Padding(
@@ -194,6 +250,42 @@ class _LoginScreenState extends State<LoginScreen> {
           ),
         ),
       ),
+    );
+  }
+
+  /// TURN設定（折りたたみ・任意）。外出先でSTUNでも繋がらない環境向け。
+  /// 標準は空＝STUN-only。入力すればWebRTCのiceServersに追加される。
+  Widget _buildTurnSection() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        InkWell(
+          onTap: () => setState(() => _showTurn = !_showTurn),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(vertical: 4),
+            child: Row(
+              children: [
+                Icon(_showTurn ? Icons.expand_less : Icons.expand_more,
+                    color: const Color(0xFF585b70), size: 20),
+                const SizedBox(width: 4),
+                const Text('TURNサーバー設定（任意・繋がらない時のみ）',
+                    style: TextStyle(color: Color(0xFF585b70), fontSize: 13)),
+              ],
+            ),
+          ),
+        ),
+        if (_showTurn) ...[
+          const SizedBox(height: 8),
+          _field(_turnUrlCtrl, 'TURN URL（例 turn:host:3478）', Icons.lan, false),
+          const SizedBox(height: 8),
+          _field(_turnUserCtrl, 'TURN ユーザー名', Icons.person, false),
+          const SizedBox(height: 8),
+          _field(_turnCredCtrl, 'TURN 認証情報', Icons.password, true),
+          const SizedBox(height: 4),
+          const Text('※ 中継の通信費は挿したTURNサーバーの持ち主負担になります',
+              style: TextStyle(color: Color(0xFF585b70), fontSize: 11)),
+        ],
+      ],
     );
   }
 

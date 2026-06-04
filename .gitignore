@@ -6,7 +6,9 @@ build/
 dist/
 *.spec.bak
 
-# ── 設定ファイル（パスワード含むため除外） ──────────────────
+# ── 設定ファイル（パスワード・認証情報を含むため除外） ──────────
+# サーバーtoken・Firebase api_key を含むため除外（クライアント側のFirebase設定は
+# 公開前提の値なので google-services.json / firebase_options.dart はコミットする）
 manga_server_config.json
 
 # ── サムネイルキャッシュ（大量ファイル） ────────────────────

@@ -3,11 +3,12 @@ plugins {
     id("kotlin-android")
     // The Flutter Gradle Plugin must be applied after the Android and Kotlin Gradle plugins.
     id("dev.flutter.flutter-gradle-plugin")
+    id("com.google.gms.google-services")
 }
 
 android {
     namespace = "com.comicserver.comicserver_app"
-    compileSdk = flutter.compileSdkVersion
+    compileSdk = 36   // flutter_webrtc 1.4.1 が compileSdk 36 を要求（旧: flutter.compileSdkVersion=35）
     ndkVersion = "27.0.12077973"
 
     compileOptions {
@@ -24,7 +25,7 @@ android {
         applicationId = "com.comicserver.comicserver_app"
         // You can update the following values to match your application needs.
         // For more information, see: https://flutter.dev/to/review-gradle-config.
-        minSdk = flutter.minSdkVersion
+        minSdk = 23   // Firebase Auth が minSdk 23 を要求するため引き上げ（旧: flutter.minSdkVersion=21）
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
         versionName = flutter.versionName

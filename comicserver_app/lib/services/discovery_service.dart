@@ -5,10 +5,11 @@ import 'dart:io';
 /// LAN自動発見で見つかったサーバー1台分の情報。
 class DiscoveredServer {
   final String name;
-  final String host;   // LAN内IPv4
-  final int    port;   // TCPポート
-  final String ipv6;   // グローバルIPv6（外出先用、無ければ空）
-  final String token;  // 認証トークン（LANペアリングで自動受け渡し、無ければ空）
+  final String host;    // LAN内IPv4
+  final int    port;    // TCPポート
+  final String ipv6;    // グローバルIPv6（外出先用、無ければ空）
+  final String token;   // 認証トークン（LANペアリングで自動受け渡し、無ければ空）
+  final String roomId;  // WebRTC部屋ID（LANペアリングで自動受け渡し、無ければ空）
 
   DiscoveredServer({
     required this.name,
@@ -16,6 +17,7 @@ class DiscoveredServer {
     required this.port,
     required this.ipv6,
     required this.token,
+    required this.roomId,
   });
 
   String get baseUrl => 'http://$host:$port';
@@ -44,11 +46,12 @@ Future<List<DiscoveredServer>> discoverServers({
         final m = jsonDecode(utf8.decode(dg.data)) as Map<String, dynamic>;
         if (m['service'] != 'comicserver') return;
         final s = DiscoveredServer(
-          name: (m['name'] ?? 'ComicServer').toString(),
-          host: (m['host'] ?? dg.address.address).toString(),
-          port: (m['port'] as num?)?.toInt() ?? 8765,
-          ipv6: (m['ipv6'] ?? '').toString(),
-          token: (m['token'] ?? '').toString(),
+          name:   (m['name'] ?? 'ComicServer').toString(),
+          host:   (m['host'] ?? dg.address.address).toString(),
+          port:   (m['port'] as num?)?.toInt() ?? 8765,
+          ipv6:   (m['ipv6'] ?? '').toString(),
+          token:  (m['token'] ?? '').toString(),
+          roomId: (m['room_id'] ?? '').toString(),
         );
         found['${s.host}:${s.port}'] = s;
       } catch (_) {/* 不正な応答は無視 */}
