@@ -4,6 +4,7 @@ import '../models/book.dart';
 import '../services/api_service.dart';
 import 'reader_screen.dart';
 import 'login_screen.dart';
+import 'history_screen.dart';
 
 class ShelfScreen extends StatefulWidget {
   final ApiService api;
@@ -102,6 +103,14 @@ class _ShelfScreenState extends State<ShelfScreen> {
               : const Text('ComicServer',
                   style: TextStyle(
                       color: Color(0xFF89b4fa), fontWeight: FontWeight.bold)),
+          actions: [
+            IconButton(
+              icon: const Icon(Icons.history, color: Color(0xFF89b4fa)),
+              tooltip: '続き / 履歴',
+              onPressed: () => Navigator.push(context, MaterialPageRoute(
+                  builder: (_) => HistoryScreen(api: widget.api))),
+            ),
+          ],
           bottom: PreferredSize(
             preferredSize: const Size.fromHeight(44),
             child: Padding(

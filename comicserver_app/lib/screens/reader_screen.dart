@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:math' show min, max;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -85,6 +86,7 @@ class _ReaderScreenState extends State<ReaderScreen> {
   final Map<int, Offset> _ptrs = {};
   double? _pinchStartDist;
   double  _pinchStartH = 0;
+  double  _heightFrac  = 0;    // 表示高さ÷画面高さ（端末内に記憶。0=未設定で初回フィット）
 
   // 虫眼鏡
   Offset? _magnifierPos;
@@ -106,6 +108,7 @@ class _ReaderScreenState extends State<ReaderScreen> {
     setState(() {
       _rtl    = p.getBool('rtl')    ?? true;
       _spread = p.getBool('spread') ?? false;
+      _heightFrac = p.getDouble('height_frac') ?? 0;
     });
     _rebuildUnits();
   }
@@ -114,6 +117,7 @@ class _ReaderScreenState extends State<ReaderScreen> {
     final p = await SharedPreferences.getInstance();
     await p.setBool('rtl',    _rtl);
     await p.setBool('spread', _spread);
+    await p.setDouble('height_frac', _heightFrac);
   }
 
   Future<void> _loadInfo() async {
@@ -128,7 +132,18 @@ class _ReaderScreenState extends State<ReaderScreen> {
           _prefetchAround(_pageToUnitIndex(_total - 1));
         });
       } else {
-        WidgetsBinding.instance.addPostFrameCallback((_) => _prefetchAround(0));
+        // 前回の続きがあればそのページから開く
+        final p = await SharedPreferences.getInstance();
+        final saved = p.getInt('progress_${widget.book.id}') ?? 0;
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (!mounted) return;
+          if (saved > 0 && saved < _total) {
+            _jumpToMangaPage(saved);
+            _prefetchAround(_pageToUnitIndex(saved));
+          } else {
+            _prefetchAround(0);
+          }
+        });
       }
     } catch (e) {
       if (!mounted) return;
@@ -245,6 +260,26 @@ class _ReaderScreenState extends State<ReaderScreen> {
     final pvIdx = _pageToUnitIndex(mangaPage);
     if (_pageCtrl.hasClients) _pageCtrl.jumpToPage(pvIdx);
     setState(() => _page = mangaPage);
+    _saveProgress();
+  }
+
+  // 続きから読むための進捗（現在ページ）と既読履歴を端末内に保存する
+  Future<void> _saveProgress() async {
+    if (_total <= 0) return;
+    final p = await SharedPreferences.getInstance();
+    await p.setInt('progress_${widget.book.id}', _page);
+    final list = p.getStringList('history') ?? [];
+    list.removeWhere((e) {
+      try { return (jsonDecode(e) as Map)['id'] == widget.book.id; }
+      catch (_) { return false; }
+    });
+    list.insert(0, jsonEncode({
+      'id': widget.book.id, 'title': widget.book.title,
+      'page': _page, 'total': _total,
+      'ts': DateTime.now().millisecondsSinceEpoch,
+    }));
+    if (list.length > 100) list.removeRange(100, list.length);
+    await p.setStringList('history', list);
   }
 
   // ── アスペクト比検出 ──────────────────────────────────────────────────────
@@ -264,7 +299,7 @@ class _ReaderScreenState extends State<ReaderScreen> {
             _ratioCache[n] = r;
             if (r < 1.0 && (_refRatio - 0.69).abs() < 0.001) {
               _refRatio = r;
-              if (!_hUser && _lastSize != null) _H = _computeDefaultH(_lastSize!);
+              if (!_hUser && _lastSize != null) _H = _defaultH(_lastSize!);
             }
             _rebuildUnits();
           });
@@ -279,6 +314,12 @@ class _ReaderScreenState extends State<ReaderScreen> {
     final unitRatio = _spread ? (_refRatio * 2) : _refRatio;
     return min(s.width / unitRatio, s.height);
   }
+
+  // 記憶した「画面高さに対する割合」で表示高さを再現（画像比率に依存せず一定の見え方）。
+  // 未設定(_heightFrac==0)のときだけ、ユニットが画面に収まる初回フィットを使う。
+  double _defaultH(Size s) => _heightFrac > 0
+      ? (s.height * _heightFrac).clamp(_minH(), _maxH())
+      : _computeDefaultH(s);
 
   double _minH() => (_lastSize?.height ?? 600) * 0.25;
   double _maxH() => (_lastSize?.height ?? 600);   // 横スクロールのみ対応(=fit height上限)
@@ -363,7 +404,7 @@ class _ReaderScreenState extends State<ReaderScreen> {
       _spread = !_spread;
       _hUser  = false;  // モード変更で高さをデフォルトに戻す
       _unitKeys.clear();
-      if (_lastSize != null) _H = _computeDefaultH(_lastSize!);
+      if (_lastSize != null) _H = _defaultH(_lastSize!);
       _rebuildUnits(startPage: savedManga);
     });
     _savePrefs();
@@ -374,7 +415,15 @@ class _ReaderScreenState extends State<ReaderScreen> {
   void _onPtrDown(PointerDownEvent e) { _ptrs[e.pointer] = e.position; }
   void _onPtrUp(int p) {
     _ptrs.remove(p);
-    if (_ptrs.length < 2) _pinchStartDist = null;
+    if (_ptrs.length < 2) {
+      // ピンチ終了 → 表示高さを「画面高さに対する割合」で記憶（画像が変わっても同じ絶対サイズ）
+      if (_pinchStartDist != null && _hUser &&
+          _lastSize != null && _lastSize!.height > 0) {
+        _heightFrac = (_H / _lastSize!.height).clamp(0.25, 1.0);
+        _savePrefs();
+      }
+      _pinchStartDist = null;
+    }
   }
   void _onPtrMove(PointerMoveEvent e) {
     if (_ptrs.containsKey(e.pointer)) _ptrs[e.pointer] = e.position;
@@ -436,9 +485,9 @@ class _ReaderScreenState extends State<ReaderScreen> {
     final size = MediaQuery.of(context).size;
     if (_lastSize != size) {
       _lastSize = size;
-      if (!_hUser) _H = _computeDefaultH(size);
+      if (!_hUser) _H = _defaultH(size);
     }
-    if (_H == 0) _H = _computeDefaultH(size);
+    if (_H == 0) _H = _defaultH(size);
 
     return Scaffold(
       backgroundColor: Colors.black,
@@ -455,6 +504,7 @@ class _ReaderScreenState extends State<ReaderScreen> {
             itemCount:  _pvCount,
             onPageChanged: (pv) {
               setState(() => _page = _pvToManga(pv));
+              _saveProgress();
               // 「前へ戻る」だった場合、戻った見開きを末尾へジャンプ（左ページ表示）
               if (_didRetreat) {
                 _didRetreat = false;
