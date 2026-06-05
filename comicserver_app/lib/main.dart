@@ -1,11 +1,19 @@
+import 'package:firebase_core/firebase_core.dart';
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'firebase_options.dart';
 import 'screens/login_screen.dart';
 import 'screens/shelf_screen.dart';
 import 'services/api_service.dart';
+import 'services/webrtc_service.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  try {
+    await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
+  } catch (_) {
+    // Firebase未設定の場合はWebRTC P2Pが無効になるが、LAN/VPN動作は継続する
+  }
   runApp(const ComicServerApp());
 }
 
@@ -44,22 +52,19 @@ class _StartScreenState extends State<_StartScreen> {
   }
 
   Future<void> _autoLogin() async {
-    final prefs = await SharedPreferences.getInstance();
-    final url   = prefs.getString('url');
-    final token = prefs.getString('token');
-    final ipv6  = prefs.getString('ipv6');
+    final prefs  = await SharedPreferences.getInstance();
+    final url    = prefs.getString('url');
+    final token  = prefs.getString('token');
+    final ipv6   = prefs.getString('ipv6');
+    final roomId = prefs.getString('room_id') ?? '';
 
     if (url != null && token != null && token.isNotEmpty) {
-      // 候補（LAN直 / IPv6）を同時に試し、最初に応答したもので接続
-      final candidates =
-          buildCandidates(primaryUrl: url, ipv6: ipv6);
+      final candidates = buildCandidates(primaryUrl: url, ipv6: ipv6);
       final working = await ApiService.resolveBaseUrl(candidates, token);
       if (!mounted) return;
       if (working != null) {
         final api = ApiService(
-            baseUrl: working, token: token,
-            candidates: candidates);
-        // 次回のため最新の ipv6 を保存（fire-and-forget）
+            baseUrl: working, token: token, candidates: candidates);
         api.getConnectionInfo().then((info) async {
           if (info == null) return;
           final v6 = (info['ipv6'] ?? '').toString();
@@ -68,6 +73,26 @@ class _StartScreenState extends State<_StartScreen> {
         Navigator.pushReplacement(context,
             MaterialPageRoute(builder: (_) => ShelfScreen(api: api)));
         return;
+      }
+
+      // HTTP候補が全滅 → WebRTC P2P を試みる
+      if (roomId.isNotEmpty) {
+        final webRtc = WebRtcService.instance;
+        final localUrl = await webRtc.connect(
+          roomId: roomId,
+          authToken: token,
+          turnUrl:        prefs.getString('turn_url'),
+          turnUsername:   prefs.getString('turn_username'),
+          turnCredential: prefs.getString('turn_credential'),
+        );
+        if (!mounted) return;
+        if (localUrl != null) {
+          final api = ApiService(
+              baseUrl: localUrl, token: token, candidates: [localUrl]);
+          Navigator.pushReplacement(context,
+              MaterialPageRoute(builder: (_) => ShelfScreen(api: api)));
+          return;
+        }
       }
     }
     if (!mounted) return;
