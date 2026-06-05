@@ -16,6 +16,7 @@ import queue
 import re
 import socket
 import threading
+import time
 import zipfile
 from pathlib import Path
 
@@ -1096,9 +1097,15 @@ def _fb_cfg() -> dict | None:
     return {"api_key": api_key, "database_url": database_url}
 
 
+class _FbAuthError(Exception):
+    """Firebaseが401を返した（idTokenの期限切れ等）。呼び出し側で再認証する。"""
+    pass
+
+
 def _http_json(url: str, method: str = "GET",
                data: dict | None = None, token: str = "") -> dict | None:
-    """Firebase REST API の同期呼び出し。urllib 標準ライブラリのみ使用。"""
+    """Firebase REST API の同期呼び出し。urllib 標準ライブラリのみ使用。
+    401（認証切れ）は _FbAuthError を送出し、呼び出し側で再認証＆リトライさせる。"""
     if token:
         sep = "&" if "?" in url else "?"
         url = f"{url}{sep}auth={token}"
@@ -1110,6 +1117,8 @@ def _http_json(url: str, method: str = "GET",
             text = r.read().decode("utf-8")
             return json.loads(text) if text.strip() not in ("", "null") else None
     except urllib.error.HTTPError as e:
+        if e.code == 401:
+            raise _FbAuthError(url)
         _log_queue.put(f"[WebRTC] Firebase HTTP {e.code}: {url}")
     except Exception as e:
         _log_queue.put(f"[WebRTC] 通信エラー: {e}")
@@ -1126,12 +1135,53 @@ def _fb_put(db_url: str, path: str, data, token: str) -> None:
 
 def _firebase_anon_signin(api_key: str) -> str | None:
     """Firebase匿名認証でidTokenを取得する。"""
-    result = _http_json(
-        f"https://identitytoolkit.googleapis.com/v1/accounts:signUp?key={api_key}",
-        method="POST",
-        data={"returnSecureToken": True},
-    )
+    try:
+        result = _http_json(
+            f"https://identitytoolkit.googleapis.com/v1/accounts:signUp?key={api_key}",
+            method="POST",
+            data={"returnSecureToken": True},
+        )
+    except _FbAuthError:
+        _log_queue.put("[WebRTC] 匿名認証が401。api_key/匿名認証の有効化を確認してください")
+        return None
     return result.get("idToken") if result else None
+
+
+def _reauth(auth: dict) -> bool:
+    """auth['token'] を新しいidTokenに更新する。成功でTrue。auth={'api_key','token'}。"""
+    tok = _firebase_anon_signin(auth["api_key"])
+    if tok:
+        auth["token"] = tok
+        _log_queue.put("[WebRTC] トークンを再認証しました")
+        return True
+    return False
+
+
+def _fb_get_retry(db_url: str, path: str, auth: dict) -> dict | None:
+    """_fb_get の401耐性版。期限切れなら再認証して1回だけリトライ。"""
+    try:
+        return _fb_get(db_url, path, auth["token"])
+    except _FbAuthError:
+        if not _reauth(auth):
+            return None
+        try:
+            return _fb_get(db_url, path, auth["token"])
+        except _FbAuthError:
+            return None
+
+
+def _fb_put_retry(db_url: str, path: str, data, auth: dict) -> None:
+    """_fb_put の401耐性版。期限切れなら再認証して1回だけリトライ。"""
+    try:
+        _fb_put(db_url, path, data, auth["token"])
+        return
+    except _FbAuthError:
+        if not _reauth(auth):
+            return
+        try:
+            _fb_put(db_url, path, data, auth["token"])
+        except _FbAuthError:
+            pass
 
 
 def _dc_response(req_id: int, status: int, content_type: str, body: bytes) -> bytes:
@@ -1271,7 +1321,7 @@ def _handle_dc_request(message: bytes | str) -> bytes:
 
 
 async def _run_peer_async(session_id: str, offer_sdp: str,
-                          db_url: str, room_id: str, fb_token: str,
+                          db_url: str, room_id: str, auth: dict,
                           loop: asyncio.AbstractEventLoop) -> None:
     """1セッション分のWebRTC接続を確立してデータチャネルを処理する。"""
     from aiortc import RTCPeerConnection, RTCSessionDescription, RTCConfiguration, RTCIceServer  # type: ignore
@@ -1303,9 +1353,9 @@ async def _run_peer_async(session_id: str, offer_sdp: str,
             await asyncio.sleep(0.1)
 
         # AnswerをFirebase に書く（ICEはSDP埋め込み済みなので追記不要）
-        await loop.run_in_executor(None, lambda: _fb_put(
+        await loop.run_in_executor(None, lambda: _fb_put_retry(
             db_url, f"rooms/{room_id}/sessions/{session_id}/answer",
-            {"sdp": pc.localDescription.sdp, "type": "answer"}, fb_token,
+            {"sdp": pc.localDescription.sdp, "type": "answer"}, auth,
         ))
         _log_queue.put(f"[WebRTC] Answer送信完了: {session_id[:8]}")
 
@@ -1343,8 +1393,8 @@ async def _run_peer_async(session_id: str, offer_sdp: str,
         await pc.close()
         _active_peers.pop(session_id, None)
         try:
-            await loop.run_in_executor(None, lambda: _fb_put(
-                db_url, f"rooms/{room_id}/sessions/{session_id}", None, fb_token,
+            await loop.run_in_executor(None, lambda: _fb_put_retry(
+                db_url, f"rooms/{room_id}/sessions/{session_id}", None, auth,
             ))
         except Exception:
             pass
@@ -1354,30 +1404,30 @@ async def _signaling_loop_async(api_key: str, db_url: str, room_id: str) -> None
     """Firebase をポーリングして新セッションが来たら _run_peer_async をタスク起動する。"""
     loop = asyncio.get_event_loop()
 
-    fb_token = await loop.run_in_executor(None, lambda: _firebase_anon_signin(api_key))
-    if not fb_token:
+    token = await loop.run_in_executor(None, lambda: _firebase_anon_signin(api_key))
+    if not token:
         _log_queue.put("[WebRTC] Firebase認証失敗")
         return
+    # 全Firebase呼び出しで共有する認証状態。401検知時に token が更新され全員に反映される
+    auth = {"api_key": api_key, "token": token}
 
-    await loop.run_in_executor(None, lambda: _fb_put(
-        db_url, f"rooms/{room_id}/presence", {"host": True}, fb_token,
+    await loop.run_in_executor(None, lambda: _fb_put_retry(
+        db_url, f"rooms/{room_id}/presence", {"host": True}, auth,
     ))
     _log_queue.put("[WebRTC] Firebase接続完了。セッション待機中...")
 
     known: set[str] = set()
-    token_age = 0
+    # 実時間ベースで期限前に先回り更新（PCスリープ後もズレない。万一切れても下のretryが拾う）
+    next_refresh = time.time() + 3300   # 有効期限1時間の5分前
 
     while _signaling_running:
         try:
-            if token_age >= 3300:  # 55分ごとにトークン更新（有効期限1時間）
-                new_tok = await loop.run_in_executor(
-                    None, lambda: _firebase_anon_signin(api_key))
-                if new_tok:
-                    fb_token = new_tok
-                    token_age = 0
+            if time.time() >= next_refresh:
+                ok = await loop.run_in_executor(None, lambda: _reauth(auth))
+                next_refresh = time.time() + (3300 if ok else 60)  # 失敗時は1分後に再試行
 
             sessions = (await loop.run_in_executor(
-                None, lambda: _fb_get(db_url, f"rooms/{room_id}/sessions", fb_token),
+                None, lambda: _fb_get_retry(db_url, f"rooms/{room_id}/sessions", auth),
             )) or {}
 
             for sid, sdata in sessions.items():
@@ -1390,13 +1440,12 @@ async def _signaling_loop_async(api_key: str, db_url: str, room_id: str) -> None
                     offer_sdp = sdata["offer"].get("sdp", "")
                     _log_queue.put(f"[WebRTC] 新セッション: {sid[:8]}")
                     asyncio.create_task(
-                        _run_peer_async(sid, offer_sdp, db_url, room_id, fb_token, loop)
+                        _run_peer_async(sid, offer_sdp, db_url, room_id, auth, loop)
                     )
         except Exception as e:
             _log_queue.put(f"[WebRTC] シグナリングエラー: {e}")
 
         await asyncio.sleep(3)
-        token_age += 3
 
 
 def _signaling_thread_main() -> None:
