@@ -230,18 +230,17 @@ class _ReaderScreenState extends State<ReaderScreen> {
     final sp = _spreadStartPage;
     final list = <_SpreadUnit>[];
     int i = 0;
-    while (i < sp) {
-      // 縦長ページ比の1.5倍以上 → 2ページ合成済みの横長と判断してペアにしない
-      final isWide = (_ratioCache[i] ?? 0) > _refRatio * 1.5;
-      if (isWide || i + 1 >= sp) { list.add(_SpreadUnit(i)); i++; }
-      else { list.add(_SpreadUnit(i, i + 1)); i += 2; }
+    // 縦長ページ比の1.5倍以上 → 2ページ合成済みの横長と判断し単独表示すべきページ
+    bool wide(int p) => (_ratioCache[p] ?? 0) > _refRatio * 1.5;
+    // i を単独にすべきか: 自分が横長 / 末尾 / 次ページが横長(=表紙の次の見開き等)ならペアにしない
+    void addFrom(int end) {
+      while (i < end) {
+        if (wide(i) || i + 1 >= end || wide(i + 1)) { list.add(_SpreadUnit(i)); i++; }
+        else { list.add(_SpreadUnit(i, i + 1)); i += 2; }
+      }
     }
-    while (i < _total) {
-      // 縦長ページ比の1.5倍以上 → 2ページ合成済みの横長と判断してペアにしない
-      final isWide = (_ratioCache[i] ?? 0) > _refRatio * 1.5;
-      if (isWide || i + 1 >= _total) { list.add(_SpreadUnit(i)); i++; }
-      else { list.add(_SpreadUnit(i, i + 1)); i += 2; }
-    }
+    addFrom(sp);
+    addFrom(_total);
     _units = list;
   }
 
