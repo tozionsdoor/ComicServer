@@ -9,6 +9,7 @@ sys.path.insert(0, r"C:\keiri_python\python_embed\Lib\site-packages")
 import asyncio
 import hashlib
 import io
+import ipaddress
 import json
 import logging
 import os
@@ -1341,6 +1342,68 @@ def _fb_put_retry(db_url: str, path: str, data, auth: dict) -> None:
             pass
 
 
+def _fb_delete(db_url: str, path: str, token: str) -> None:
+    # Firebase でノード削除は HTTP DELETE。PUT に本文 None を渡すと400になるため専用にする。
+    _http_json(f"{db_url}/{path}.json", method="DELETE", token=token)
+
+
+def _fb_delete_retry(db_url: str, path: str, auth: dict) -> None:
+    """_fb_delete の401耐性版。期限切れなら再認証して1回だけリトライ。"""
+    try:
+        _fb_delete(db_url, path, auth["token"])
+        return
+    except _FbAuthError:
+        if not _reauth(auth):
+            return
+        try:
+            _fb_delete(db_url, path, auth["token"])
+        except _FbAuthError:
+            pass
+
+
+# Firebase push ID の文字セット（先頭8文字に生成時刻msが48bitで埋まっている）
+_PUSH_CHARS = "-0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz"
+
+
+def _push_id_time_ms(sid: str) -> int | None:
+    """Firebase push ID 先頭8文字から生成時刻(ms)を復元する。解析不能なら None。"""
+    try:
+        t = 0
+        for c in sid[:8]:
+            t = t * 64 + _PUSH_CHARS.index(c)
+        return t
+    except ValueError:
+        return None
+
+
+def _offer_origin(offer_sdp: str) -> str:
+    """offer SDP の ICE candidate から接続元を要約（自分のLAN端末か外部かの判別材料）。"""
+    pub, lan, mdns = set(), set(), False
+    for m in re.finditer(r"candidate:\S+ \d+ \S+ \d+ (\S+) \d+ typ (\w+)", offer_sdp):
+        addr = m.group(1)
+        if addr.endswith(".local"):       # 近年のWebRTCは host候補をmDNS名で秘匿する
+            mdns = True
+            continue
+        try:
+            ip = ipaddress.ip_address(addr)
+        except ValueError:
+            continue
+        # プライベート/リンクローカル/ループバックはLAN、それ以外は外部扱い
+        # （携帯回線のCGNAT等で is_global が False になる住所も外部として拾うため）
+        if ip.is_private or ip.is_link_local or ip.is_loopback:
+            lan.add(addr)
+        else:
+            pub.add(addr)
+    parts = []
+    if pub:
+        parts.append("外部 " + ",".join(sorted(pub)))
+    if lan:
+        parts.append("LAN " + ",".join(sorted(lan)))
+    if mdns and not parts:
+        parts.append("LAN(mDNS秘匿)")
+    return " / ".join(parts) if parts else "不明"
+
+
 def _dc_response(req_id: int, status: int, content_type: str, body: bytes) -> bytes:
     """データチャネルレスポンス: [4B header_len][header JSON][body]"""
     header = json.dumps(
@@ -1550,8 +1613,8 @@ async def _run_peer_async(session_id: str, offer_sdp: str,
         await pc.close()
         _active_peers.pop(session_id, None)
         try:
-            await loop.run_in_executor(None, lambda: _fb_put_retry(
-                db_url, f"rooms/{room_id}/sessions/{session_id}", None, auth,
+            await loop.run_in_executor(None, lambda: _fb_delete_retry(
+                db_url, f"rooms/{room_id}/sessions/{session_id}", auth,
             ))
         except Exception:
             pass
@@ -1595,7 +1658,16 @@ async def _signaling_loop_async(api_key: str, db_url: str, room_id: str) -> None
                         and not sdata.get("answer")):
                     known.add(sid)
                     offer_sdp = sdata["offer"].get("sdp", "")
-                    _log_queue.put(f"[WebRTC] 新セッション: {sid[:8]}")
+                    # サーバー停止中にアプリが書いた古いoffer(ゾンビ)は応答せず破棄する。
+                    # Answerしても相手は居らず30秒タイムアウトするだけなのでログも無駄に流れる。
+                    ts = _push_id_time_ms(sid)
+                    if ts is not None and time.time() * 1000 - ts > 90_000:
+                        _log_queue.put(f"[WebRTC] 古いセッションを破棄: {sid[:8]}")
+                        await loop.run_in_executor(None, lambda s=sid: _fb_delete_retry(
+                            db_url, f"rooms/{room_id}/sessions/{s}", auth))
+                        continue
+                    _log_queue.put(
+                        f"[WebRTC] 新セッション: {sid[:8]}  接続元: {_offer_origin(offer_sdp)}")
                     asyncio.create_task(
                         _run_peer_async(sid, offer_sdp, db_url, room_id, auth, loop)
                     )
