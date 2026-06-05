@@ -615,11 +615,16 @@ header{background:#181825;padding:10px 14px;display:flex;align-items:center;gap:
              oninput="rSeekInput(this.value)" onchange="rSeekChange(this.value)">
       <span id="rpager-d"></span>
     </div>
+    <div id="rvol-nav" style="display:none;gap:16px">
+      <button class="rbtn" id="rbtn-pvol" onclick="rNavVol(-1)">◀ 前の巻</button>
+      <button class="rbtn" id="rbtn-nvol" onclick="rNavVol(+1)">次の巻 ▶</button>
+    </div>
   </div>
 </div>
 <script>
 const dbg=s=>{document.getElementById('dbg').textContent=s;};
 let allBooks=[], curPath='', searching=false;
+let _folderBooks=[];  // 現在表示中フォルダの本リスト（巻ナビ用）
 const x=s=>s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 
 // パスへ遷移
@@ -666,6 +671,7 @@ function render(folders, books){
       <div class="tt">${x(b.title)}</div></div>`
   ).join('');
   document.getElementById('shelf').innerHTML=fc+bc;
+  _folderBooks=books;  // 同フォルダ内の本リストを巻ナビ用に保持
   document.getElementById('cnt').textContent=
     (folders.length?folders.length+' フォルダ':'')+(folders.length&&books.length?' / ':'')+
     (books.length?books.length+' 冊':'');
@@ -749,6 +755,7 @@ let rId='', rPage=0, rTotal=0, rTitle='';
 let rRtl=true, rSpread=false, rUiOn=false, rIsOpen=false;
 let _skipPush=false; // popstate 経由のナビゲーション中は履歴を積まない
 let rThumbTimer=null, rObs=null;
+let rSiblings=[], rSiblingIdx=-1;  // 巻ナビ用: 同フォルダの本リストと現在位置
 
 // ── スロット管理 ─────────────────────────────────────────
 function rSetSlot(slotId,n){
@@ -787,6 +794,10 @@ function rPtSet(dx,animate){
 async function rOpen(id,title){
   if(!_skipPush) history.pushState({v:'r', id, title}, '');
   rId=id; rPage=0; rTotal=0; rTitle=title;
+  // 同フォルダ内での巻ナビ位置を確定
+  const _si=_folderBooks.findIndex(b=>b.id===id);
+  rSiblings=_si>=0?_folderBooks:[]; rSiblingIdx=_si;
+  rUpdateVolNav();
   document.getElementById('rtitle-d').textContent=title;
   rIsOpen=true;
   document.getElementById('reader').style.display='flex';
@@ -821,8 +832,39 @@ function rClose(){
 
 function rStep(){ return rSpread?2:1; }
 
+// 巻ナビ: dir=-1で前の巻, +1で次の巻
+function rNavVol(dir){
+  const idx=rSiblingIdx+dir;
+  if(idx<0||idx>=rSiblings.length) return;
+  rOpen(rSiblings[idx].id, rSiblings[idx].title);
+}
+function rUpdateVolNav(){
+  const hasPrev=rSiblingIdx>0;
+  const hasNext=rSiblingIdx>=0&&rSiblingIdx<rSiblings.length-1;
+  const wrap=document.getElementById('rvol-nav');
+  wrap.style.display=(hasPrev||hasNext)?'flex':'none';
+  document.getElementById('rbtn-pvol').style.visibility=hasPrev?'visible':'hidden';
+  document.getElementById('rbtn-nvol').style.visibility=hasNext?'visible':'hidden';
+}
+
 function rLoad(n){
   if(rTotal===0) return;
+  // 先頭より前へ → 前の巻へ確認
+  if(n<0){
+    if(rSiblingIdx>0){
+      const prev=rSiblings[rSiblingIdx-1];
+      if(confirm('「'+prev.title+'」へ移動しますか？')) rOpen(prev.id,prev.title);
+    }
+    return;
+  }
+  // 末尾より後へ → 次の巻へ確認
+  if(n>=rTotal){
+    if(rSiblingIdx>=0 && rSiblingIdx<rSiblings.length-1){
+      const next=rSiblings[rSiblingIdx+1];
+      if(confirm('「'+next.title+'」へ移動しますか？')) rOpen(next.id,next.title);
+    }
+    return;
+  }
   n=Math.max(0,Math.min(n,rTotal-1));
   rPage=n;
   rUpdateSlots();
@@ -1065,7 +1107,7 @@ window.addEventListener('popstate', e=>{
   _skipPush=true;
   if(rIsOpen) rCloseUI();
   if(!st||st.v==='f') go(st?.path??'');
-  else if(st.v==='r') rOpen(st.id, st.title);
+  else if(st.v==='r') rOpen(st.id, st.title, st.rel||'');
   setTimeout(()=>{_skipPush=false;},0);
 });
 
