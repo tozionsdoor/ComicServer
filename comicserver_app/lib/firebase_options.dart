@@ -11,15 +11,11 @@ class DefaultFirebaseOptions {
   static FirebaseOptions get currentPlatform => android;
 
   static const FirebaseOptions android = FirebaseOptions(
-    // Firebaseコンソール → プロジェクト設定 → 全般 → ウェブAPIキー
-    apiKey: 'YOUR_WEB_API_KEY',
-    // Firebaseコンソール → プロジェクト設定 → 全般 → プロジェクトID
-    projectId: 'YOUR_PROJECT_ID',
-    // Firebaseコンソール → プロジェクト設定 → 全般 → プロジェクト番号
-    messagingSenderId: 'YOUR_PROJECT_NUMBER',
-    // Firebaseコンソール → プロジェクト設定 → Android アプリ → アプリID
-    appId: '1:YOUR_PROJECT_NUMBER:android:YOUR_APP_ID',
-    // Firebaseコンソール → Realtime Database → データ タブの最上部のURL
-    databaseURL: 'YOUR_DATABASE_URL',
+    apiKey: 'AIzaSyCHz05od7Ta6wJFKSWcTisWfhJh_kg1fKQ',
+    projectId: 'comicserver',
+    messagingSenderId: '25817336486',
+    appId: '1:25817336486:android:81a92877c2ee8b4cfc8267',
+    databaseURL:
+        'https://comicserver-default-rtdb.asia-southeast1.firebasedatabase.app',
   );
 }

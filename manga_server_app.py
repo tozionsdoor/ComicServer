@@ -55,8 +55,8 @@ PAGE_CACHE_MAX = 4000                  # 本文ページキャッシュの最大
 # 開発者は↓の2つを一度だけ記入すれば、配布した全サーバーが同じ伝言板を使う。
 # （個別に変えたい場合のみ manga_server_config.json の "firebase" で上書き可能）
 DEFAULT_FIREBASE: dict = {
-    "api_key":      "",  # Firebaseコンソール → プロジェクト設定 → ウェブAPIキー
-    "database_url": "",  # https://xxx-default-rtdb.<region>.firebasedatabase.app
+    "api_key":      "AIzaSyCHz05od7Ta6wJFKSWcTisWfhJh_kg1fKQ",
+    "database_url": "https://comicserver-default-rtdb.asia-southeast1.firebasedatabase.app",
 }
 
 DEFAULT_CONFIG: dict = {

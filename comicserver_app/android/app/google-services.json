@@ -1,13 +1,14 @@
 {
   "project_info": {
-    "project_number": "000000000000",
-    "project_id": "YOUR_PROJECT_ID",
-    "storage_bucket": "YOUR_PROJECT_ID.appspot.com"
+    "project_number": "25817336486",
+    "firebase_url": "https://comicserver-default-rtdb.asia-southeast1.firebasedatabase.app",
+    "project_id": "comicserver",
+    "storage_bucket": "comicserver.firebasestorage.app"
   },
   "client": [
     {
       "client_info": {
-        "mobilesdk_app_id": "1:000000000000:android:0000000000000000000000",
+        "mobilesdk_app_id": "1:25817336486:android:81a92877c2ee8b4cfc8267",
         "android_client_info": {
           "package_name": "com.comicserver.comicserver_app"
         }
@@ -15,7 +16,7 @@
       "oauth_client": [],
       "api_key": [
         {
-          "current_key": "YOUR_API_KEY"
+          "current_key": "AIzaSyCHz05od7Ta6wJFKSWcTisWfhJh_kg1fKQ"
         }
       ],
       "services": {
