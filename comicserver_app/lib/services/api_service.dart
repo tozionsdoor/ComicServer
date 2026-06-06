@@ -1,18 +1,36 @@
 import 'dart:async';
 import 'dart:convert';
+import 'package:flutter/foundation.dart';   // ValueNotifier
 import 'package:http/http.dart' as http;
 import '../models/book.dart';
+import 'webrtc_service.dart';
 
 class ApiService {
   String baseUrl;
   String token;              // 認証トークン（LANペアリングで受け取る or 手動入力）
-  List<String> candidates;   // 接続先候補（LAN直 / IPv6 など）。失敗時に繋ぎ直すのに使う
-  bool _reconnecting = false;
+  List<String> candidates;   // HTTP接続先候補（LAN直 / IPv6 など）。繋ぎ直しでレースする
+  bool viaWebRtc;            // 現在 baseUrl がWebRTCローカルプロキシ(loopback)を指しているか
+
+  // WebRTC P2P を張り直すための材料（prefsから渡す）。HTTP全滅時の保険。
+  String? roomId;
+  String? turnUrl;
+  String? turnUsername;
+  String? turnCredential;
+
+  /// 再接続中に画面下部へ出すステータス文言。null=非表示。UIが購読する。
+  final ValueNotifier<String?> status = ValueNotifier<String?>(null);
+
+  Future<bool>? _reconnectInFlight;   // 同時多発の繋ぎ直しを1本に集約
 
   ApiService({
     required this.baseUrl,
     required this.token,
     List<String>? candidates,
+    this.roomId,
+    this.turnUrl,
+    this.turnUsername,
+    this.turnCredential,
+    this.viaWebRtc = false,
   }) : candidates =
             (candidates == null || candidates.isEmpty) ? [baseUrl] : candidates;
 
@@ -68,18 +86,54 @@ class ApiService {
     return completer.future;
   }
 
-  /// セッション中に経路が変わっても追従する。現行baseUrlを確認し、
-  /// ダメなら候補をレースし直して baseUrl を差し替える。
-  Future<bool> ensureConnected() async {
-    if (await _ping(baseUrl)) return true;
-    if (_reconnecting) return false;   // 同時多発リクエストは1本だけ繋ぎ直す
-    _reconnecting = true;
+  /// WebRTC経路が死んでいるか（ローカルプロキシは生きていても切断後は404を返す）。
+  bool get _transportDead => viaWebRtc && !WebRtcService.instance.isConnected;
+
+  /// 経路が死んでいれば HTTP候補→WebRTC の順で繋ぎ直す。生きていれば即true。
+  /// バックグラウンド復帰時や通信失敗時に呼ぶ（常駐せずオンデマンド）。
+  /// 同時に何度呼ばれても張り直しは1回に集約する。
+  Future<bool> reconnect() {
+    final inflight = _reconnectInFlight;
+    if (inflight != null) return inflight;
+    final f = _doReconnect();
+    _reconnectInFlight = f;
+    f.whenComplete(() => _reconnectInFlight = null);
+    return f;
+  }
+
+  Future<bool> _doReconnect() async {
+    // 現行経路が生きていれば張り直さない（resume時の無駄な再接続・バナー点滅を防ぐ）
+    if (!_transportDead && await _ping(baseUrl)) return true;
+
+    status.value = '再接続中…';
     try {
+      // 1) HTTP候補（LAN/IPv6）をレース。自宅Wi-Fiに戻った等で勝つ。
       final working = await resolveBaseUrl(candidates, token);
-      if (working != null) { baseUrl = working; return true; }
+      if (working != null) {
+        if (viaWebRtc) await WebRtcService.instance.dispose();  // 古いP2Pを片付け
+        baseUrl = working;
+        viaWebRtc = false;
+        return true;
+      }
+      // 2) WebRTC P2P を張り直す（loopbackポートは変わるのでbaseUrlを差し替え）
+      if ((roomId ?? '').isNotEmpty) {
+        status.value = 'P2Pで再接続中…';
+        final localUrl = await WebRtcService.instance.connect(
+          roomId: roomId!,
+          authToken: token,
+          turnUrl: turnUrl,
+          turnUsername: turnUsername,
+          turnCredential: turnCredential,
+        );
+        if (localUrl != null) {
+          baseUrl = localUrl;
+          viaWebRtc = true;
+          return true;
+        }
+      }
       return false;
     } finally {
-      _reconnecting = false;
+      status.value = null;   // バナーを消す（失敗時は呼び出し側がエラー表示を出す）
     }
   }
 
@@ -98,10 +152,17 @@ class ApiService {
   Future<http.Response> _getWithRecovery(String pathAndQuery) async {
     Uri u() => Uri.parse('$baseUrl$pathAndQuery');
     try {
-      return await http.get(u(), headers: headers)
+      final res = await http.get(u(), headers: headers)
           .timeout(const Duration(seconds: 8));
+      // WebRTC切断後はローカルプロキシが404を返す（例外でないので個別に検知）。
+      // 経路が死んでいる時の404だけ「繋ぎ直し」シグナルとして扱う。
+      if (res.statusCode == 404 && _transportDead && await reconnect()) {
+        return http.get(u(), headers: headers)
+            .timeout(const Duration(seconds: 8));
+      }
+      return res;
     } catch (_) {
-      if (await ensureConnected()) {
+      if (await reconnect()) {
         return http.get(u(), headers: headers)
             .timeout(const Duration(seconds: 8));
       }

@@ -142,7 +142,11 @@ class _LoginScreenState extends State<LoginScreen> {
       await prefs.setString('token', token);
       if (!mounted) return;
       final api = ApiService(
-          baseUrl: working, token: token, candidates: candidates);
+          baseUrl: working, token: token, candidates: candidates,
+          roomId: roomId,
+          turnUrl: prefs.getString('turn_url'),
+          turnUsername: prefs.getString('turn_username'),
+          turnCredential: prefs.getString('turn_credential'));
       _refreshConnInfo(api);
       Navigator.pushReplacement(context,
           MaterialPageRoute(builder: (_) => ShelfScreen(api: api)));
@@ -166,7 +170,11 @@ class _LoginScreenState extends State<LoginScreen> {
         await prefs.setString('token', token);
         if (!mounted) return;
         final api = ApiService(
-            baseUrl: localUrl, token: token, candidates: [localUrl]);
+            baseUrl: localUrl, token: token, candidates: candidates,
+            viaWebRtc: true, roomId: roomId,
+            turnUrl: prefs.getString('turn_url'),
+            turnUsername: prefs.getString('turn_username'),
+            turnCredential: prefs.getString('turn_credential'));
         Navigator.pushReplacement(context,
             MaterialPageRoute(builder: (_) => ShelfScreen(api: api)));
         return;

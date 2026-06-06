@@ -8,6 +8,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 import '../models/book.dart';
 import '../services/api_service.dart';
+import '../widgets/reconnect_banner.dart';
 
 // 漫画ページ用の共有キャッシュ。既定（200ファイル/30日）では読み返しで溢れるため
 // 上限を拡大し、表示・先読み・比率検出すべてで同じキャッシュを共有する。
@@ -48,7 +49,7 @@ class ReaderScreen extends StatefulWidget {
   State<ReaderScreen> createState() => _ReaderScreenState();
 }
 
-class _ReaderScreenState extends State<ReaderScreen> {
+class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver {
   int    _total         = 0;
   int    _page          = 0;      // 現在の manga ページ番号
   bool   _rtl           = true;
@@ -95,11 +96,29 @@ class _ReaderScreenState extends State<ReaderScreen> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _pageCtrl = PageController();
     _loadPrefs();
     _loadInfo();
     WakelockPlus.enable();
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    // 復帰時に経路を検証し、死んでいれば繋ぎ直す（常駐なしのオンデマンド再接続）
+    if (state == AppLifecycleState.resumed) _onResume();
+  }
+
+  Future<void> _onResume() async {
+    final before = widget.api.baseUrl;
+    final ok = await widget.api.reconnect();
+    if (!mounted) return;
+    // 経路が変わった時だけ再描画（pageUrlが変わりCachedNetworkImageが再取得する）
+    if (ok && widget.api.baseUrl != before) {
+      setState(() {});
+      _prefetchAround(_pageToUnitIndex(_page));
+    }
   }
 
   Future<void> _loadPrefs() async {
@@ -209,6 +228,7 @@ class _ReaderScreenState extends State<ReaderScreen> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _pageCtrl.dispose();
     WakelockPlus.disable();
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
@@ -537,6 +557,8 @@ class _ReaderScreenState extends State<ReaderScreen> {
 
           if (_magnifierPos != null)
             _buildMagnifier(_magnifierPos!, size),
+
+          ReconnectBanner(api: widget.api),
         ]),
       ),
     );

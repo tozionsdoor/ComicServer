@@ -5,6 +5,7 @@ import '../services/api_service.dart';
 import 'reader_screen.dart';
 import 'login_screen.dart';
 import 'history_screen.dart';
+import '../widgets/reconnect_banner.dart';
 
 class ShelfScreen extends StatefulWidget {
   final ApiService api;
@@ -13,7 +14,7 @@ class ShelfScreen extends StatefulWidget {
   State<ShelfScreen> createState() => _ShelfScreenState();
 }
 
-class _ShelfScreenState extends State<ShelfScreen> {
+class _ShelfScreenState extends State<ShelfScreen> with WidgetsBindingObserver {
   final List<String> _pathStack = [];
   FolderContents? _contents;
   bool _loading = true;
@@ -25,8 +26,33 @@ class _ShelfScreenState extends State<ShelfScreen> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _load('');
     _loadAllBooks();
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _searchCtrl.dispose();
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    // バックグラウンド復帰時だけ経路を検証し、死んでいれば繋ぎ直す（常駐なし）
+    if (state == AppLifecycleState.resumed) _onResume();
+  }
+
+  Future<void> _onResume() async {
+    final before = widget.api.baseUrl;
+    final ok = await widget.api.reconnect();
+    if (!mounted) return;
+    // 経路が変わった（HTTP復帰や新しいloopbackポート）時だけ再読込してURLを張り替え
+    if (ok && widget.api.baseUrl != before) {
+      _load(_currentPath);
+      _loadAllBooks();
+    }
   }
 
   Future<void> _loadAllBooks() async {
@@ -142,7 +168,10 @@ class _ShelfScreenState extends State<ShelfScreen> {
             ),
           ),
         ),
-        body: _buildBody(),
+        body: Stack(children: [
+          _buildBody(),
+          ReconnectBanner(api: widget.api),
+        ]),
       ),
     );
   }
