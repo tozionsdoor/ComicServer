@@ -512,6 +512,18 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
 
   // ── ユニット送り（タップ＆端スワイプ共通） ──────────────────────────────────
   void _advance() {
+    // 見開きモード: ペアの右ページ(first)にいるなら左ページ(second)へ移動してとどまる
+    if (_spread) {
+      final pvIdx = _currentPvIndex();
+      if (pvIdx < _units.length) {
+        final unit = _units[pvIdx];
+        if (unit.isPair && _page == unit.first) {
+          setState(() => _page = unit.second!);
+          _saveProgress();
+          return;
+        }
+      }
+    }
     final pv = _pageCtrl.page?.round() ?? 0;
     if (pv < _pvCount - 1) {
       _didRetreat = false;   // 次へ: 新ページは先頭(読み始め側)から
@@ -523,6 +535,18 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
   }
 
   void _retreat() {
+    // 見開きモード: ペアの左ページ(second)にいるなら右ページ(first)へ戻る
+    if (_spread) {
+      final pvIdx = _currentPvIndex();
+      if (pvIdx < _units.length) {
+        final unit = _units[pvIdx];
+        if (unit.isPair && _page == unit.second) {
+          setState(() => _page = unit.first);
+          _saveProgress();
+          return;
+        }
+      }
+    }
     final pv = _pageCtrl.page?.round() ?? 0;
     if (pv > 0) {
       _didRetreat = true;    // 前へ: 戻った見開きは末尾(読み終わり側=左ページ)から
@@ -668,7 +692,13 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
             physics:    const NeverScrollableScrollPhysics(), // 送りはプログラム制御
             itemCount:  _pvCount,
             onPageChanged: (pv) {
-              setState(() => _page = _pvToManga(pv));
+              final retreating = _didRetreat;
+              _didRetreat = false;
+              // 前へ戻った場合、見開きペアなら左ページ(second)から始める
+              final newPage = retreating && _spread && pv < _units.length && _units[pv].isPair
+                  ? _units[pv].second!
+                  : _pvToManga(pv);
+              setState(() => _page = newPage);
               _saveProgress();
               if (!_filmUserScrolling) {
                 _filmNeedsSync = false;
@@ -676,8 +706,7 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
               } else {
                 _filmNeedsSync = true;
               }
-              if (_didRetreat) {
-                _didRetreat = false;
+              if (retreating) {
                 WidgetsBinding.instance.addPostFrameCallback((_) {
                   _unitKeys[pv]?.currentState?.jumpToEnd();
                 });
