@@ -21,6 +21,7 @@ class _ShelfScreenState extends State<ShelfScreen> with WidgetsBindingObserver {
   String _error  = '';
   final _searchCtrl = TextEditingController();
   bool _searching   = false;
+  bool _rescanning  = false;
   List<BookItem> _allBooks = [];
 
   @override
@@ -70,6 +71,27 @@ class _ShelfScreenState extends State<ShelfScreen> with WidgetsBindingObserver {
       setState(() { _contents = c; _loading = false; });
     } catch (e) {
       setState(() { _loading = false; _error = e.toString(); });
+    }
+  }
+
+  Future<void> _rescan() async {
+    if (_rescanning) return;
+    setState(() => _rescanning = true);
+    try {
+      final books = await widget.api.rescan();
+      await _load(_currentPath);
+      await _loadAllBooks();
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('再スキャン完了: $books冊')),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('再スキャン失敗: $e')),
+      );
+    } finally {
+      if (mounted) setState(() => _rescanning = false);
     }
   }
 
@@ -130,6 +152,20 @@ class _ShelfScreenState extends State<ShelfScreen> with WidgetsBindingObserver {
                   style: TextStyle(
                       color: Color(0xFF89b4fa), fontWeight: FontWeight.bold)),
           actions: [
+            IconButton(
+              icon: _rescanning
+                  ? const SizedBox(
+                      width: 18,
+                      height: 18,
+                      child: CircularProgressIndicator(
+                        strokeWidth: 2,
+                        color: Color(0xFF89b4fa),
+                      ),
+                    )
+                  : const Icon(Icons.refresh, color: Color(0xFF89b4fa)),
+              tooltip: '本棚を更新',
+              onPressed: _rescanning ? null : _rescan,
+            ),
             IconButton(
               icon: const Icon(Icons.history, color: Color(0xFF89b4fa)),
               tooltip: '続き / 履歴',

@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:math' show min, max;
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter_cache_manager/flutter_cache_manager.dart';
@@ -60,6 +61,7 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
   String _error         = '';
 
   late final PageController _pageCtrl;
+  late ScrollController _filmCtrl;
 
   // アスペクト比キャッシュ
   final Map<int, double> _ratioCache = {};
@@ -67,9 +69,12 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
 
   BuildContext? _ctx; // プリフェッチ用コンテキスト
 
-  // 見開きユニット
   List<_SpreadUnit> _units = [];
-  int _spreadStartPage = 0;
+  int _spreadPairStart = 1;
+  bool _filmUserScrolling = false;
+  bool _filmNeedsSync = false;
+  int? _pendingFilmIndex;
+  double _filmViewportW = 0;
 
   // 各見開きの状態にアクセスするキー（戻る時に末尾へジャンプするため）
   final Map<int, GlobalKey<_ScrollUnitState>> _unitKeys = {};
@@ -98,6 +103,7 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     _pageCtrl = PageController();
+    _filmCtrl = ScrollController();
     _loadPrefs();
     _loadInfo();
     WakelockPlus.enable();
@@ -118,6 +124,7 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
     if (ok && widget.api.baseUrl != before) {
       setState(() {});
       _prefetchAround(_pageToUnitIndex(_page));
+      _syncFilmToIndex(_currentPvIndex(), animate: false);
     }
   }
 
@@ -127,6 +134,7 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
     setState(() {
       _rtl    = p.getBool('rtl')    ?? true;
       _spread = p.getBool('spread') ?? false;
+      _spreadPairStart = (p.getInt('spread_pair_offset') ?? 1).clamp(0, 1);
       _heightFrac = p.getDouble('height_frac') ?? 0;
     });
     _rebuildUnits();
@@ -136,6 +144,7 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
     final p = await SharedPreferences.getInstance();
     await p.setBool('rtl',    _rtl);
     await p.setBool('spread', _spread);
+    await p.setInt('spread_pair_offset', _spreadPairStart.clamp(0, 1));
     await p.setDouble('height_frac', _heightFrac);
   }
 
@@ -147,8 +156,17 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
       _rebuildUnits();
       if (widget.startFromEnd && _total > 0) {
         WidgetsBinding.instance.addPostFrameCallback((_) {
-          _jumpToMangaPage(_total - 1);
-          _prefetchAround(_pageToUnitIndex(_total - 1));
+          if (!mounted) return;
+          final target = _total - 1;
+          if (_spread) {
+            setState(() {
+              _unitKeys.clear();
+              _rebuildUnits();
+            });
+          }
+          _jumpToMangaPage(target);
+          _prefetchAround(_pageToUnitIndex(_page));
+          _scheduleFilmSyncToIndex(_currentPvIndex(), animate: false);
         });
       } else {
         // 前回の続きがあればそのページから開く
@@ -157,10 +175,18 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
         WidgetsBinding.instance.addPostFrameCallback((_) {
           if (!mounted) return;
           if (saved > 0 && saved < _total) {
+            if (_spread) {
+              setState(() {
+                _unitKeys.clear();
+                _rebuildUnits();
+              });
+            }
             _jumpToMangaPage(saved);
-            _prefetchAround(_pageToUnitIndex(saved));
+            _prefetchAround(_pageToUnitIndex(_page));
+            _scheduleFilmSyncToIndex(_currentPvIndex(), animate: false);
           } else {
             _prefetchAround(0);
+            _scheduleFilmSyncToIndex(0, animate: false);
           }
         });
       }
@@ -177,6 +203,9 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
   static const int _kPrefetchAhead       = 8;
   static const int _kPrefetchBehind      = 1;
   static const int _kPrefetchConcurrency = 3;
+  static const double _kFilmSlotW = 88.0;
+  static const double _kFilmThumbW = 78.0;
+  static const double _kFilmThumbH = 118.0;
 
   final List<int> _prefetchQueue   = [];
   int             _prefetchInFlight = 0;
@@ -230,14 +259,14 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _pageCtrl.dispose();
+    _filmCtrl.dispose();
     WakelockPlus.disable();
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
     super.dispose();
   }
 
   // ── ユニット構築 ───────────────────────────────────────────────────────────
-  void _rebuildUnits({int? startPage}) {
-    if (startPage != null) _spreadStartPage = startPage;
+  void _rebuildUnits() {
     if (_total == 0) { _units = []; return; }
 
     // 単ページモード: 1ページ=1ユニット
@@ -246,27 +275,41 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
       return;
     }
 
-    // 見開きモード: startPage を右側(first)に揃えてペアを組む
-    final sp = _spreadStartPage;
     final list = <_SpreadUnit>[];
+    final offset = _spreadPairStart.clamp(0, 1);
     int i = 0;
-    // 縦長ページ比の1.5倍以上 → 2ページ合成済みの横長と判断し単独表示すべきページ
-    bool wide(int p) => (_ratioCache[p] ?? 0) > _refRatio * 1.5;
-    // i を単独にすべきか: 自分が横長 / 末尾 / 次ページが横長(=表紙の次の見開き等)ならペアにしない
-    void addFrom(int end) {
+    if (offset == 1 && _total > 0) {
+      list.add(_SpreadUnit(0));
+      i = 1;
+    }
+    bool wide(int p) {
+      final r = _ratioCache[p];
+      if (r == null) return false;
+      return r > _refRatio * 1.8;
+    }
+
+    void addPairedUntil(int end) {
       while (i < end) {
-        if (wide(i) || i + 1 >= end || wide(i + 1)) { list.add(_SpreadUnit(i)); i++; }
-        else { list.add(_SpreadUnit(i, i + 1)); i += 2; }
+        if (wide(i) || i + 1 >= end || wide(i + 1)) {
+          list.add(_SpreadUnit(i));
+          i++;
+        } else {
+          list.add(_SpreadUnit(i, i + 1));
+          i += 2;
+        }
       }
     }
-    addFrom(sp);
-    addFrom(_total);
+
+    addPairedUntil(_total);
     _units = list;
   }
 
   int _pageToUnitIndex(int mangaPage) {
     for (int u = 0; u < _units.length; u++) {
-      if (_units[u].first == mangaPage || _units[u].second == mangaPage) return u;
+      if (_units[u].first == mangaPage) return u;
+    }
+    for (int u = 0; u < _units.length; u++) {
+      if (_units[u].second == mangaPage) return u;
     }
     return 0;
   }
@@ -275,11 +318,91 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
   int _pvToManga(int pvIdx) =>
       (pvIdx >= 0 && pvIdx < _units.length) ? _units[pvIdx].first : 0;
 
+  int _currentPvIndex() {
+    if (_pageCtrl.hasClients) {
+      final p = _pageCtrl.page;
+      if (p != null) return p.round().clamp(0, max(0, _pvCount - 1));
+    }
+    return _pageToUnitIndex(_page).clamp(0, max(0, _pvCount - 1));
+  }
+
   void _jumpToMangaPage(int mangaPage) {
-    final pvIdx = _pageToUnitIndex(mangaPage);
+    final target = mangaPage.clamp(0, _total > 0 ? _total - 1 : 0);
+    final pvIdx = _pageToUnitIndex(target);
+    final displayPage = _spread ? _pvToManga(pvIdx) : target;
     if (_pageCtrl.hasClients) _pageCtrl.jumpToPage(pvIdx);
-    setState(() => _page = mangaPage);
+    setState(() => _page = displayPage);
     _saveProgress();
+  }
+
+  void _syncFilmToIndex(int filmIndex, {bool animate = true}) {
+    if (_total <= 0) return;
+    final filmCount = _filmItemCount();
+    if (filmCount <= 0) return;
+    final targetIndex = filmIndex.clamp(0, filmCount - 1);
+    _pendingFilmIndex = targetIndex;
+    if (!_filmCtrl.hasClients || _filmViewportW <= 0) return;
+    final position = _filmCtrl.position;
+    // レイアウト未確定（content dimensions未設定）ならpendingのまま再試行に任せる
+    if (!position.hasContentDimensions) return;
+
+    final displayIndex = _rtl ? (filmCount - 1 - targetIndex) : targetIndex;
+    final slotW = _filmSlotWidth(_filmViewportW);
+    final rawOffset =
+        displayIndex * slotW - (_filmViewportW - slotW) / 2;
+    final maxOffset = position.maxScrollExtent;
+    final offset = rawOffset.clamp(0.0, maxOffset);
+
+    if ((_filmCtrl.offset - offset).abs() < 0.5) {
+      _pendingFilmIndex = null;
+      return;
+    }
+    if (animate) {
+      _filmCtrl.animateTo(
+        offset,
+        duration: const Duration(milliseconds: 120),
+        curve: Curves.easeOut,
+      );
+    } else {
+      _filmCtrl.jumpTo(offset);
+    }
+    _pendingFilmIndex = null;
+  }
+
+  void _scheduleFilmSyncToIndex(int filmIndex, {bool animate = false}) {
+    final filmCount = _filmItemCount();
+    if (filmCount <= 0) return;
+    final target = filmIndex.clamp(0, filmCount - 1);
+    _pendingFilmIndex = target;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        _syncFilmToIndex(target, animate: animate);
+      });
+    });
+  }
+
+  int _filmItemCount() => _spread ? _units.length : _total;
+
+  void _resetFilmController() {
+    final old = _filmCtrl;
+    _filmCtrl = ScrollController();
+    _filmViewportW = 0;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      old.dispose();
+    });
+  }
+
+  double _filmSlotWidth(double viewportW) {
+    if (!_spread) return _kFilmSlotW;
+    if (viewportW <= 0) return 160.0;
+    return (viewportW / 2.45).clamp(148.0, 188.0);
+  }
+
+  double _filmThumbWidth(double slotW) {
+    if (!_spread) return _kFilmThumbW;
+    return max(136.0, slotW - 10.0);
   }
 
   // 続きから読むための進捗（現在ページ）と既読履歴を端末内に保存する
@@ -363,7 +486,7 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
         backgroundColor: const Color(0xFF181825),
         title: Text(prev ? '前の巻' : '次の巻',
             style: const TextStyle(color: Color(0xFFcdd6f4))),
-        content: Text('「${target.title}」\nに移動しますか？',
+        content: Text('${target.title}\nOpen this volume?',
             style: const TextStyle(color: Color(0xFFa6adc8))),
         actions: [
           TextButton(onPressed: () => Navigator.pop(ctx, false),
@@ -412,22 +535,45 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
 
   // ── モード切替 ───────────────────────────────────────────────────────────
   void _toggleRtl() {
+    _filmUserScrolling = false;
+    _filmNeedsSync = false;
+    _resetFilmController();
     setState(() { _rtl = !_rtl; _unitKeys.clear(); });
     _savePrefs();
+    _scheduleFilmSyncToIndex(_currentPvIndex(), animate: false);
   }
-  void _toggleUI()  => setState(() => _uiVisible = !_uiVisible);
+  void _toggleUI() {
+    final closing = _uiVisible;
+    if (closing) {
+      _filmUserScrolling = false;
+      _filmNeedsSync = false;
+      _syncFilmToIndex(_currentPvIndex(), animate: false);
+    }
+    setState(() => _uiVisible = !_uiVisible);
+    if (!closing) {
+      _scheduleFilmSyncToIndex(_currentPvIndex(), animate: false);
+    }
+  }
 
   void _toggleSpread() {
     final savedManga = _page;
+    _filmUserScrolling = false;
+    _filmNeedsSync = false;
+    _resetFilmController();
     setState(() {
       _spread = !_spread;
       _hUser  = false;  // モード変更で高さをデフォルトに戻す
       _unitKeys.clear();
       if (_lastSize != null) _H = _defaultH(_lastSize!);
-      _rebuildUnits(startPage: savedManga);
+      _rebuildUnits();
     });
     _savePrefs();
-    WidgetsBinding.instance.addPostFrameCallback((_) => _jumpToMangaPage(savedManga));
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      _jumpToMangaPage(savedManga);
+      _prefetchAround(_pageToUnitIndex(_page));
+      _scheduleFilmSyncToIndex(_currentPvIndex(), animate: false);
+    });
   }
 
   // ── ピンチ（固定高さ変更） ─────────────────────────────────────────────────
@@ -524,7 +670,12 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
             onPageChanged: (pv) {
               setState(() => _page = _pvToManga(pv));
               _saveProgress();
-              // 「前へ戻る」だった場合、戻った見開きを末尾へジャンプ（左ページ表示）
+              if (!_filmUserScrolling) {
+                _filmNeedsSync = false;
+                _syncFilmToIndex(pv, animate: true);
+              } else {
+                _filmNeedsSync = true;
+              }
               if (_didRetreat) {
                 _didRetreat = false;
                 WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -632,18 +783,93 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
             IconButton(
               icon: const Icon(Icons.arrow_back, color: Colors.white),
               onPressed: () => Navigator.pop(context)),
-            Expanded(child: Text(widget.book.title,
-                overflow: TextOverflow.ellipsis,
-                style: const TextStyle(color: Colors.white, fontSize: 13))),
-            _uiBtn(_rtl ? 'RTL' : 'LTR', _toggleRtl, active: _rtl),
+            Expanded(
+              child: _MarqueeText(
+                text: widget.book.title,
+                style: const TextStyle(color: Colors.white, fontSize: 13),
+              ),
+            ),
+            _uiBtn(_rtl ? '右綴じ' : '左綴じ', _toggleRtl, active: _rtl),
             _uiBtn(_spread ? '見開き' : '単ページ', _toggleSpread, active: _spread),
+            if (_spread) _uiBtn('1ページずらす', _shiftSpreadByOne),
           ]),
         ),
       ),
     );
   }
 
+  void _shiftSpreadByOne() {
+    if (!_spread || _total <= 1) return;
+    final currentUnit =
+        _units.isEmpty ? _SpreadUnit(_page) : _units[_pageToUnitIndex(_page)];
+    final target = (currentUnit.second ?? min(currentUnit.first + 1, _total - 1))
+        .clamp(0, _total - 1)
+        .toInt();
+    _filmUserScrolling = false;
+    _filmNeedsSync = false;
+    _resetFilmController();
+    setState(() {
+      _didRetreat = false;
+      _unitKeys.clear();
+      _spreadPairStart = _spreadPairStart == 0 ? 1 : 0;
+      _rebuildUnits();
+    });
+    _savePrefs();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      _jumpToMangaPage(target);
+      _prefetchAround(_pageToUnitIndex(_page));
+      _scheduleFilmSyncToIndex(_currentPvIndex(), animate: false);
+    });
+  }
+
   // ── 下部オーバーレイ ──────────────────────────────────────────────────────
+  Widget _volumeNavButton({
+    required bool show,
+    required bool prev,
+    required bool alignRight,
+  }) {
+    if (!show) return const SizedBox();
+    final idx = widget.bookIndex + (prev ? -1 : 1);
+    if (idx < 0 || idx >= widget.siblings.length) return const SizedBox();
+    final icon = prev
+        ? (_rtl ? Icons.skip_next : Icons.skip_previous)
+        : (_rtl ? Icons.skip_previous : Icons.skip_next);
+    const titleStyle = TextStyle(color: Color(0xFF89b4fa), fontSize: 11);
+    return TextButton(
+      onPressed: () => _askVolume(prev: prev),
+      style: TextButton.styleFrom(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+        minimumSize: const Size(0, 36),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.max,
+        children: alignRight
+            ? [
+                Expanded(
+                  child: _MarqueeText(
+                    text: widget.siblings[idx].title,
+                    style: titleStyle,
+                    textAlign: TextAlign.right,
+                  ),
+                ),
+                const SizedBox(width: 6),
+                Icon(icon, color: const Color(0xFF89b4fa), size: 16),
+              ]
+            : [
+                Icon(icon, color: const Color(0xFF89b4fa), size: 16),
+                const SizedBox(width: 6),
+                Expanded(
+                  child: _MarqueeText(
+                    text: widget.siblings[idx].title,
+                    style: titleStyle,
+                  ),
+                ),
+              ],
+      ),
+    );
+  }
+
   Widget _bottomOverlay(BuildContext context) {
     return Positioned(bottom: 0, left: 0, right: 0,
       child: GestureDetector(onTap: _toggleUI,
@@ -652,11 +878,13 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
             begin: Alignment.bottomCenter, end: Alignment.topCenter,
             colors: [Colors.black87, Colors.transparent])),
           padding: EdgeInsets.fromLTRB(
-              16, 16, 16, MediaQuery.of(context).padding.bottom + 8),
+              8, 16, 8, MediaQuery.of(context).padding.bottom + 8),
           child: Column(mainAxisSize: MainAxisSize.min, children: [
             Text('${_page + 1} / $_total',
                 style: const TextStyle(color: Colors.white70, fontSize: 13)),
             const SizedBox(height: 4),
+            _buildFilmStripV2(),
+            const SizedBox(height: 8),
             SliderTheme(
               data: SliderTheme.of(context).copyWith(
                 activeTrackColor:   const Color(0xFF89b4fa),
@@ -676,25 +904,36 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
               ),
             ),
             if (widget.siblings.length > 1)
-              Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
-                if (widget.bookIndex > 0)
-                  TextButton.icon(
-                    onPressed: () => _askVolume(prev: true),
-                    icon: const Icon(Icons.skip_previous,
-                        color: Color(0xFF89b4fa), size: 16),
-                    label: Text(widget.siblings[widget.bookIndex - 1].title,
-                        style: const TextStyle(color: Color(0xFF89b4fa), fontSize: 11),
-                        overflow: TextOverflow.ellipsis))
-                else const SizedBox(),
-                if (widget.bookIndex < widget.siblings.length - 1)
-                  TextButton.icon(
-                    onPressed: () => _askVolume(prev: false),
-                    icon: const Icon(Icons.skip_next,
-                        color: Color(0xFF89b4fa), size: 16),
-                    label: Text(widget.siblings[widget.bookIndex + 1].title,
-                        style: const TextStyle(color: Color(0xFF89b4fa), fontSize: 11),
-                        overflow: TextOverflow.ellipsis))
-                else const SizedBox(),
+              Row(children: [
+                // 右綴じは下部ナビの左右を反転: 左=次の巻 / 右=前の巻
+                // 左綴じは従来通り: 左=前の巻 / 右=次の巻
+                Expanded(
+                  child: !_rtl
+                      ? _volumeNavButton(
+                          show: widget.bookIndex > 0,
+                          prev: true,
+                          alignRight: false,
+                        )
+                      : _volumeNavButton(
+                          show: widget.bookIndex < widget.siblings.length - 1,
+                          prev: false,
+                          alignRight: false,
+                        ),
+                ),
+                const SizedBox(width: 6),
+                Expanded(
+                  child: !_rtl
+                      ? _volumeNavButton(
+                          show: widget.bookIndex < widget.siblings.length - 1,
+                          prev: false,
+                          alignRight: true,
+                        )
+                      : _volumeNavButton(
+                          show: widget.bookIndex > 0,
+                          prev: true,
+                          alignRight: true,
+                        ),
+                ),
               ]),
           ]),
         ),
@@ -702,10 +941,142 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
     );
   }
 
-  // ── 虫眼鏡 ────────────────────────────────────────────────────────────────
   Rect? _currentContentRect() {
     final pv = _pageCtrl.page?.round() ?? 0;
     return _unitKeys[pv]?.currentState?.contentRect();
+  }
+
+  Widget _buildFilmStripV2() {
+    if (_total <= 0) return const SizedBox.shrink();
+    final filmItems = _spread
+        ? _units
+        : [for (int i = 0; i < _total; i++) _SpreadUnit(i)];
+    final filmCount = filmItems.length;
+    if (filmCount <= 0) return const SizedBox.shrink();
+
+    Widget thumbImage(int page, {int memWidth = 220}) {
+      return CachedNetworkImage(
+        imageUrl: widget.api.pageUrl(widget.book.id, page),
+        httpHeaders: widget.api.headers,
+        cacheManager: _pageCacheManager,
+        memCacheWidth: memWidth,
+        maxWidthDiskCache: memWidth,
+        fit: BoxFit.cover,
+        fadeInDuration: Duration.zero,
+        placeholder: (_, __) => Container(
+          color: const Color(0xFF1e1e2e),
+        ),
+        errorWidget: (_, __, ___) => const ColoredBox(
+          color: Color(0xFF1e1e2e),
+          child: Center(
+            child: Icon(Icons.broken_image, color: Colors.white30, size: 16),
+          ),
+        ),
+      );
+    }
+
+    return SizedBox(
+      height: 126,
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          _filmViewportW = constraints.maxWidth;
+          if (_pendingFilmIndex != null) {
+            WidgetsBinding.instance.addPostFrameCallback((_) {
+              if (!mounted) return;
+              final pending = _pendingFilmIndex;
+              if (pending != null) _syncFilmToIndex(pending, animate: false);
+            });
+          }
+          final slotW = _filmSlotWidth(_filmViewportW);
+          final thumbW = _filmThumbWidth(slotW);
+          const thumbH = _kFilmThumbH;
+          return NotificationListener<ScrollNotification>(
+            onNotification: (n) {
+              if (n is ScrollStartNotification && n.dragDetails != null) {
+                _filmUserScrolling = true;
+              } else if (n is ScrollEndNotification) {
+                _filmUserScrolling = false;
+                if (_filmNeedsSync) {
+                  _filmNeedsSync = false;
+                  _syncFilmToIndex(_currentPvIndex(), animate: true);
+                }
+              } else if (n is UserScrollNotification &&
+                  n.direction == ScrollDirection.idle) {
+                _filmUserScrolling = false;
+                if (_filmNeedsSync) {
+                  _filmNeedsSync = false;
+                  _syncFilmToIndex(_currentPvIndex(), animate: true);
+                }
+              }
+              return false;
+            },
+            child: ListView.builder(
+                  controller: _filmCtrl,
+                  scrollDirection: Axis.horizontal,
+                  physics: const BouncingScrollPhysics(),
+                  clipBehavior: Clip.none,
+                  itemCount: filmCount,
+                  itemBuilder: (context, displayIndex) {
+                    final filmIndex =
+                        _rtl ? (filmCount - 1 - displayIndex) : displayIndex;
+                    final item = filmItems[filmIndex];
+                    final page = item.first;
+                    final selected =
+                        item.first == _page || item.second == _page;
+                    return SizedBox(
+                      width: slotW,
+                      child: Center(
+                        child: GestureDetector(
+                          onTap: () {
+                            _filmUserScrolling = false;
+                            _filmNeedsSync = false;
+                            _jumpToMangaPage(page);
+                            _prefetchAround(_pageToUnitIndex(page));
+                            _syncFilmToIndex(filmIndex, animate: true);
+                          },
+                          child: AnimatedContainer(
+                            duration: const Duration(milliseconds: 120),
+                            curve: Curves.easeOut,
+                            width: thumbW,
+                            height: thumbH,
+                            decoration: BoxDecoration(
+                              borderRadius: BorderRadius.circular(6),
+                              border: Border.all(
+                                color: selected
+                                    ? const Color(0xFF89b4fa)
+                                    : Colors.white24,
+                                width: selected ? 1.8 : 1.0,
+                              ),
+                            ),
+                            clipBehavior: Clip.antiAlias,
+                            child: item.isPair
+                                ? Row(
+                                    children: [
+                                      Expanded(
+                                        child: thumbImage(
+                                          _rtl ? item.second! : item.first,
+                                          memWidth: 160,
+                                        ),
+                                      ),
+                                      Expanded(
+                                        child: thumbImage(
+                                          _rtl ? item.first : item.second!,
+                                          memWidth: 160,
+                                        ),
+                                      ),
+                                    ],
+                                  )
+                                : thumbImage(page),
+                          ),
+                        ),
+                      ),
+                    );
+                  },
+                ),
+          );
+        },
+      ),
+    );
   }
 
   Widget _buildMagnifier(Offset fingerPos, Size screenSize) {
@@ -796,6 +1167,160 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
         ),
       ),
     );
+  }
+}
+
+class _MarqueeText extends StatefulWidget {
+  final String text;
+  final TextStyle style;
+  final TextAlign textAlign;
+
+  const _MarqueeText({
+    required this.text,
+    required this.style,
+    this.textAlign = TextAlign.left,
+  });
+
+  @override
+  State<_MarqueeText> createState() => _MarqueeTextState();
+}
+
+class _MarqueeTextState extends State<_MarqueeText>
+    with SingleTickerProviderStateMixin {
+  static const double _gap = 24.0;
+  static const double _speedPxPerSec = 25.0; // さらに少し速め
+  static const int _pauseEndMs = 700;        // 末端で一時停止
+  late final AnimationController _ctrl;
+  double _overflow = 0;
+  double _boxWidth = 0;
+  double _textWidth = 0;
+  double _moveFraction = 1.0;
+
+  @override
+  void initState() {
+    super.initState();
+    _ctrl = AnimationController(vsync: this);
+  }
+
+  @override
+  void didUpdateWidget(covariant _MarqueeText oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.text != widget.text || oldWidget.style != widget.style) {
+      _scheduleRecalc();
+    }
+  }
+
+  @override
+  void dispose() {
+    _ctrl.dispose();
+    super.dispose();
+  }
+
+  void _scheduleRecalc() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || _boxWidth <= 0) return;
+      _recalc(_boxWidth);
+    });
+  }
+
+  void _startTicker() {
+    final travel = _textWidth + _gap;
+    final moveMs = (travel / _speedPxPerSec * 1000).round().clamp(5000, 24000);
+    final totalMs = moveMs + _pauseEndMs;
+    _moveFraction = moveMs / totalMs;
+    _ctrl.stop();
+    _ctrl.duration = Duration(milliseconds: totalMs);
+    _ctrl.value = 0;
+    _ctrl.repeat();
+  }
+
+  void _recalc(double maxWidth) {
+    final painter = TextPainter(
+      text: TextSpan(text: widget.text, style: widget.style),
+      textDirection: TextDirection.ltr,
+      maxLines: 1,
+    )..layout(minWidth: 0, maxWidth: double.infinity);
+
+    _textWidth = painter.width;
+    final newOverflow = _textWidth - maxWidth;
+    final overflow = newOverflow > 0 ? newOverflow : 0.0;
+    final changed = (overflow - _overflow).abs() >= 0.5;
+    if (!changed) {
+      if (overflow > 0 && !_ctrl.isAnimating) {
+        _startTicker();
+        if (mounted) setState(() {});
+      }
+      return;
+    }
+
+    final hadOverflow = _overflow > 0;
+    _overflow = overflow;
+    if (_overflow <= 0) {
+      _ctrl.stop();
+      if (mounted) setState(() {});
+      return;
+    }
+
+    _startTicker();
+    if (!hadOverflow && mounted) setState(() {});
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return LayoutBuilder(builder: (_, constraints) {
+      final w = constraints.maxWidth;
+      if ((w - _boxWidth).abs() > 0.5) {
+        _boxWidth = w;
+        _scheduleRecalc();
+      }
+
+      if (_overflow <= 0) {
+        return Text(
+          widget.text,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          textAlign: widget.textAlign,
+          style: widget.style,
+        );
+      }
+
+      return ClipRect(
+        child: AnimatedBuilder(
+          animation: _ctrl,
+          builder: (_, __) {
+            final t = _ctrl.value;
+            final travel = _textWidth + _gap;
+            final moveT = t <= _moveFraction ? (t / _moveFraction) : 1.0;
+            final dx = -travel * moveT;
+            return Transform.translate(
+              offset: Offset(dx, 0),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(
+                    widget.text,
+                    maxLines: 1,
+                    softWrap: false,
+                    overflow: TextOverflow.visible,
+                    textAlign: widget.textAlign,
+                    style: widget.style,
+                  ),
+                  const SizedBox(width: _gap),
+                  Text(
+                    widget.text,
+                    maxLines: 1,
+                    softWrap: false,
+                    overflow: TextOverflow.visible,
+                    textAlign: widget.textAlign,
+                    style: widget.style,
+                  ),
+                ],
+              ),
+            );
+          },
+        ),
+      );
+    });
   }
 }
 

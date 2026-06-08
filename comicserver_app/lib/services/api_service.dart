@@ -170,6 +170,27 @@ class ApiService {
     }
   }
 
+  /// 通信失敗時に1回だけ繋ぎ直して再試行するPOST。
+  Future<http.Response> _postWithRecovery(String pathAndQuery) async {
+    Uri u() => Uri.parse('$baseUrl$pathAndQuery');
+    try {
+      final res = await http.post(u(), headers: headers)
+          .timeout(const Duration(seconds: 8));
+      // WebRTC切断後はローカルプロキシが404を返す（例外でないので個別に検知）。
+      if (res.statusCode == 404 && _transportDead && await reconnect()) {
+        return http.post(u(), headers: headers)
+            .timeout(const Duration(seconds: 8));
+      }
+      return res;
+    } catch (_) {
+      if (await reconnect()) {
+        return http.post(u(), headers: headers)
+            .timeout(const Duration(seconds: 8));
+      }
+      rethrow;
+    }
+  }
+
   Future<FolderContents> getFolders(String path) async {
     final res = await _getWithRecovery(
         '/api/folders?path=${Uri.encodeQueryComponent(path)}');
@@ -202,6 +223,17 @@ class ApiService {
       }
     } catch (_) {}
     return null;
+  }
+
+  /// サーバー側の蔵書再スキャンを実行し、登録冊数を返す。
+  Future<int> rescan() async {
+    final res = await _postWithRecovery('/api/scan');
+    if (res.statusCode != 200) throw Exception('HTTP ${res.statusCode}');
+    final data = jsonDecode(res.body);
+    if (data is Map && data['books'] is num) {
+      return (data['books'] as num).toInt();
+    }
+    throw Exception('Invalid response');
   }
 }
 

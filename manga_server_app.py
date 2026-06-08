@@ -842,9 +842,16 @@ function rUpdateVolNav(){
   const hasPrev=rSiblingIdx>0;
   const hasNext=rSiblingIdx>=0&&rSiblingIdx<rSiblings.length-1;
   const wrap=document.getElementById('rvol-nav');
+  const pbtn=document.getElementById('rbtn-pvol');
+  const nbtn=document.getElementById('rbtn-nvol');
   wrap.style.display=(hasPrev||hasNext)?'flex':'none';
-  document.getElementById('rbtn-pvol').style.visibility=hasPrev?'visible':'hidden';
-  document.getElementById('rbtn-nvol').style.visibility=hasNext?'visible':'hidden';
+  // 右綴じ時は下部ナビの左右を反転（左=次の巻 / 右=前の巻）
+  wrap.style.flexDirection=rRtl?'row-reverse':'row';
+  // 右綴じ: 次の巻=左向き / 前の巻=右向き
+  pbtn.textContent=rRtl?'前の巻 ▶':'◀ 前の巻';
+  nbtn.textContent=rRtl?'◀ 次の巻':'次の巻 ▶';
+  pbtn.style.visibility=hasPrev?'visible':'hidden';
+  nbtn.style.visibility=hasNext?'visible':'hidden';
 }
 
 function rLoad(n){
@@ -887,6 +894,7 @@ function rToggleDir(){
   b.classList.toggle('on',rRtl);
   rUpdateSlots();
   rApplyRtlLayout();
+  rUpdateVolNav();
   rFilmHL(rPage);
 }
 
