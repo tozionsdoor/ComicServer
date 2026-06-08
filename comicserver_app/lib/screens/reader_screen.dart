@@ -512,13 +512,14 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
 
   // ── ユニット送り（タップ＆端スワイプ共通） ──────────────────────────────────
   void _advance() {
-    // 見開きモード: ペアの右ページ(first)にいるなら左ページ(second)へ移動してとどまる
+    // 見開きモード: ユニット内が末尾でなければ左ページへスクロール、末尾なら次ユニットへ
     if (_spread) {
       final pvIdx = _currentPvIndex();
-      if (pvIdx < _units.length) {
-        final unit = _units[pvIdx];
-        if (unit.isPair && _page == unit.first) {
-          setState(() => _page = unit.second!);
+      if (pvIdx < _units.length && _units[pvIdx].isPair) {
+        final state = _unitKeys[pvIdx]?.currentState;
+        if (state != null && !state.isAtEnd()) {
+          state.animateToEnd();
+          setState(() => _page = _units[pvIdx].second!);
           _saveProgress();
           return;
         }
@@ -535,13 +536,14 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
   }
 
   void _retreat() {
-    // 見開きモード: ペアの左ページ(second)にいるなら右ページ(first)へ戻る
+    // 見開きモード: ユニット内が先頭でなければ右ページへスクロール、先頭なら前ユニットへ
     if (_spread) {
       final pvIdx = _currentPvIndex();
-      if (pvIdx < _units.length) {
-        final unit = _units[pvIdx];
-        if (unit.isPair && _page == unit.second) {
-          setState(() => _page = unit.first);
+      if (pvIdx < _units.length && _units[pvIdx].isPair) {
+        final state = _unitKeys[pvIdx]?.currentState;
+        if (state != null && !state.isAtStart()) {
+          state.animateToStart();
+          setState(() => _page = _units[pvIdx].first);
           _saveProgress();
           return;
         }
@@ -1397,6 +1399,26 @@ class _ScrollUnitState extends State<_ScrollUnit> {
   // 末尾（読み終わり側）へ即ジャンプ。前の見開きに戻った時に左ページを表示する用
   void jumpToEnd() {
     if (_c.hasClients) _c.jumpTo(_c.position.maxScrollExtent);
+  }
+
+  // タップ1ページ送り用: スクロール端判定＆アニメーション移動
+  bool isAtEnd() {
+    if (!_c.hasClients) return true;
+    final max = _c.position.maxScrollExtent;
+    return max <= 0 || _c.position.pixels >= max - 1;
+  }
+  bool isAtStart() {
+    if (!_c.hasClients) return true;
+    final max = _c.position.maxScrollExtent;
+    return max <= 0 || _c.position.pixels <= 1;
+  }
+  void animateToEnd() {
+    if (_c.hasClients) _c.animateTo(_c.position.maxScrollExtent,
+        duration: const Duration(milliseconds: 220), curve: Curves.easeOut);
+  }
+  void animateToStart() {
+    if (_c.hasClients) _c.animateTo(0,
+        duration: const Duration(milliseconds: 220), curve: Curves.easeOut);
   }
 
   // 虫眼鏡用: コンテンツのグローバルRect
