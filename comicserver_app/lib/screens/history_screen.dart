@@ -192,6 +192,7 @@ class _HistoryScreenState extends State<HistoryScreen> {
                     child: CachedNetworkImage(
                       imageUrl: widget.api.coverUrl(id),
                       httpHeaders: widget.api.headers,
+                      cacheManager: widget.api.cacheManager,
                       fit: BoxFit.cover,
                       width: double.infinity,
                       placeholder: (_, __) =>

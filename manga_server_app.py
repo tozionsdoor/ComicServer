@@ -39,6 +39,13 @@ from fastapi.responses import Response, HTMLResponse
 import secrets
 import base64
 import uvicorn
+import datetime
+
+from cryptography import x509
+from cryptography.x509.oid import NameOID
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.x509 import load_pem_x509_certificate
 
 # ─── 定数 ────────────────────────────────────────────────────────────────────
 UNRAR_PATH      = r"C:\Program Files\WinRAR\UnRAR.exe"
@@ -54,6 +61,9 @@ COVER_W, COVER_H = 200, 280
 PAGE_MAX     = 1800   # 長辺の最大ピクセル（スマホ向けリサイズ）
 
 CONFIG_PATH = Path(__file__).parent / "manga_server_config.json"
+_TLS_DIR    = Path(__file__).parent          # 証明書をスクリプトと同じフォルダに置く
+CERT_PATH   = _TLS_DIR / "server.crt"
+KEY_PATH    = _TLS_DIR / "server.key"
 CACHE_DIR   = Path.home() / ".manga_server" / "cache"  # ローカルに保存（NAS越しI/O回避）
 PAGE_CACHE_DIR = CACHE_DIR / "pages"   # リサイズ済み本文ページのディスクキャッシュ
 PAGE_CACHE_MAX = 4000                  # 本文ページキャッシュの最大ファイル数（超過分は古い順に削除）
@@ -92,6 +102,43 @@ def _new_token() -> str:
 def _new_room_id() -> str:
     """WebRTC部屋IDを生成（URLセーフ・約32文字）。"""
     return secrets.token_urlsafe(24)
+
+# ─── TLS 自己署名証明書 ───────────────────────────────────────────────────────
+_cert_fingerprint: str = ""   # SHA-256(DER) hex。起動時に ensure_tls_cert() で設定される
+
+def ensure_tls_cert() -> str:
+    """自己署名EC証明書が無ければ生成し、SHA-256フィンガープリント(hex)を返す。"""
+    global _cert_fingerprint
+    if CERT_PATH.exists() and KEY_PATH.exists():
+        try:
+            cert = load_pem_x509_certificate(CERT_PATH.read_bytes())
+            fp = cert.fingerprint(hashes.SHA256()).hex()
+            _cert_fingerprint = fp
+            return fp
+        except Exception:
+            pass  # 壊れていれば再生成
+    # 新規生成
+    key = ec.generate_private_key(ec.SECP256R1())
+    subject = issuer = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "ComicServer")])
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(issuer)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(datetime.datetime.now(datetime.timezone.utc))
+        .not_valid_after(datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=3650))
+        .sign(key, hashes.SHA256())
+    )
+    CERT_PATH.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+    KEY_PATH.write_bytes(key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.TraditionalOpenSSL,
+        serialization.NoEncryption(),
+    ))
+    fp = cert.fingerprint(hashes.SHA256()).hex()
+    _cert_fingerprint = fp
+    return fp
 
 # ─── グローバル状態（GUI ↔ API 共有） ─────────────────────────────────────────
 _books: dict[str, dict] = {}    # book_id -> {path, title, folder, pages}
@@ -450,6 +497,7 @@ def _connection_info(requester_ip: str = "") -> dict:
                     "room_id": _config.get("room_id", ""),
                     "host": get_local_ip(), "port": int(_config.get("port", 8765)),
                     "ipv6": get_global_ipv6(), "reg_nonce": nonce,
+                    "cert_fingerprint": _cert_fingerprint,
                 }
     nonce = secrets.token_urlsafe(16)
     _reg_nonces[nonce] = time.time() + 300  # 5分有効
@@ -464,6 +512,7 @@ def _connection_info(requester_ip: str = "") -> dict:
         "room_id": _config.get("room_id", ""),
         "host": get_local_ip(), "port": int(_config.get("port", 8765)),
         "ipv6": get_global_ipv6(), "reg_nonce": nonce,
+        "cert_fingerprint": _cert_fingerprint,
     }
 
 def _discovery_responder() -> None:
@@ -1902,12 +1951,14 @@ class _NoSignalServer(uvicorn.Server):
         pass
 
 class _UvicornThread(threading.Thread):
-    def __init__(self, host: str, port: int):
+    def __init__(self, host: str, port: int,
+                 ssl_certfile: str = "", ssl_keyfile: str = ""):
         super().__init__(daemon=True)
-        self._srv = _NoSignalServer(
-            uvicorn.Config(api, host=host, port=port,
-                           log_config=None)  # pythonw.exe は stdout=None なので uvicorn のログ設定をスキップ
-        )
+        kw: dict = dict(host=host, port=port, log_config=None)
+        if ssl_certfile and ssl_keyfile:
+            kw["ssl_certfile"] = ssl_certfile
+            kw["ssl_keyfile"]  = ssl_keyfile
+        self._srv = _NoSignalServer(uvicorn.Config(api, **kw))
         self.error: str = ""
 
     def run(self) -> None:
@@ -1923,7 +1974,8 @@ class _UvicornThread(threading.Thread):
     def stop(self) -> None:
         self._srv.should_exit = True
 
-_server_thread: _UvicornThread | None = None
+_server_thread:    _UvicornThread | None = None
+_server_thread_v6: _UvicornThread | None = None
 
 # uvicorn のログを _log_queue に流す
 class _QueueHandler(logging.Handler):
@@ -2332,23 +2384,39 @@ class App(tk.Tk):
                 n = len(_books)
                 self._log(f"スキャン済み: {n} 冊")
 
+            self._log("[DEBUG] TLS証明書確認中...")
+            fp = ensure_tls_cert()
+            self._log(f"  cert fingerprint: {fp[:16]}…")
+
             self._log("[DEBUG] UvicornThread 作成中...")
             host = _config.get("host", "0.0.0.0")
             port = _config.get("port", 8765)
-            _server_thread = _UvicornThread(host, port)
+            cert = str(CERT_PATH)
+            key  = str(KEY_PATH)
+            _server_thread = _UvicornThread(host, port, cert, key)
             self._log("[DEBUG] start() 呼び出し...")
             _server_thread.start()
             self._log("[DEBUG] start() 完了")
+
+            # IPv6 デュアルリッスン（失敗しても本体は動く）
+            global _server_thread_v6
+            try:
+                _server_thread_v6 = _UvicornThread("::", port, cert, key)
+                _server_thread_v6.start()
+                self._log(f"IPv6 HTTPS listen 開始 (:::){port}")
+            except Exception as _e6:
+                self._log(f"IPv6 listen: 起動失敗（無視）: {_e6}")
+                _server_thread_v6 = None
+
             start_discovery_responder()   # LAN自動発見の応答を開始
             start_webrtc_signaling()      # WebRTC P2Pシグナリングを開始（Firebase未設定なら即終了）
 
             self._log("[DEBUG] IPアドレス取得中...")
             ip  = get_local_ip()
-            url = f"http://{ip}:{port}"
+            url = f"https://{ip}:{port}"
             self.after(0, lambda: self._status_lbl.configure(
                 text=f"起動中...  {url}", fg="#f9e2af"))
-            self._log(f"サーバー起動中: {url}")
-            self._log(f"  認証トークン: {_config.get('token', '')[:8]}…（設定欄でコピー可）")
+            self._log(f"サーバー起動中: {url}（HTTPS）")
             self._log(f"  登録冊数: {n} 冊")
             self.after(5000, lambda: self._check_server_alive(url))
 
@@ -2386,10 +2454,13 @@ class App(tk.Tk):
                 f"サーバーを起動できませんでした。\n\n{err}")
 
     def _stop_server(self):
-        global _server_thread
+        global _server_thread, _server_thread_v6
         if _server_thread:
             _server_thread.stop()
             _server_thread = None
+        if _server_thread_v6:
+            _server_thread_v6.stop()
+            _server_thread_v6 = None
         self._dot.configure(fg=FG_RED)
         self._status_lbl.configure(text="停止中", fg=FG_DIM)
         self._start_btn.configure(state=tk.NORMAL)
@@ -2404,7 +2475,7 @@ class App(tk.Tk):
             return
         port  = _config.get("port", 8765)
         token = _browser_token()
-        webbrowser.open(f"http://127.0.0.1:{port}/?token={token}")
+        webbrowser.open(f"https://127.0.0.1:{port}/?token={token}")
         self._log("ブラウザでビューワーを開きました")
 
     # ── 閉じる / 最小化 / システムトレイ ──────────────────────────────────────

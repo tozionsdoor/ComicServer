@@ -9,20 +9,22 @@ class DiscoveredServer {
   final int    port;      // TCPポート
   final String ipv6;      // グローバルIPv6（外出先用、無ければ空）
   final String token;     // 旧サーバー互換（新サーバーは空）
-  final String regNonce;  // 端末登録ノンス（新サーバー）
-  final String roomId;    // WebRTC部屋ID
+  final String regNonce;        // 端末登録ノンス（新サーバー）
+  final String roomId;          // WebRTC部屋ID
+  final String certFingerprint; // TLS証明書 SHA-256 フィンガープリント（hex）
 
   DiscoveredServer({
     required this.name,
     required this.host,
     required this.port,
     required this.ipv6,
-    this.token    = '',
-    this.regNonce = '',
+    this.token           = '',
+    this.regNonce        = '',
     required this.roomId,
+    this.certFingerprint = '',
   });
 
-  String get baseUrl => 'http://$host:$port';
+  String get baseUrl => 'https://$host:$port';
 }
 
 /// 発見用の固定UDPポート（サーバーの DISCOVERY_PORT と一致させること）。
@@ -48,13 +50,14 @@ Future<List<DiscoveredServer>> discoverServers({
         final m = jsonDecode(utf8.decode(dg.data)) as Map<String, dynamic>;
         if (m['service'] != 'comicserver') return;
         final s = DiscoveredServer(
-          name:     (m['name']      ?? 'ComicServer').toString(),
-          host:     (m['host']      ?? dg.address.address).toString(),
-          port:     (m['port']      as num?)?.toInt() ?? 8765,
-          ipv6:     (m['ipv6']      ?? '').toString(),
-          token:    (m['token']     ?? '').toString(),
-          regNonce: (m['reg_nonce'] ?? '').toString(),
-          roomId:   (m['room_id']   ?? '').toString(),
+          name:            (m['name']             ?? 'ComicServer').toString(),
+          host:            (m['host']             ?? dg.address.address).toString(),
+          port:            (m['port']             as num?)?.toInt() ?? 8765,
+          ipv6:            (m['ipv6']             ?? '').toString(),
+          token:           (m['token']            ?? '').toString(),
+          regNonce:        (m['reg_nonce']        ?? '').toString(),
+          roomId:          (m['room_id']          ?? '').toString(),
+          certFingerprint: (m['cert_fingerprint'] ?? '').toString(),
         );
         found['${s.host}:${s.port}'] = s;
       } catch (_) {/* 不正な応答は無視 */}

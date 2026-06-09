@@ -63,16 +63,20 @@ class _StartScreenState extends State<_StartScreen> {
     final turnUser = prefs.getString('turn_username');
     final turnCred = prefs.getString('turn_credential');
 
+    final certFingerprint = prefs.getString('cert_fingerprint') ?? '';
+
     if (url != null && token != null && token.isNotEmpty) {
       _setStatus('保存した接続先を確認中…');
       final candidates = buildCandidates(primaryUrl: url, ipv6: ipv6);
-      final working = await ApiService.resolveBaseUrl(candidates, token);
+      final working = await ApiService.resolveBaseUrl(candidates, token,
+          certFingerprint: certFingerprint);
       if (!mounted) return;
       if (working != null) {
         final api = ApiService(
             baseUrl: working, token: token, candidates: candidates,
             roomId: roomId, turnUrl: turnUrl,
-            turnUsername: turnUser, turnCredential: turnCred);
+            turnUsername: turnUser, turnCredential: turnCred,
+            certFingerprint: certFingerprint);
         api.getConnectionInfo().then((info) async {
           if (info == null) return;
           final v6 = (info['ipv6'] ?? '').toString();
@@ -98,7 +102,8 @@ class _StartScreenState extends State<_StartScreen> {
           final api = ApiService(
               baseUrl: localUrl, token: token, candidates: candidates,
               viaWebRtc: true, roomId: roomId, turnUrl: turnUrl,
-              turnUsername: turnUser, turnCredential: turnCred);
+              turnUsername: turnUser, turnCredential: turnCred,
+              certFingerprint: certFingerprint);
           await _finish('P2Pで接続しました', () => ShelfScreen(api: api));
           return;
         }

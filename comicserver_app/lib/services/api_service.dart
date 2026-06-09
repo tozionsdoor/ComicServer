@@ -1,8 +1,10 @@
 import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/foundation.dart';   // ValueNotifier
+import 'package:flutter_cache_manager/flutter_cache_manager.dart';
 import 'package:http/http.dart' as http;
 import '../models/book.dart';
+import 'http_pinned_client.dart';
 import 'webrtc_service.dart';
 
 class ApiService {
@@ -20,6 +22,9 @@ class ApiService {
   /// 再接続中に画面下部へ出すステータス文言。null=非表示。UIが購読する。
   final ValueNotifier<String?> status = ValueNotifier<String?>(null);
 
+  late final http.Client _client;
+  late final CacheManager cacheManager;
+
   Future<bool>? _reconnectInFlight;   // 同時多発の繋ぎ直しを1本に集約
 
   ApiService({
@@ -31,8 +36,17 @@ class ApiService {
     this.turnUsername,
     this.turnCredential,
     this.viaWebRtc = false,
+    String certFingerprint = '',
   }) : candidates =
-            (candidates == null || candidates.isEmpty) ? [baseUrl] : candidates;
+            (candidates == null || candidates.isEmpty) ? [baseUrl] : candidates {
+    _client = makePinnedClient(certFingerprint);
+    cacheManager = CacheManager(Config(
+      'comicPageCache',
+      stalePeriod: const Duration(days: 90),
+      maxNrOfCacheObjects: 2000,
+      fileService: HttpFileService(httpClient: makePinnedClient(certFingerprint)),
+    ));
+  }
 
   String get _auth => 'Bearer $token';
 
@@ -44,7 +58,7 @@ class ApiService {
 
   Future<bool> testConnection() async {
     try {
-      final res = await http
+      final res = await _client
           .get(Uri.parse('$baseUrl/api/status'), headers: headers)
           .timeout(const Duration(seconds: 5));
       return res.statusCode == 200;
@@ -58,6 +72,7 @@ class ApiService {
   static Future<String?> resolveBaseUrl(
     List<String> candidates,
     String token, {
+    String certFingerprint = '',
     Duration timeout = const Duration(seconds: 4),
   }) async {
     if (candidates.isEmpty) return null;
@@ -68,13 +83,16 @@ class ApiService {
     for (final base in candidates) {
       () async {
         String? ok;
+        final client = makePinnedClient(certFingerprint);
         try {
-          final res = await http
+          final res = await client
               .get(Uri.parse('$base/api/status'),
                   headers: {'Authorization': auth})
               .timeout(timeout);
           if (res.statusCode == 200) ok = base;
-        } catch (_) {/* この候補は不通 */}
+        } catch (_) {/* この候補は不通 */} finally {
+          client.close();
+        }
         if (ok != null) {
           if (!completer.isCompleted) completer.complete(ok); // 最初の成功で確定
         } else {
@@ -139,7 +157,7 @@ class ApiService {
 
   Future<bool> _ping(String base) async {
     try {
-      final res = await http
+      final res = await _client
           .get(Uri.parse('$base/api/status'), headers: headers)
           .timeout(const Duration(seconds: 3));
       return res.statusCode == 200;
@@ -152,18 +170,18 @@ class ApiService {
   Future<http.Response> _getWithRecovery(String pathAndQuery) async {
     Uri u() => Uri.parse('$baseUrl$pathAndQuery');
     try {
-      final res = await http.get(u(), headers: headers)
+      final res = await _client.get(u(), headers: headers)
           .timeout(const Duration(seconds: 8));
       // WebRTC切断後はローカルプロキシが404を返す（例外でないので個別に検知）。
       // 経路が死んでいる時の404だけ「繋ぎ直し」シグナルとして扱う。
       if (res.statusCode == 404 && _transportDead && await reconnect()) {
-        return http.get(u(), headers: headers)
+        return _client.get(u(), headers: headers)
             .timeout(const Duration(seconds: 8));
       }
       return res;
     } catch (_) {
       if (await reconnect()) {
-        return http.get(u(), headers: headers)
+        return _client.get(u(), headers: headers)
             .timeout(const Duration(seconds: 8));
       }
       rethrow;
@@ -174,17 +192,17 @@ class ApiService {
   Future<http.Response> _postWithRecovery(String pathAndQuery) async {
     Uri u() => Uri.parse('$baseUrl$pathAndQuery');
     try {
-      final res = await http.post(u(), headers: headers)
+      final res = await _client.post(u(), headers: headers)
           .timeout(const Duration(seconds: 8));
       // WebRTC切断後はローカルプロキシが404を返す（例外でないので個別に検知）。
       if (res.statusCode == 404 && _transportDead && await reconnect()) {
-        return http.post(u(), headers: headers)
+        return _client.post(u(), headers: headers)
             .timeout(const Duration(seconds: 8));
       }
       return res;
     } catch (_) {
       if (await reconnect()) {
-        return http.post(u(), headers: headers)
+        return _client.post(u(), headers: headers)
             .timeout(const Duration(seconds: 8));
       }
       rethrow;
@@ -252,11 +270,15 @@ List<String> buildCandidates({
     if (!list.contains(v)) list.add(v);
   }
 
-  add(primaryUrl);
+  // http:// で保存された旧 URL を https:// に正規化
+  String toHttps(String u) =>
+      u.startsWith('http://') ? u.replaceFirst('http://', 'https://') : u;
+
+  add(toHttps(primaryUrl));
   if (ipv6 != null && ipv6.isNotEmpty) {
     final p = Uri.tryParse(primaryUrl);
     final port = (p != null && p.hasPort) ? p.port : 8765;
-    add('http://[$ipv6]:$port');
+    add('https://[$ipv6]:$port');
   }
   return list;
 }

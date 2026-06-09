@@ -324,6 +324,7 @@ class _ShelfScreenState extends State<ShelfScreen> with WidgetsBindingObserver {
           .map((id) => CachedNetworkImage(
                 imageUrl: widget.api.coverUrl(id),
                 httpHeaders: widget.api.headers,
+                cacheManager: widget.api.cacheManager,
                 fit: BoxFit.cover,
                 placeholder: (_, __) =>
                     Container(color: const Color(0xFF313244)),
@@ -349,6 +350,7 @@ class _ShelfScreenState extends State<ShelfScreen> with WidgetsBindingObserver {
                 child: CachedNetworkImage(
                   imageUrl: widget.api.coverUrl(book.id),
                   httpHeaders: widget.api.headers,
+                  cacheManager: widget.api.cacheManager,
                   fit: BoxFit.cover,
                   width: double.infinity,
                   placeholder: (_, __) =>

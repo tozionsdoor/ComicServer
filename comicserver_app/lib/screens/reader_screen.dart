@@ -11,15 +11,6 @@ import '../models/book.dart';
 import '../services/api_service.dart';
 import '../widgets/reconnect_banner.dart';
 
-// 漫画ページ用の共有キャッシュ。既定（200ファイル/30日）では読み返しで溢れるため
-// 上限を拡大し、表示・先読み・比率検出すべてで同じキャッシュを共有する。
-final CacheManager _pageCacheManager = CacheManager(
-  Config(
-    'comicPageCache',
-    stalePeriod: const Duration(days: 90),
-    maxNrOfCacheObjects: 2000,
-  ),
-);
 
 // ─── 見開き1ユニット ──────────────────────────────────────────────────────────
 // 1ページ（単独）か 2ページ（見開きペア）か
@@ -244,7 +235,7 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
         CachedNetworkImageProvider(
           widget.api.pageUrl(widget.book.id, n),
           headers: widget.api.headers,
-          cacheManager: _pageCacheManager,
+          cacheManager: widget.api.cacheManager,
         ),
         ctx,
         onError: (_, __) {},   // 先読み失敗はログを汚さず無視
@@ -431,7 +422,7 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
     final provider = CachedNetworkImageProvider(
       widget.api.pageUrl(widget.book.id, n),
       headers: widget.api.headers,
-      cacheManager: _pageCacheManager,
+      cacheManager: widget.api.cacheManager,
     );
     provider.resolve(ImageConfiguration.empty).addListener(
       ImageStreamListener((info, _) {
@@ -990,7 +981,7 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
       return CachedNetworkImage(
         imageUrl: widget.api.pageUrl(widget.book.id, page),
         httpHeaders: widget.api.headers,
-        cacheManager: _pageCacheManager,
+        cacheManager: widget.api.cacheManager,
         memCacheWidth: memWidth,
         maxWidthDiskCache: memWidth,
         fit: BoxFit.cover,
@@ -1170,7 +1161,7 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
     return CachedNetworkImage(
       imageUrl:       widget.api.pageUrl(widget.book.id, n),
       httpHeaders:    widget.api.headers,
-      cacheManager:   _pageCacheManager,
+      cacheManager:   widget.api.cacheManager,
       fit:            fit,
       fadeInDuration: Duration.zero,
       placeholder: (_, __) => const Center(

@@ -135,6 +135,9 @@ class _LoginScreenState extends State<LoginScreen> {
     final baseUrl  = server.baseUrl;
     await prefs.setString('ipv6', server.ipv6);
     if (server.roomId.isNotEmpty) await prefs.setString('room_id', server.roomId);
+    if (server.certFingerprint.isNotEmpty) {
+      await prefs.setString('cert_fingerprint', server.certFingerprint);
+    }
 
     try {
       final res = await http.post(
@@ -212,22 +215,25 @@ class _LoginScreenState extends State<LoginScreen> {
   }
 
   Future<void> _saveAndNavigate(String baseUrl, String token) async {
-    final prefs      = await SharedPreferences.getInstance();
-    final ipv6       = prefs.getString('ipv6');
-    final roomId     = prefs.getString('room_id') ?? '';
-    final candidates = buildCandidates(primaryUrl: baseUrl, ipv6: ipv6);
+    final prefs           = await SharedPreferences.getInstance();
+    final ipv6            = prefs.getString('ipv6');
+    final roomId          = prefs.getString('room_id') ?? '';
+    final certFingerprint = prefs.getString('cert_fingerprint') ?? '';
+    final candidates      = buildCandidates(primaryUrl: baseUrl, ipv6: ipv6);
     await prefs.setString('url',   baseUrl);
     await prefs.setString('token', token);
-    final working = await ApiService.resolveBaseUrl(candidates, token);
+    final working = await ApiService.resolveBaseUrl(candidates, token,
+        certFingerprint: certFingerprint);
     if (!mounted) return;
     final api = ApiService(
-      baseUrl:        working ?? baseUrl,
-      token:          token,
-      candidates:     candidates,
-      roomId:         roomId,
-      turnUrl:        prefs.getString('turn_url'),
-      turnUsername:   prefs.getString('turn_username'),
-      turnCredential: prefs.getString('turn_credential'),
+      baseUrl:          working ?? baseUrl,
+      token:            token,
+      candidates:       candidates,
+      roomId:           roomId,
+      turnUrl:          prefs.getString('turn_url'),
+      turnUsername:     prefs.getString('turn_username'),
+      turnCredential:   prefs.getString('turn_credential'),
+      certFingerprint:  certFingerprint,
     );
     setState(() { _waitingApproval = false; });
     Navigator.pushReplacement(context, MaterialPageRoute(builder: (_) => ShelfScreen(api: api)));
@@ -254,10 +260,12 @@ class _LoginScreenState extends State<LoginScreen> {
     await prefs.setString('turn_url',        _turnUrlCtrl.text.trim());
     await prefs.setString('turn_username',   _turnUserCtrl.text.trim());
     await prefs.setString('turn_credential', _turnCredCtrl.text.trim());
-    final ipv6   = prefs.getString('ipv6');
-    final roomId = prefs.getString('room_id') ?? '';
+    final ipv6            = prefs.getString('ipv6');
+    final roomId          = prefs.getString('room_id') ?? '';
+    final certFingerprint = prefs.getString('cert_fingerprint') ?? '';
     final candidates = buildCandidates(primaryUrl: url, ipv6: ipv6);
-    final working = await ApiService.resolveBaseUrl(candidates, token);
+    final working = await ApiService.resolveBaseUrl(candidates, token,
+        certFingerprint: certFingerprint);
 
     if (!mounted) return;
     if (working != null) {
@@ -267,9 +275,10 @@ class _LoginScreenState extends State<LoginScreen> {
       final api = ApiService(
           baseUrl: working, token: token, candidates: candidates,
           roomId: roomId,
-          turnUrl: prefs.getString('turn_url'),
-          turnUsername: prefs.getString('turn_username'),
-          turnCredential: prefs.getString('turn_credential'));
+          turnUrl:          prefs.getString('turn_url'),
+          turnUsername:     prefs.getString('turn_username'),
+          turnCredential:   prefs.getString('turn_credential'),
+          certFingerprint:  certFingerprint);
       _refreshConnInfo(api);
       Navigator.pushReplacement(context,
           MaterialPageRoute(builder: (_) => ShelfScreen(api: api)));
@@ -295,9 +304,10 @@ class _LoginScreenState extends State<LoginScreen> {
         final api = ApiService(
             baseUrl: localUrl, token: token, candidates: candidates,
             viaWebRtc: true, roomId: roomId,
-            turnUrl: prefs.getString('turn_url'),
-            turnUsername: prefs.getString('turn_username'),
-            turnCredential: prefs.getString('turn_credential'));
+            turnUrl:          prefs.getString('turn_url'),
+            turnUsername:     prefs.getString('turn_username'),
+            turnCredential:   prefs.getString('turn_credential'),
+            certFingerprint:  certFingerprint);
         Navigator.pushReplacement(context,
             MaterialPageRoute(builder: (_) => ShelfScreen(api: api)));
         return;
