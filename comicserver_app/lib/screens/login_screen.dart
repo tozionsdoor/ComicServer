@@ -6,6 +6,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../services/api_service.dart';
 import '../services/device_service.dart';
 import '../services/discovery_service.dart';
+import '../services/http_pinned_client.dart';
 import '../services/webrtc_service.dart';
 import 'shelf_screen.dart';
 
@@ -16,7 +17,7 @@ class LoginScreen extends StatefulWidget {
 }
 
 class _LoginScreenState extends State<LoginScreen> {
-  final _urlCtrl   = TextEditingController(text: 'http://192.168.0.25:8765');
+  final _urlCtrl   = TextEditingController(text: 'https://192.168.0.25:8765');
   final _tokenCtrl = TextEditingController();
   // TURN（任意・STUNで繋がらない少数派向け。標準は空＝STUN-only）
   final _turnUrlCtrl  = TextEditingController();
@@ -29,10 +30,11 @@ class _LoginScreenState extends State<LoginScreen> {
   String _error       = '';
 
   // 端末登録・承認待ちフロー
-  bool   _waitingApproval = false;
-  String _regToken        = '';
-  String _pendingBaseUrl  = '';
-  int    _approvalTimeout = 180;
+  bool   _waitingApproval  = false;
+  String _regToken         = '';
+  String _pendingBaseUrl   = '';
+  String _certFingerprint  = '';   // LAN発見で取得した証明書フィンガープリント
+  int    _approvalTimeout  = 180;
   Timer? _approvalTimer;
 
   @override
@@ -54,8 +56,13 @@ class _LoginScreenState extends State<LoginScreen> {
 
   Future<void> _loadSaved() async {
     final prefs = await SharedPreferences.getInstance();
+    _certFingerprint = prefs.getString('cert_fingerprint') ?? '';
     setState(() {
-      _urlCtrl.text       = prefs.getString('url')   ?? _urlCtrl.text;
+      final saved = prefs.getString('url') ?? _urlCtrl.text;
+      // http:// → https:// に正規化（サーバーTLS化後の既存保存値を修正）
+      _urlCtrl.text       = saved.startsWith('http://')
+          ? saved.replaceFirst('http://', 'https://')
+          : saved;
       _tokenCtrl.text     = prefs.getString('token') ?? '';
       _turnUrlCtrl.text   = prefs.getString('turn_url')        ?? '';
       _turnUserCtrl.text  = prefs.getString('turn_username')   ?? '';
@@ -135,12 +142,15 @@ class _LoginScreenState extends State<LoginScreen> {
     final baseUrl  = server.baseUrl;
     await prefs.setString('ipv6', server.ipv6);
     if (server.roomId.isNotEmpty) await prefs.setString('room_id', server.roomId);
+    // フィンガープリントを保存し、以降の接続でピン留めに使う
+    _certFingerprint = server.certFingerprint;
     if (server.certFingerprint.isNotEmpty) {
       await prefs.setString('cert_fingerprint', server.certFingerprint);
     }
 
+    final pinnedClient = makePinnedClient(_certFingerprint);
     try {
-      final res = await http.post(
+      final res = await pinnedClient.post(
         Uri.parse('$baseUrl/api/devices/register'),
         headers: {'Content-Type': 'application/json'},
         body: jsonEncode({
@@ -177,6 +187,8 @@ class _LoginScreenState extends State<LoginScreen> {
       });
     } catch (e) {
       if (mounted) setState(() { _loading = false; _error = '接続できません: $e'; });
+    } finally {
+      pinnedClient.close();
     }
   }
 
@@ -193,21 +205,26 @@ class _LoginScreenState extends State<LoginScreen> {
         return;
       }
       try {
-        final res = await http.get(
-          Uri.parse('$baseUrl/api/devices/status?reg_token=${Uri.encodeComponent(regToken)}'),
-        ).timeout(const Duration(seconds: 5));
-        if (!mounted) { timer.cancel(); return; }
-        if (res.statusCode == 200) {
-          final data = jsonDecode(res.body) as Map<String, dynamic>;
-          if (data['status'] == 'approved') {
+        final client = makePinnedClient(_certFingerprint);
+        try {
+          final res = await client.get(
+            Uri.parse('$baseUrl/api/devices/status?reg_token=${Uri.encodeComponent(regToken)}'),
+          ).timeout(const Duration(seconds: 5));
+          if (!mounted) { timer.cancel(); return; }
+          if (res.statusCode == 200) {
+            final data = jsonDecode(res.body) as Map<String, dynamic>;
+            if (data['status'] == 'approved') {
+              timer.cancel();
+              await _saveAndNavigate(baseUrl, data['token'] as String? ?? '');
+              return;
+            }
+          } else if (res.statusCode == 403) {
             timer.cancel();
-            await _saveAndNavigate(baseUrl, data['token'] as String? ?? '');
+            setState(() { _waitingApproval = false; _error = '接続リクエストが拒否されました。'; });
             return;
           }
-        } else if (res.statusCode == 403) {
-          timer.cancel();
-          setState(() { _waitingApproval = false; _error = '接続リクエストが拒否されました。'; });
-          return;
+        } finally {
+          client.close();
         }
       } catch (_) { /* ネットワークエラーは無視してリトライ */ }
       if (mounted) setState(() => _approvalTimeout -= 3);
