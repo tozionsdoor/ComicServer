@@ -84,15 +84,27 @@ class _HistoryScreenState extends State<HistoryScreen> {
   }
 
   Future<void> _open(Map<String, dynamic> it) async {
+    final id = it['id'] as String;
+    String rel = (it['rel'] as String?) ?? '';
+
+    // relが旧履歴で保存されていない場合、全冊リストから補完する
+    if (rel.isEmpty) {
+      try {
+        final all = await widget.api.getBooks();
+        final found = all.firstWhere((b) => b.id == id,
+            orElse: () => BookItem(id: id, title: '', rel: ''));
+        rel = found.rel;
+      } catch (_) {}
+    }
+
     final book = BookItem(
-        id: it['id'] as String,
+        id: id,
         title: (it['title'] as String?) ?? '',
-        rel: (it['rel'] as String?) ?? '');
+        rel: rel);
 
     // 同じフォルダの兄弟巻リストを取得して「前の巻/次の巻」ナビを有効化する
     List<BookItem> siblings = [book];
     int bookIndex = 0;
-    final rel = book.rel;
     if (rel.isNotEmpty) {
       try {
         final parentPath = rel.contains('/')
