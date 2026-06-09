@@ -233,11 +233,21 @@ class ApiService {
   }
 
   /// 接続情報（ipv6 など）を取得。次回接続のため保存に使う。
+  /// 新たに判明したIPv6は今回のセッションの候補リストにも反映する
+  /// （次回起動を待たずに reconnect() でレースに参加できるように）。
   Future<Map<String, dynamic>?> getConnectionInfo() async {
     try {
       final res = await _getWithRecovery('/api/connection-info');
       if (res.statusCode == 200) {
-        return jsonDecode(res.body) as Map<String, dynamic>;
+        final info = jsonDecode(res.body) as Map<String, dynamic>;
+        final v6 = (info['ipv6'] ?? '').toString();
+        if (v6.isNotEmpty) {
+          final p = Uri.tryParse(baseUrl);
+          final port = (p != null && p.hasPort) ? p.port : 8765;
+          final url = 'https://[$v6]:$port';
+          if (!candidates.contains(url)) candidates.add(url);
+        }
+        return info;
       }
     } catch (_) {}
     return null;
