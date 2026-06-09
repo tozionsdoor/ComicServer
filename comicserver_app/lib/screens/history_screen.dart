@@ -87,7 +87,8 @@ class _HistoryScreenState extends State<HistoryScreen> {
     final id = it['id'] as String;
     String rel = (it['rel'] as String?) ?? '';
 
-    // relが旧履歴で保存されていない場合、全冊リストから補完する
+    // relが保存されていない場合、全冊リストから補完する
+    // （relはファイルパスではなく親フォルダパス: "." = ルート, "シリーズA", "ジャンル/シリーズA"）
     if (rel.isEmpty) {
       try {
         final all = await widget.api.getBooks();
@@ -102,15 +103,14 @@ class _HistoryScreenState extends State<HistoryScreen> {
         title: (it['title'] as String?) ?? '',
         rel: rel);
 
-    // 同じフォルダの兄弟巻リストを取得して「前の巻/次の巻」ナビを有効化する
+    // relを使ってフォルダ内の兄弟巻リストを取得する
+    // rel自体が親フォルダパスなので getFolders(rel) で直接取得できる
     List<BookItem> siblings = [book];
     int bookIndex = 0;
     if (rel.isNotEmpty) {
       try {
-        final parentPath = rel.contains('/')
-            ? rel.substring(0, rel.lastIndexOf('/'))
-            : '';
-        final contents = await widget.api.getFolders(parentPath);
+        final folderPath = rel == '.' ? '' : rel;
+        final contents = await widget.api.getFolders(folderPath);
         final idx = contents.books.indexWhere((b) => b.id == book.id);
         if (idx >= 0) {
           siblings = contents.books;
