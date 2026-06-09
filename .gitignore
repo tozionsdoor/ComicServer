@@ -40,6 +40,10 @@ app-release.apk
 *.apk
 cloudflared.exe
 
+# ── TLS 証明書（自動生成・秘密鍵） ─────────────────────────
+server.crt
+server.key
+
 # ── Windows ──────────────────────────────────────────────
 Thumbs.db
 desktop.ini
