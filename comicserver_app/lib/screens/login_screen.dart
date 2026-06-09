@@ -1,6 +1,10 @@
+import 'dart:async';
+import 'dart:convert';
 import 'package:flutter/material.dart';
+import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 import '../services/api_service.dart';
+import '../services/device_service.dart';
 import '../services/discovery_service.dart';
 import '../services/webrtc_service.dart';
 import 'shelf_screen.dart';
@@ -18,11 +22,18 @@ class _LoginScreenState extends State<LoginScreen> {
   final _turnUrlCtrl  = TextEditingController();
   final _turnUserCtrl = TextEditingController();
   final _turnCredCtrl = TextEditingController();
-  bool _loading = false;
-  bool _discovering = false;
-  bool _obscure = true;
-  bool _showTurn = false;   // TURN詳細設定の開閉
-  String _error = '';
+  bool _loading       = false;
+  bool _discovering   = false;
+  bool _obscure       = true;
+  bool _showTurn      = false;
+  String _error       = '';
+
+  // 端末登録・承認待ちフロー
+  bool   _waitingApproval = false;
+  String _regToken        = '';
+  String _pendingBaseUrl  = '';
+  int    _approvalTimeout = 180;
+  Timer? _approvalTimer;
 
   @override
   void initState() {
@@ -32,6 +43,7 @@ class _LoginScreenState extends State<LoginScreen> {
 
   @override
   void dispose() {
+    _approvalTimer?.cancel();
     _urlCtrl.dispose();
     _tokenCtrl.dispose();
     _turnUrlCtrl.dispose();
@@ -97,17 +109,128 @@ class _LoginScreenState extends State<LoginScreen> {
     );
 
     if (selected != null && mounted) {
-      setState(() {
-        _urlCtrl.text   = selected.baseUrl;
-        _tokenCtrl.text = selected.token;
-      });
-      final prefs = await SharedPreferences.getInstance();
-      await prefs.setString('ipv6', selected.ipv6);
-      // room_id もLANペアリングで受け取る（WebRTC部屋ID）
-      if (selected.roomId.isNotEmpty) {
-        await prefs.setString('room_id', selected.roomId);
+      if (selected.regNonce.isNotEmpty) {
+        // 新サーバー: 端末登録フロー
+        await _startRegistration(selected);
+      } else if (selected.token.isNotEmpty) {
+        // 旧サーバー互換: トークンを直接受け取る
+        setState(() {
+          _urlCtrl.text   = selected.baseUrl;
+          _tokenCtrl.text = selected.token;
+        });
+        final prefs = await SharedPreferences.getInstance();
+        await prefs.setString('ipv6', selected.ipv6);
+        if (selected.roomId.isNotEmpty) {
+          await prefs.setString('room_id', selected.roomId);
+        }
       }
     }
+  }
+
+  // ── 端末登録フロー ──────────────────────────────────────────────────────────
+  Future<void> _startRegistration(DiscoveredServer server) async {
+    setState(() { _loading = true; _error = ''; });
+    final prefs    = await SharedPreferences.getInstance();
+    final deviceId = await DeviceService.getDeviceId();
+    final baseUrl  = server.baseUrl;
+    await prefs.setString('ipv6', server.ipv6);
+    if (server.roomId.isNotEmpty) await prefs.setString('room_id', server.roomId);
+
+    try {
+      final res = await http.post(
+        Uri.parse('$baseUrl/api/devices/register'),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({
+          'device_id':   deviceId,
+          'device_name': DeviceService.deviceName,
+          'reg_nonce':   server.regNonce,
+        }),
+      ).timeout(const Duration(seconds: 10));
+
+      if (!mounted) return;
+      final data = jsonDecode(res.body) as Map<String, dynamic>;
+      if (res.statusCode == 200) {
+        final status = data['status'] as String? ?? '';
+        if (status == 'pending') {
+          setState(() {
+            _loading        = false;
+            _waitingApproval = true;
+            _regToken       = data['reg_token'] as String? ?? '';
+            _pendingBaseUrl = baseUrl;
+            _approvalTimeout = 180;
+          });
+          _startApprovalPolling(baseUrl, _regToken);
+          return;
+        }
+        if (status == 'already_approved') {
+          // 既承認（再ペアリング）: トークン要手動入力 or 再度LAN発見
+          setState(() { _loading = false; _urlCtrl.text = baseUrl; });
+          return;
+        }
+      }
+      setState(() {
+        _loading = false;
+        _error   = 'ペアリングに失敗しました (${res.statusCode})';
+      });
+    } catch (e) {
+      if (mounted) setState(() { _loading = false; _error = '接続できません: $e'; });
+    }
+  }
+
+  void _startApprovalPolling(String baseUrl, String regToken) {
+    _approvalTimer?.cancel();
+    _approvalTimer = Timer.periodic(const Duration(seconds: 3), (timer) async {
+      if (!mounted) { timer.cancel(); return; }
+      if (_approvalTimeout <= 0) {
+        timer.cancel();
+        setState(() {
+          _waitingApproval = false;
+          _error = 'タイムアウト。もう一度「LAN内のサーバーを探す」を試してください。';
+        });
+        return;
+      }
+      try {
+        final res = await http.get(
+          Uri.parse('$baseUrl/api/devices/status?reg_token=${Uri.encodeComponent(regToken)}'),
+        ).timeout(const Duration(seconds: 5));
+        if (!mounted) { timer.cancel(); return; }
+        if (res.statusCode == 200) {
+          final data = jsonDecode(res.body) as Map<String, dynamic>;
+          if (data['status'] == 'approved') {
+            timer.cancel();
+            await _saveAndNavigate(baseUrl, data['token'] as String? ?? '');
+            return;
+          }
+        } else if (res.statusCode == 403) {
+          timer.cancel();
+          setState(() { _waitingApproval = false; _error = '接続リクエストが拒否されました。'; });
+          return;
+        }
+      } catch (_) { /* ネットワークエラーは無視してリトライ */ }
+      if (mounted) setState(() => _approvalTimeout -= 3);
+    });
+  }
+
+  Future<void> _saveAndNavigate(String baseUrl, String token) async {
+    final prefs      = await SharedPreferences.getInstance();
+    final ipv6       = prefs.getString('ipv6');
+    final roomId     = prefs.getString('room_id') ?? '';
+    final candidates = buildCandidates(primaryUrl: baseUrl, ipv6: ipv6);
+    await prefs.setString('url',   baseUrl);
+    await prefs.setString('token', token);
+    final working = await ApiService.resolveBaseUrl(candidates, token);
+    if (!mounted) return;
+    final api = ApiService(
+      baseUrl:        working ?? baseUrl,
+      token:          token,
+      candidates:     candidates,
+      roomId:         roomId,
+      turnUrl:        prefs.getString('turn_url'),
+      turnUsername:   prefs.getString('turn_username'),
+      turnCredential: prefs.getString('turn_credential'),
+    );
+    setState(() { _waitingApproval = false; });
+    Navigator.pushReplacement(context, MaterialPageRoute(builder: (_) => ShelfScreen(api: api)));
   }
 
   void _refreshConnInfo(ApiService api) {
@@ -196,68 +319,119 @@ class _LoginScreenState extends State<LoginScreen> {
           padding: const EdgeInsets.all(32),
           child: ConstrainedBox(
             constraints: const BoxConstraints(maxWidth: 440),
-            child: Column(
-              children: [
-                const Icon(Icons.menu_book, size: 72, color: Color(0xFF89b4fa)),
-                const SizedBox(height: 12),
-                const Text('ComicServer',
-                    style: TextStyle(
-                        fontSize: 28,
-                        fontWeight: FontWeight.bold,
-                        color: Color(0xFF89b4fa))),
-                const SizedBox(height: 40),
-                _field(_urlCtrl,  'サーバーURL',  Icons.dns,  false),
-                const SizedBox(height: 6),
-                Align(
-                  alignment: Alignment.centerRight,
-                  child: TextButton.icon(
-                    onPressed: _discovering ? null : _discover,
-                    icon: _discovering
-                        ? const SizedBox(
-                            width: 16, height: 16,
-                            child: CircularProgressIndicator(
-                                strokeWidth: 2, color: Color(0xFF89b4fa)))
-                        : const Icon(Icons.wifi_find,
-                            color: Color(0xFF89b4fa), size: 20),
-                    label: Text(_discovering ? '探索中…' : 'LAN内のサーバーを探す',
-                        style: const TextStyle(color: Color(0xFF89b4fa))),
-                  ),
-                ),
-                const SizedBox(height: 6),
-                _field(_tokenCtrl, '認証トークン', Icons.key, true),
-                const SizedBox(height: 12),
-                _buildTurnSection(),
-                const SizedBox(height: 24),
-                if (_error.isNotEmpty)
-                  Padding(
-                    padding: const EdgeInsets.only(bottom: 16),
-                    child: Text(_error,
-                        style: const TextStyle(color: Color(0xFFf38ba8))),
-                  ),
-                SizedBox(
-                  width: double.infinity,
-                  height: 50,
-                  child: ElevatedButton(
-                    onPressed: _loading ? null : _connect,
-                    style: ElevatedButton.styleFrom(
-                      backgroundColor: const Color(0xFF89b4fa),
-                      foregroundColor: const Color(0xFF1e1e2e),
-                      shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(10)),
-                    ),
-                    child: _loading
-                        ? const CircularProgressIndicator(
-                            color: Color(0xFF1e1e2e), strokeWidth: 2)
-                        : const Text('接続',
-                            style: TextStyle(
-                                fontSize: 16, fontWeight: FontWeight.bold)),
-                  ),
-                ),
-              ],
-            ),
+            child: _waitingApproval ? _buildWaitingApproval() : _buildLoginForm(),
           ),
         ),
       ),
+    );
+  }
+
+  Widget _buildWaitingApproval() {
+    return Column(
+      children: [
+        const Icon(Icons.menu_book, size: 72, color: Color(0xFF89b4fa)),
+        const SizedBox(height: 12),
+        const Text('ComicServer',
+            style: TextStyle(
+                fontSize: 28,
+                fontWeight: FontWeight.bold,
+                color: Color(0xFF89b4fa))),
+        const SizedBox(height: 48),
+        const Icon(Icons.devices, size: 64, color: Color(0xFFA6E3A1)),
+        const SizedBox(height: 24),
+        const Text('承認待ち',
+            style: TextStyle(
+                fontSize: 20,
+                fontWeight: FontWeight.bold,
+                color: Color(0xFFcdd6f4))),
+        const SizedBox(height: 16),
+        const Text(
+          'サーバーの「端末管理」で\nこの端末を承認してください',
+          textAlign: TextAlign.center,
+          style: TextStyle(color: Color(0xFFa6adc8), fontSize: 15, height: 1.6),
+        ),
+        const SizedBox(height: 24),
+        const CircularProgressIndicator(color: Color(0xFF89b4fa)),
+        const SizedBox(height: 20),
+        Text('残り約 $_approvalTimeout 秒',
+            style: const TextStyle(color: Color(0xFF585b70), fontSize: 13)),
+        const SizedBox(height: 32),
+        TextButton(
+          onPressed: () {
+            _approvalTimer?.cancel();
+            setState(() {
+              _waitingApproval = false;
+              _regToken        = '';
+              _pendingBaseUrl  = '';
+              _approvalTimeout = 180;
+              _error           = '';
+            });
+          },
+          child: const Text('キャンセル', style: TextStyle(color: Color(0xFFf38ba8))),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildLoginForm() {
+    return Column(
+      children: [
+        const Icon(Icons.menu_book, size: 72, color: Color(0xFF89b4fa)),
+        const SizedBox(height: 12),
+        const Text('ComicServer',
+            style: TextStyle(
+                fontSize: 28,
+                fontWeight: FontWeight.bold,
+                color: Color(0xFF89b4fa))),
+        const SizedBox(height: 40),
+        _field(_urlCtrl,  'サーバーURL',  Icons.dns,  false),
+        const SizedBox(height: 6),
+        Align(
+          alignment: Alignment.centerRight,
+          child: TextButton.icon(
+            onPressed: _discovering ? null : _discover,
+            icon: _discovering
+                ? const SizedBox(
+                    width: 16, height: 16,
+                    child: CircularProgressIndicator(
+                        strokeWidth: 2, color: Color(0xFF89b4fa)))
+                : const Icon(Icons.wifi_find,
+                    color: Color(0xFF89b4fa), size: 20),
+            label: Text(_discovering ? '探索中…' : 'LAN内のサーバーを探す',
+                style: const TextStyle(color: Color(0xFF89b4fa))),
+          ),
+        ),
+        const SizedBox(height: 6),
+        _field(_tokenCtrl, '認証トークン', Icons.key, true),
+        const SizedBox(height: 12),
+        _buildTurnSection(),
+        const SizedBox(height: 24),
+        if (_error.isNotEmpty)
+          Padding(
+            padding: const EdgeInsets.only(bottom: 16),
+            child: Text(_error,
+                style: const TextStyle(color: Color(0xFFf38ba8))),
+          ),
+        SizedBox(
+          width: double.infinity,
+          height: 50,
+          child: ElevatedButton(
+            onPressed: _loading ? null : _connect,
+            style: ElevatedButton.styleFrom(
+              backgroundColor: const Color(0xFF89b4fa),
+              foregroundColor: const Color(0xFF1e1e2e),
+              shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(10)),
+            ),
+            child: _loading
+                ? const CircularProgressIndicator(
+                    color: Color(0xFF1e1e2e), strokeWidth: 2)
+                : const Text('接続',
+                    style: TextStyle(
+                        fontSize: 16, fontWeight: FontWeight.bold)),
+          ),
+        ),
+      ],
     );
   }
 
