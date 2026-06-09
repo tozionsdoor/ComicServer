@@ -2244,7 +2244,6 @@ class App(tk.Tk):
             d["token"]       = _new_token()
             d["status"]      = "approved"
             d["approved_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
-            d.pop("reg_token", None)
             save_config(_config)
             self._log(f"[認証] 端末を承認しました: {d.get('name', did[:8])}")
             refresh()
