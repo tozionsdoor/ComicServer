@@ -1,3 +1,5 @@
+import 'dart:async';
+import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:flutter/material.dart';
 import 'package:cached_network_image/cached_network_image.dart';
 import '../models/book.dart';
@@ -23,6 +25,7 @@ class _ShelfScreenState extends State<ShelfScreen> with WidgetsBindingObserver {
   bool _searching   = false;
   bool _rescanning  = false;
   List<BookItem> _allBooks = [];
+  StreamSubscription<List<ConnectivityResult>>? _connectivitySub;
 
   @override
   void initState() {
@@ -30,11 +33,18 @@ class _ShelfScreenState extends State<ShelfScreen> with WidgetsBindingObserver {
     WidgetsBinding.instance.addObserver(this);
     _load('');
     _loadAllBooks();
+    // ネットワーク変化（WiFi→モバイル等）を検知して自動再接続
+    _connectivitySub = Connectivity().onConnectivityChanged.listen((results) {
+      if (results.any((r) => r != ConnectivityResult.none)) {
+        _onResume();
+      }
+    });
   }
 
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    _connectivitySub?.cancel();
     _searchCtrl.dispose();
     super.dispose();
   }

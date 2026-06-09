@@ -1,5 +1,7 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:math' show min, max;
+import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
@@ -89,11 +91,18 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
   Offset? _magnifierPos;
   static const double _magnifierScale = 2.0;
 
+  StreamSubscription<List<ConnectivityResult>>? _connectivitySub;
+
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     _pageCtrl = PageController();
+    _connectivitySub = Connectivity().onConnectivityChanged.listen((results) {
+      if (results.any((r) => r != ConnectivityResult.none)) {
+        _onResume();
+      }
+    });
     _filmCtrl = ScrollController();
     _loadPrefs();
     _loadInfo();
@@ -249,6 +258,7 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    _connectivitySub?.cancel();
     _pageCtrl.dispose();
     _filmCtrl.dispose();
     WakelockPlus.disable();

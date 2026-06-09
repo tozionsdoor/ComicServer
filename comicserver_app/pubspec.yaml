@@ -20,6 +20,7 @@ dependencies:
   firebase_database: ^11.1.1
   firebase_auth: ^5.3.1
   crypto: ^3.0.3
+  connectivity_plus: ^6.1.1
 
 dev_dependencies:
   flutter_test:
