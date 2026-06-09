@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>プライバシーポリシー — ComicServer</title>
+  <style>
+    body {
+      font-family: 'Hiragino Kaku Gothic ProN', 'Noto Sans JP', sans-serif;
+      max-width: 720px;
+      margin: 0 auto;
+      padding: 24px 20px 60px;
+      background: #fafafa;
+      color: #1a1a1a;
+      line-height: 1.8;
+    }
+    h1 { font-size: 1.5rem; border-bottom: 2px solid #333; padding-bottom: 8px; }
+    h2 { font-size: 1.1rem; margin-top: 2em; color: #333; }
+    p, ul { font-size: 0.95rem; }
+    ul { padding-left: 1.4em; }
+    li { margin-bottom: 4px; }
+    .updated { color: #666; font-size: 0.85rem; }
+    a { color: #1a73e8; }
+  </style>
+</head>
+<body>
+
+<h1>プライバシーポリシー</h1>
+<p class="updated">最終更新日: 2026年6月9日</p>
+
+<p>
+  ComicServer（以下「本アプリ」）は、個人が自炊した書籍ファイルを自宅 PC サーバーから閲覧するための
+  個人向けアプリです。開発者（以下「当方」）は、ユーザーのプライバシーを尊重し、
+  個人情報の収集を最小限に抑えることを基本方針としています。
+</p>
+
+<h2>1. 収集する情報</h2>
+<p>当方は、ユーザーの個人情報（氏名・住所・メールアドレス等）を収集しません。</p>
+<p>本アプリが端末内（ローカルストレージ）に保存するデータは以下のとおりです。</p>
+<ul>
+  <li>接続先サーバーの URL・認証トークン（ユーザーが設定した自宅サーバーへの接続情報）</li>
+  <li>読書履歴・読書進捗（どの本を何ページまで読んだか）</li>
+</ul>
+<p>これらのデータは端末内のみに保存され、当方のサーバーや第三者には送信されません。</p>
+
+<h2>2. Firebase の利用</h2>
+<p>
+  本アプリは、自宅外からのサーバー接続（WebRTC P2P 通信）を確立するためのシグナリングに
+  Google Firebase Realtime Database を使用しています。
+</p>
+<p>
+  Firebase に送信されるのは接続確立のための技術的なセッション情報（SDP・ICE 候補）のみです。
+  氏名・メールアドレス等の個人情報は一切含まれません。Firebase 匿名認証を使用しており、
+  個人を特定できる情報は収集されません。
+</p>
+<p>
+  Firebase のプライバシーポリシーについては
+  <a href="https://policies.google.com/privacy" target="_blank" rel="noopener">Google プライバシーポリシー</a>
+  をご参照ください。
+</p>
+
+<h2>3. 広告</h2>
+<p>
+  現時点では本アプリに広告は表示されていません。将来的に Google AdMob による広告を導入する際は、
+  本ポリシーを更新のうえ、お知らせします。
+</p>
+
+<h2>4. 第三者への情報提供</h2>
+<p>
+  当方は、法令に基づく場合を除き、ユーザーの情報を第三者に提供・販売・共有しません。
+</p>
+
+<h2>5. お問い合わせ</h2>
+<p>
+  本ポリシーに関するご質問は、下記までご連絡ください。<br>
+  メールアドレス: <a href="mailto:to.zionsdoor@gmail.com">to.zionsdoor@gmail.com</a>
+</p>
+
+<h2>6. プライバシーポリシーの変更</h2>
+<p>
+  本ポリシーは必要に応じて改定することがあります。重要な変更がある場合はアプリ内またはこのページでお知らせします。
+  最終更新日は本ページ上部に記載しています。
+</p>
+
+</body>
+</html>

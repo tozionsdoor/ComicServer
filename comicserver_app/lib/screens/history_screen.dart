@@ -83,16 +83,38 @@ class _HistoryScreenState extends State<HistoryScreen> {
     _load();
   }
 
-  void _open(Map<String, dynamic> it) {
+  Future<void> _open(Map<String, dynamic> it) async {
     final book = BookItem(
         id: it['id'] as String,
         title: (it['title'] as String?) ?? '',
-        rel: '');
+        rel: (it['rel'] as String?) ?? '');
+
+    // 同じフォルダの兄弟巻リストを取得して「前の巻/次の巻」ナビを有効化する
+    List<BookItem> siblings = [book];
+    int bookIndex = 0;
+    final rel = book.rel;
+    if (rel.isNotEmpty) {
+      try {
+        final parentPath = rel.contains('/')
+            ? rel.substring(0, rel.lastIndexOf('/'))
+            : '';
+        final contents = await widget.api.getFolders(parentPath);
+        final idx = contents.books.indexWhere((b) => b.id == book.id);
+        if (idx >= 0) {
+          siblings = contents.books;
+          bookIndex = idx;
+        }
+      } catch (_) {
+        // API失敗時は単巻のまま開く
+      }
+    }
+    if (!mounted) return;
+
     Navigator.push(
       context,
       MaterialPageRoute(
         builder: (_) => ReaderScreen(
-            api: widget.api, book: book, siblings: [book], bookIndex: 0),
+            api: widget.api, book: book, siblings: siblings, bookIndex: bookIndex),
       ),
     ).then((_) => _load()); // 戻ったら進捗を反映して並び替え
   }

@@ -419,6 +419,7 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
       'id': widget.book.id, 'title': widget.book.title,
       'page': _page, 'total': _total,
       'ts': DateTime.now().millisecondsSinceEpoch,
+      'rel': widget.book.rel,
     }));
     if (list.length > 100) list.removeRange(100, list.length);
     await p.setStringList('history', list);
