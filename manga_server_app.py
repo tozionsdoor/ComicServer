@@ -618,28 +618,86 @@ def _browser_token() -> str:
     """PC ブラウザ用デバイスのトークンを返す（「ブラウザで開く」ボタン専用）。"""
     return _config.get("devices", {}).get("browser-local", {}).get("token", "")
 
+def _find_device_by_token(token: str) -> tuple[str, dict] | None:
+    """承認済み端末からトークンが一致するものを探す。(device_id, device情報) または None。"""
+    if not token:
+        return None
+    for did, d in _config.get("devices", {}).items():
+        if d.get("status") == "approved" and d.get("token") and secrets.compare_digest(token, d["token"]):
+            return did, d
+    return None
+
+# ─── ブルートフォース対策（IPごとに誤トークン回数を数えて一時ブロック） ──────────────
+_AUTH_FAIL_LIMIT    = 10   # この期間内にこの回数誤ったらブロック
+_AUTH_FAIL_WINDOW   = 300  # 失敗カウントの期間（秒）
+_AUTH_BLOCK_SECONDS = 600  # ブロック時間（秒）
+
+_auth_failures: dict[str, list[float]] = {}  # ip -> 失敗時刻のリスト（メモリのみ・再起動でリセット）
+_auth_blocked:  dict[str, float]       = {}  # ip -> ブロック解除時刻 (time.time())
+_auth_lock = threading.Lock()
+
+def _client_ip(request: Request) -> str:
+    return request.client.host if request.client else "unknown"
+
+def _is_blocked(ip: str) -> int:
+    """ブロック中なら残り秒数（切り上げ・最低1）を返す。ブロックされていなければ0。"""
+    with _auth_lock:
+        until = _auth_blocked.get(ip, 0.0)
+        if until <= time.time():
+            _auth_blocked.pop(ip, None)
+            return 0
+        return int(until - time.time()) + 1
+
+def _record_auth_failure(ip: str) -> None:
+    """誤トークン/不正リクエストを記録し、規定回数を超えたら一定時間ブロックする。"""
+    now = time.time()
+    with _auth_lock:
+        fails = [t for t in _auth_failures.get(ip, []) if now - t < _AUTH_FAIL_WINDOW]
+        fails.append(now)
+        if len(fails) >= _AUTH_FAIL_LIMIT:
+            _auth_blocked[ip] = now + _AUTH_BLOCK_SECONDS
+            _auth_failures.pop(ip, None)
+            _log_queue.put(
+                f"[認証] {ip} を{_AUTH_BLOCK_SECONDS // 60}分間ブロックしました"
+                f"（{_AUTH_FAIL_WINDOW // 60}分以内に認証失敗{_AUTH_FAIL_LIMIT}回）"
+            )
+        else:
+            _auth_failures[ip] = fails
+
+def _clear_auth_failures(ip: str) -> None:
+    """正規トークンでの認証成功時に呼ぶ。誤カウントとブロックを両方解除する。"""
+    with _auth_lock:
+        _auth_failures.pop(ip, None)
+        _auth_blocked.pop(ip, None)
+
 def _check_auth(request: Request) -> str:
     """全API共通の認証。承認済み端末のトークンのいずれかと一致すればOK。
       トークンの受け取り方:
         1. Authorization ヘッダ（アプリ=Bearer / ブラウザ=Basic）
         2. クエリ ?token=...（GUIの「ブラウザで開く」起動用。初回アクセスでCookie化）
         3. Cookie ms_token（一度トークン付きで開いた後の <img> 等）
+      ブルートフォース対策: 正しいトークンは常に通す（再ペアリング直後の正規端末を
+      ブロックで巻き込まない）。誤トークンが規定回数を超えたIPは一時ブロックする
+      （未提示=未ログインの通常アクセスは失敗カウントしない）。
     """
+    ip = _client_ip(request)
     supplied = (
         _extract_token(request.headers.get("authorization"))
         or request.query_params.get("token", "")
         or request.cookies.get("ms_token", "")
     )
-    if not supplied:
+    if supplied and _find_device_by_token(supplied):
+        _clear_auth_failures(ip)
+        return "ok"
+
+    blocked_for = _is_blocked(ip)
+    if blocked_for:
         raise HTTPException(
-            status_code=401, detail="Unauthorized",
-            headers={"WWW-Authenticate": "Basic"},
+            status_code=429, detail="Too many failed attempts",
+            headers={"Retry-After": str(blocked_for)},
         )
-    for device in _config.get("devices", {}).values():
-        if device.get("status") == "approved":
-            t = device.get("token", "")
-            if t and secrets.compare_digest(supplied, t):
-                return "ok"
+    if supplied:
+        _record_auth_failure(ip)
     raise HTTPException(
         status_code=401, detail="Unauthorized",
         headers={"WWW-Authenticate": "Basic"},
@@ -1318,7 +1376,11 @@ async def register_device(request: Request):
 
 @api.get("/api/devices/status")
 async def device_status(request: Request):
-    """端末承認状態をポーリング。承認済みになったらトークンを返す。"""
+    """端末承認状態をポーリング。承認済みになったらトークンを返す。
+    ブルートフォース対策: reg_token不一致(404)が続いたIPは一時ブロックする
+    （正規端末は自分のreg_tokenが常に一致するため、ブロック中でも404にはならず通る）。
+    """
+    ip = _client_ip(request)
     reg_token = request.query_params.get("reg_token", "")
     if not reg_token:
         raise HTTPException(400, "reg_token required")
@@ -1332,12 +1394,19 @@ async def device_status(request: Request):
             continue
         if not match:
             continue
+        _clear_auth_failures(ip)
         status = device.get("status", "pending")
         if status == "pending":
             return {"status": "pending"}
         if status == "approved":
             return {"status": "approved", "token": device.get("token", "")}
         raise HTTPException(403, "Device revoked")
+
+    blocked_for = _is_blocked(ip)
+    if blocked_for:
+        raise HTTPException(status_code=429, detail="Too many failed attempts",
+                             headers={"Retry-After": str(blocked_for)})
+    _record_auth_failure(ip)
     raise HTTPException(404, "Not found")
 
 
@@ -1660,6 +1729,20 @@ def _dc_response(req_id: int, status: int, content_type: str, body: bytes) -> by
     return struct.pack(">I", len(header)) + header + body
 
 
+def _device_label_for_message(message: bytes | str) -> str:
+    """DCリクエストのtokenから端末を逆引きし、接続元ログ用のラベルを返す。"""
+    try:
+        req = json.loads(message if isinstance(message, str) else message.decode("utf-8"))
+        supplied = str(req.get("token", ""))
+    except Exception:
+        return "解析失敗"
+    found = _find_device_by_token(supplied)
+    if found:
+        did, d = found
+        return f"端末「{d.get('name', '?')}」({did[:8]}) として認証成功"
+    return "不明なトークンで認証失敗"
+
+
 def _handle_dc_request(message: bytes | str) -> bytes:
     """JSON形式のリクエストを処理してバイナリレスポンスを返す（同期・ブロッキングOK）。"""
     try:
@@ -1675,11 +1758,7 @@ def _handle_dc_request(message: bytes | str) -> bytes:
                             json.dumps({"error": str(e)}).encode())
 
     # 認証層2: room_idでP2Pが成立しても、承認済み端末トークンが無ければ本を配らない。
-    if not supplied or not any(
-        d.get("status") == "approved" and d.get("token") and
-        secrets.compare_digest(supplied, d["token"])
-        for d in _config.get("devices", {}).values()
-    ):
+    if not _find_device_by_token(supplied):
         return _dc_response(req_id, 401, "application/json",
                             json.dumps({"error": "unauthorized"}).encode())
     try:
@@ -1837,15 +1916,23 @@ async def _run_peer_async(session_id: str, offer_sdp: str,
         def on_datachannel(channel):
             _log_queue.put(f"[WebRTC] P2P接続確立: {session_id[:8]}")
             dc_ready.set()
+            device_logged = False
 
             @channel.on("message")
             def on_message(message):
                 async def _process():
+                    nonlocal device_logged
                     try:
                         resp = await loop.run_in_executor(None, _handle_dc_request, message)
                         channel.send(resp)
                     except Exception as e:
                         _log_queue.put(f"[WebRTC] DCエラー: {e}")
+                        return
+                    if not device_logged:
+                        device_logged = True
+                        _log_queue.put(
+                            f"[WebRTC] {session_id[:8]}: {_device_label_for_message(message)}"
+                        )
                 asyncio.create_task(_process())
 
         try:
