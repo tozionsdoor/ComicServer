@@ -104,6 +104,11 @@ class _StartScreenState extends State<_StartScreen> {
               viaWebRtc: true, roomId: roomId, turnUrl: turnUrl,
               turnUsername: turnUser, turnCredential: turnCred,
               certFingerprint: certFingerprint);
+          api.getConnectionInfo().then((info) async {
+            if (info == null) return;
+            final v6 = (info['ipv6'] ?? '').toString();
+            if (v6.isNotEmpty) await prefs.setString('ipv6', v6);
+          });
           await _finish('P2Pで接続しました', () => ShelfScreen(api: api));
           return;
         }

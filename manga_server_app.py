@@ -16,6 +16,7 @@ import os
 import queue
 import re
 import socket
+import subprocess
 import threading
 import time
 import webbrowser
@@ -472,14 +473,43 @@ DISCOVERY_PROBE    = b"COMICSERVER_DISCOVER"
 _discovery_started = False
 
 def get_global_ipv6() -> str:
-    """インターネットへ出る際の送信元グローバルIPv6を返す（無ければ空文字）。"""
+    """インターネットへ出る際のグローバルIPv6を返す（無ければ空文字）。
+    getsockname()はOSのプライバシー拡張で一時アドレス(数時間で失効・ローテーション)を
+    返すことが多いため、同じNIC・同じ/64内にPublic(安定)アドレスがあればそちらを優先する
+    （PCにWi-Fi/有線など複数NICがあり、それぞれが別アドレスを持つ場合があるため、
+    getsockname()が属するインターフェースのブロック内に限定して探す）。
+    """
     try:
         s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
         s.connect(("2001:4860:4860::8888", 80))   # 実際には送信しない（経路確認のみ）
         ip = s.getsockname()[0]
         s.close()
-        if ip and not ip.startswith("fe80") and ip != "::1":
-            return ip.split("%")[0]
+        if not ip or ip.startswith("fe80") or ip == "::1":
+            return ""
+        ip = ip.split("%")[0]
+        prefix = ip.split(":")[:4]
+        try:
+            out = subprocess.run(
+                ["netsh", "interface", "ipv6", "show", "address"],
+                capture_output=True, text=True, timeout=3,
+                encoding="utf-8", errors="replace",
+            ).stdout
+            for block in out.split("\n\n"):
+                public_addr = None
+                contains_ip = False
+                for line in block.splitlines():
+                    cols = line.split()
+                    if len(cols) == 5 and cols[0] in ("Public", "Temporary"):
+                        addr = cols[4].split("%")[0]
+                        if cols[0] == "Public" and addr.split(":")[:4] == prefix:
+                            public_addr = addr
+                        if addr == ip:
+                            contains_ip = True
+                if contains_ip and public_addr:
+                    return public_addr
+        except Exception:
+            pass
+        return ip
     except OSError:
         pass
     return ""

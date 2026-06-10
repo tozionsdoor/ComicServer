@@ -325,6 +325,7 @@ class _LoginScreenState extends State<LoginScreen> {
             turnUsername:     prefs.getString('turn_username'),
             turnCredential:   prefs.getString('turn_credential'),
             certFingerprint:  certFingerprint);
+        _refreshConnInfo(api);
         Navigator.pushReplacement(context,
             MaterialPageRoute(builder: (_) => ShelfScreen(api: api)));
         return;
