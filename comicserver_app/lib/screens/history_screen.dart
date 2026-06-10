@@ -4,6 +4,7 @@ import 'package:cached_network_image/cached_network_image.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../models/book.dart';
 import '../services/api_service.dart';
+import '../services/ads_service.dart';
 import 'reader_screen.dart';
 
 /// 読書履歴（続きから / 既読一覧）。端末内 SharedPreferences の 'history' を表示する。
@@ -120,6 +121,9 @@ class _HistoryScreenState extends State<HistoryScreen> {
         // API失敗時は単巻のまま開く
       }
     }
+    if (!mounted) return;
+
+    await AdsService.maybeShowInterstitial();
     if (!mounted) return;
 
     Navigator.push(

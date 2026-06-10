@@ -11,6 +11,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 import '../models/book.dart';
 import '../services/api_service.dart';
+import '../services/ads_service.dart';
 import '../widgets/reconnect_banner.dart';
 
 
@@ -502,6 +503,7 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
     );
     _dialogShowing = false;
     if (ok == true && mounted) {
+      AdsService.recordVolumeRead();
       Navigator.pushReplacement(context, MaterialPageRoute(
         builder: (_) => ReaderScreen(
           api: widget.api, book: target,

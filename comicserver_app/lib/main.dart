@@ -4,6 +4,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'firebase_options.dart';
 import 'screens/login_screen.dart';
 import 'screens/shelf_screen.dart';
+import 'services/ads_service.dart';
 import 'services/api_service.dart';
 import 'services/webrtc_service.dart';
 
@@ -14,16 +15,21 @@ void main() async {
   } catch (_) {
     // Firebase未設定の場合はWebRTC P2Pが無効になるが、LAN/VPN動作は継続する
   }
-  runApp(const ComicServerApp());
+  try {
+    await AdsService.initialize();
+  } catch (_) {
+    // 広告SDK初期化失敗時もアプリ本体の動作は継続する
+  }
+  runApp(const ArcHiveApp());
 }
 
-class ComicServerApp extends StatelessWidget {
-  const ComicServerApp({super.key});
+class ArcHiveApp extends StatelessWidget {
+  const ArcHiveApp({super.key});
 
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'ComicServer',
+      title: 'ArcHive',
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
         colorScheme: ColorScheme.fromSeed(
@@ -50,6 +56,7 @@ class _StartScreenState extends State<_StartScreen> {
   @override
   void initState() {
     super.initState();
+    AdsService.requestConsent();
     _autoLogin();
   }
 

@@ -359,7 +359,7 @@ class _LoginScreenState extends State<LoginScreen> {
       children: [
         const Icon(Icons.menu_book, size: 72, color: Color(0xFF89b4fa)),
         const SizedBox(height: 12),
-        const Text('ComicServer',
+        const Text('ArcHive',
             style: TextStyle(
                 fontSize: 28,
                 fontWeight: FontWeight.bold,
@@ -406,7 +406,7 @@ class _LoginScreenState extends State<LoginScreen> {
       children: [
         const Icon(Icons.menu_book, size: 72, color: Color(0xFF89b4fa)),
         const SizedBox(height: 12),
-        const Text('ComicServer',
+        const Text('ArcHive',
             style: TextStyle(
                 fontSize: 28,
                 fontWeight: FontWeight.bold,

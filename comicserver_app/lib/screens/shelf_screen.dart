@@ -8,6 +8,8 @@ import 'reader_screen.dart';
 import 'login_screen.dart';
 import 'history_screen.dart';
 import '../widgets/reconnect_banner.dart';
+import '../widgets/banner_ad_widget.dart';
+import '../services/ads_service.dart';
 
 class ShelfScreen extends StatefulWidget {
   final ApiService api;
@@ -116,7 +118,9 @@ class _ShelfScreenState extends State<ShelfScreen> with WidgetsBindingObserver {
     _load(prev);
   }
 
-  void _openBook(BookItem book, {List<BookItem>? siblings}) {
+  Future<void> _openBook(BookItem book, {List<BookItem>? siblings}) async {
+    await AdsService.maybeShowInterstitial();
+    if (!mounted) return;
     final books = siblings ?? _contents?.books ?? <BookItem>[];
     final idx   = books.indexWhere((b) => b.id == book.id);
     Navigator.push(
@@ -158,7 +162,7 @@ class _ShelfScreenState extends State<ShelfScreen> with WidgetsBindingObserver {
           title: _canGoBack
               ? Text(_currentPath.split('/').last,
                   style: const TextStyle(color: Color(0xFFcdd6f4), fontSize: 16))
-              : const Text('ComicServer',
+              : const Text('ArcHive',
                   style: TextStyle(
                       color: Color(0xFF89b4fa), fontWeight: FontWeight.bold)),
           actions: [
@@ -218,6 +222,7 @@ class _ShelfScreenState extends State<ShelfScreen> with WidgetsBindingObserver {
           _buildBody(),
           ReconnectBanner(api: widget.api),
         ]),
+        bottomNavigationBar: const BannerAdWidget(),
       ),
     );
   }
