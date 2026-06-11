@@ -211,6 +211,16 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
   final List<int> _prefetchQueue   = [];
   int             _prefetchInFlight = 0;
 
+  // 画像の自己回復:
+  // ページ画像(CachedNetworkImage)はAPI経路(_getWithRecovery)を通らないため、
+  // 経路が一時的に切れると（IPv6プレフィックス/一時アドレスのローテーション、
+  // アイドルでのフロー切断、keep-alive接続の死活など）静的なエラー表示を出すだけで
+  // 自動復旧しなかった。失敗を検知したら reconnect() で生きた経路を確保し、
+  // 世代カウンタ _imgGen を進めて画像ウィジェットを作り直す（新規接続で取り直す）。
+  int      _imgGen         = 0;     // ++ で全 _img / サムネを作り直す
+  bool     _imgRecovering  = false; // reconnect の多重起動ガード
+  DateTime _lastImgRecover = DateTime.fromMillisecondsSinceEpoch(0); // スロットル基点
+
   void _prefetchAround(int pvIdx) {
     final ctx = _ctx;
     if (ctx == null || !mounted || _units.isEmpty) return;
@@ -462,6 +472,9 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
             _rebuildUnits();
           });
         }
+      }, onError: (_, __) {
+        // 比率検出の失敗は致命的でない（_refRatioにフォールバック・再ビルドで再試行）。
+        // 接続由来の失敗は表示画像の errorWidget → _onImageError が回復を担う。
       }),
     );
   }
@@ -1027,6 +1040,7 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
 
     Widget thumbImage(int page, {int memWidth = 220}) {
       return CachedNetworkImage(
+        key: ValueKey('thumb_${page}_$_imgGen'),
         imageUrl: widget.api.pageUrl(widget.book.id, page),
         httpHeaders: widget.api.headers,
         cacheManager: widget.api.cacheManager,
@@ -1037,12 +1051,15 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
         placeholder: (_, __) => Container(
           color: const Color(0xFF1e1e2e),
         ),
-        errorWidget: (_, __, ___) => const ColoredBox(
-          color: Color(0xFF1e1e2e),
-          child: Center(
-            child: Icon(Icons.broken_image, color: Colors.white30, size: 16),
-          ),
-        ),
+        errorWidget: (_, __, ___) {
+          _onImageError();
+          return const ColoredBox(
+            color: Color(0xFF1e1e2e),
+            child: Center(
+              child: Icon(Icons.broken_image, color: Colors.white30, size: 16),
+            ),
+          );
+        },
       );
     }
 
@@ -1205,8 +1222,31 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
   }
 
   // ── 画像 ──────────────────────────────────────────────────────────────────
+  // 画像読み込み失敗時の自己回復。8秒スロットル＋多重起動ガードで reconnect を1回に
+  // 集約し、生きた経路を確保できたら _imgGen を進めて画像を作り直す（baseUrlが同じでも
+  // 新規接続で取り直すため、死んだkeep-alive接続も捨てられる）。本物の404等で恒久的に
+  // 失敗する場合もスロットルで暴走しない（reconnectは生存pingで即returnする）。
+  void _onImageError() {
+    if (_imgRecovering) return;
+    final now = DateTime.now();
+    if (now.difference(_lastImgRecover) < const Duration(seconds: 8)) return;
+    _imgRecovering  = true;
+    _lastImgRecover = now;
+    () async {
+      try {
+        final ok = await widget.api.reconnect();
+        if (!mounted || !ok) return;
+        setState(() => _imgGen++);
+        _prefetchAround(_pageToUnitIndex(_page));
+      } finally {
+        _imgRecovering = false;
+      }
+    }();
+  }
+
   Widget _img(int n, BoxFit fit) {
     return CachedNetworkImage(
+      key:            ValueKey('img_${n}_$_imgGen'),
       imageUrl:       widget.api.pageUrl(widget.book.id, n),
       httpHeaders:    widget.api.headers,
       cacheManager:   widget.api.cacheManager,
@@ -1214,8 +1254,11 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
       fadeInDuration: Duration.zero,
       placeholder: (_, __) => const Center(
           child: CircularProgressIndicator(color: Color(0xFF89b4fa), strokeWidth: 2)),
-      errorWidget: (_, __, ___) => const Center(
-          child: Icon(Icons.broken_image, color: Colors.white30, size: 40)),
+      errorWidget: (_, __, ___) {
+        _onImageError();
+        return const Center(
+            child: Icon(Icons.broken_image, color: Colors.white30, size: 40));
+      },
     );
   }
 
