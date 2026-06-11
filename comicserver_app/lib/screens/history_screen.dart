@@ -19,6 +19,7 @@ class HistoryScreen extends StatefulWidget {
 class _HistoryScreenState extends State<HistoryScreen> {
   List<Map<String, dynamic>> _items = [];
   bool _loading = true;
+  bool _opening = false;   // 本を開く処理の多重実行ガード（広告後の誤オープン対策）
 
   @override
   void initState() {
@@ -123,16 +124,23 @@ class _HistoryScreenState extends State<HistoryScreen> {
     }
     if (!mounted) return;
 
-    await AdsService.maybeShowInterstitial();
-    if (!mounted) return;
-
-    Navigator.push(
-      context,
-      MaterialPageRoute(
-        builder: (_) => ReaderScreen(
-            api: widget.api, book: book, siblings: siblings, bookIndex: bookIndex),
-      ),
-    ).then((_) => _load()); // 戻ったら進捗を反映して並び替え
+    // 多重オープン防止。広告を閉じた瞬間のタップ貫通で別の巻が開く不具合の対策。
+    if (_opening) return;
+    _opening = true;
+    try {
+      await AdsService.maybeShowInterstitial();
+      if (!mounted) return;
+      await Navigator.push(
+        context,
+        MaterialPageRoute(
+          builder: (_) => ReaderScreen(
+              api: widget.api, book: book, siblings: siblings, bookIndex: bookIndex),
+        ),
+      );
+      if (mounted) _load(); // 戻ったら進捗を反映して並び替え
+    } finally {
+      _opening = false;
+    }
   }
 
   @override

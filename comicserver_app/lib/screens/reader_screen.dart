@@ -277,32 +277,45 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
       return;
     }
 
-    final list = <_SpreadUnit>[];
-    final offset = _spreadPairStart.clamp(0, 1);
-    int i = 0;
-    if (offset == 1 && _total > 0) {
-      list.add(_SpreadUnit(0));
-      i = 1;
-    }
     bool wide(int p) {
       final r = _ratioCache[p];
       if (r == null) return false;
       return r > _refRatio * 1.8;
     }
 
-    void addPairedUntil(int end) {
-      while (i < end) {
-        if (wide(i) || i + 1 >= end || wide(i + 1)) {
-          list.add(_SpreadUnit(i));
-          i++;
-        } else {
-          list.add(_SpreadUnit(i, i + 1));
-          i += 2;
-        }
+    final list = <_SpreadUnit>[];
+    final offset = _spreadPairStart.clamp(0, 1);
+    int i = 0;
+    // セグメント先頭（本の先頭・横長ページ直後）。横長ページは見開きペアを
+    // リセットするので、「1ページずらす」のオフセットを各セグメント先頭に
+    // 適用しないと、横長ページより後ろではペアの偶奇を直せない
+    // （横長の表紙を持つ本で「1ページずらす」が効かない不具合の原因）。
+    bool segmentStart = true;
+    while (i < _total) {
+      // 横長（合成見開き）は単独表示し、次ページから新しいセグメントを開始
+      if (wide(i)) {
+        list.add(_SpreadUnit(i));
+        i++;
+        segmentStart = true;
+        continue;
+      }
+      // セグメント先頭でオフセット=1なら、先頭1枚を単独にしてペアの偶奇をずらす
+      if (segmentStart && offset == 1) {
+        segmentStart = false;
+        list.add(_SpreadUnit(i));
+        i++;
+        continue;
+      }
+      segmentStart = false;
+      // 次ページが範囲外/横長ならペアにせず単独表示（横長合成見開きの貼り付き防止）
+      if (i + 1 >= _total || wide(i + 1)) {
+        list.add(_SpreadUnit(i));
+        i++;
+      } else {
+        list.add(_SpreadUnit(i, i + 1));
+        i += 2;
       }
     }
-
-    addPairedUntil(_total);
     _units = list;
   }
 
@@ -516,16 +529,28 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
 
   // ── ユニット送り（タップ＆端スワイプ共通） ──────────────────────────────────
   void _advance() {
-    // 見開きモード: ユニット内が末尾でなければ左ページへスクロール、末尾なら次ユニットへ
+    // 見開きモード: ペアの右ページ(first)から左ページ(second)へは常にページ単位で送る。
+    // ・拡大中(画面幅より広い)＝端未達なら左ページへスクロール、端なら次ユニットへ
+    // ・画面に収まる見開き＝スクロール余地が無いので、右ページ表示中は_pageだけ
+    //   左ページへ進め、次タップで次ユニットへ（=2タップで1見開き=ページ単位送り）
     if (_spread) {
       final pvIdx = _currentPvIndex();
       if (pvIdx < _units.length && _units[pvIdx].isPair) {
+        final unit = _units[pvIdx];
         final state = _unitKeys[pvIdx]?.currentState;
-        if (state != null && !state.isAtEnd()) {
-          state.animateToEnd();
-          setState(() => _page = _units[pvIdx].second!);
-          _saveProgress();
-          return;
+        if (state != null) {
+          if (state.hasScrollRoom()) {
+            if (!state.isAtEnd()) {
+              state.animateToEnd();
+              setState(() => _page = unit.second!);
+              _saveProgress();
+              return;
+            }
+          } else if (_page == unit.first) {
+            setState(() => _page = unit.second!);
+            _saveProgress();
+            return;
+          }
         }
       }
     }
@@ -540,16 +565,27 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
   }
 
   void _retreat() {
-    // 見開きモード: ユニット内が先頭でなければ右ページへスクロール、先頭なら前ユニットへ
+    // 見開きモード: ペアの左ページ(second)から右ページ(first)へは常にページ単位で戻る。
+    // ・拡大中＝先頭未達なら右ページへスクロール、先頭なら前ユニットへ
+    // ・画面に収まる見開き＝左ページ表示中は_pageだけ右ページへ戻し、次タップで前ユニットへ
     if (_spread) {
       final pvIdx = _currentPvIndex();
       if (pvIdx < _units.length && _units[pvIdx].isPair) {
+        final unit = _units[pvIdx];
         final state = _unitKeys[pvIdx]?.currentState;
-        if (state != null && !state.isAtStart()) {
-          state.animateToStart();
-          setState(() => _page = _units[pvIdx].first);
-          _saveProgress();
-          return;
+        if (state != null) {
+          if (state.hasScrollRoom()) {
+            if (!state.isAtStart()) {
+              state.animateToStart();
+              setState(() => _page = unit.first);
+              _saveProgress();
+              return;
+            }
+          } else if (_page == unit.second) {
+            setState(() => _page = unit.first);
+            _saveProgress();
+            return;
+          }
         }
       }
     }
@@ -1403,6 +1439,13 @@ class _ScrollUnitState extends State<_ScrollUnit> {
   // 末尾（読み終わり側）へ即ジャンプ。前の見開きに戻った時に左ページを表示する用
   void jumpToEnd() {
     if (_c.hasClients) _c.jumpTo(_c.position.maxScrollExtent);
+  }
+
+  // 見開きが画面幅より広く、横スクロールの余地があるか（=拡大表示中か）。
+  // 余地がなければ見開き全体が画面に収まっており、ページ送りは_pageの更新で行う。
+  bool hasScrollRoom() {
+    if (!_c.hasClients) return false;
+    return _c.position.maxScrollExtent > 1;
   }
 
   // タップ1ページ送り用: スクロール端判定＆アニメーション移動

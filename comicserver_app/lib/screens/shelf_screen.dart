@@ -26,6 +26,7 @@ class _ShelfScreenState extends State<ShelfScreen> with WidgetsBindingObserver {
   final _searchCtrl = TextEditingController();
   bool _searching   = false;
   bool _rescanning  = false;
+  bool _opening     = false;   // 本を開く処理の多重実行ガード（広告後の誤オープン対策）
   List<BookItem> _allBooks = [];
   StreamSubscription<List<ConnectivityResult>>? _connectivitySub;
 
@@ -119,21 +120,30 @@ class _ShelfScreenState extends State<ShelfScreen> with WidgetsBindingObserver {
   }
 
   Future<void> _openBook(BookItem book, {List<BookItem>? siblings}) async {
-    await AdsService.maybeShowInterstitial();
-    if (!mounted) return;
-    final books = siblings ?? _contents?.books ?? <BookItem>[];
-    final idx   = books.indexWhere((b) => b.id == book.id);
-    Navigator.push(
-      context,
-      MaterialPageRoute(
-        builder: (_) => ReaderScreen(
-          api:       widget.api,
-          book:      book,
-          siblings:  books,
-          bookIndex: idx >= 0 ? idx : 0,
+    // 多重オープン防止。インタースティシャル広告を閉じた瞬間のタップが下の
+    // 本棚へ貫通し、別の巻がもう1冊開いてしまう（広告後に違う巻が開く）不具合の対策。
+    // リーダーを開いている間はガードを維持し、戻ってきたら解除する。
+    if (_opening) return;
+    _opening = true;
+    try {
+      await AdsService.maybeShowInterstitial();
+      if (!mounted) return;
+      final books = siblings ?? _contents?.books ?? <BookItem>[];
+      final idx   = books.indexWhere((b) => b.id == book.id);
+      await Navigator.push(
+        context,
+        MaterialPageRoute(
+          builder: (_) => ReaderScreen(
+            api:       widget.api,
+            book:      book,
+            siblings:  books,
+            bookIndex: idx >= 0 ? idx : 0,
+          ),
         ),
-      ),
-    );
+      );
+    } finally {
+      _opening = false;
+    }
   }
 
   String get _currentPath => _contents?.path ?? '';
