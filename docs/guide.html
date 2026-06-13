@@ -86,6 +86,13 @@
   .step h3{margin:0 0 8px;font-size:1.2rem;}
   .step p{color:var(--dim);font-size:0.95rem;margin:0;}
 
+  /* note box */
+  .note-box{
+    background:var(--accent-bg);border:1px solid var(--accent);border-radius:8px;
+    padding:16px 20px;margin:0 auto 32px;max-width:720px;font-size:0.9rem;color:var(--text);
+  }
+  .note-box strong{color:var(--accent-dark);}
+
   /* footer */
   footer{padding:32px 0;text-align:center;color:var(--dim);font-size:0.85rem;}
   footer a{color:var(--dim);text-decoration:underline;}
@@ -129,6 +136,12 @@
     <p class="section-sub">
       下のスクリーンショットはイメージ（モックアップ）です。実際の画面は今後の更新で差し替え予定です。
     </p>
+
+    <div class="note-box">
+      ⚠️ <strong>インストーラー実行時に「Windows によって PC が保護されました」と表示される場合があります。</strong><br>
+      これは開発元の署名がない個人配布アプリで一般的に表示される警告で、ArcHive固有の問題ではありません。
+      表示されたら「詳細情報」をクリックすると「実行」ボタンが現れるので、それをクリックするとインストールを続行できます。
+    </div>
 
     <div class="step">
       <div class="img-col">
