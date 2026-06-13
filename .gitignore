@@ -39,6 +39,7 @@ comicserver_app/__pycache__/
 # ── ビルド生成物・配布バイナリ（NAS上に配置、gitには入れない） ──
 app-release.apk
 *.apk
+*.aab
 cloudflared.exe
 
 # ── TLS 証明書（自動生成・秘密鍵） ─────────────────────────
