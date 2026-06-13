@@ -1,7 +1,7 @@
 # WebRTC P2P セットアップ手順
 
 Phase 2 の WebRTC P2P（外出先からVPN無しで自宅サーバーに繋ぐ機能）を有効化する手順。
-**この作業は開発者（taka）が一度だけ行えばよい。** エンドユーザーはFirebase作業不要
+**この作業は開発者が一度だけ行えばよい。** エンドユーザーはFirebase作業不要
 （アプリ・サーバーに設定が同梱される）。
 
 設計の全体像は memory `07_webrtc_design.md` 参照。
@@ -76,9 +76,9 @@ DEFAULT_FIREBASE = {
 ## ステップ 7: サーバーに aiortc をインストール
 
 ```
-C:\keiri_python\python_embed\python.exe -m pip install aiortc
+%KEIRI_PYTHON% -m pip install aiortc
 ```
-（※ taka機ではインストール済み: aiortc 1.14.0）
+（※ 開発機ではインストール済み: aiortc 1.14.0）
 
 ## ステップ 8: Realtime DB セキュリティルールを適用
 
@@ -90,8 +90,8 @@ C:\keiri_python\python_embed\python.exe -m pip install aiortc
 
 Firebase値を入れた後、APKを作り直す:
 ```
-# JAVA_HOMEを通してから（taka機の場合）
-cd C:\Users\taka\comicserver_app
+# JAVA_HOMEを通してから
+cd <comicserver_appのパス>
 flutter build apk --release
 ```
 → `build/app/outputs/flutter-apk/app-release.apk` を `Z:\...\app-release.apk` へ配置

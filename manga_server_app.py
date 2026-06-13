@@ -3,9 +3,12 @@ manga_server_app.py - 自炊ファイル配信サーバー（GUI版）
 ZIP / RAR / CBZ / PDF / EPUB をスキャンして FastAPI + uvicorn で配信する
 Android クライアントから Basic 認証で接続して閲覧できる
 """
+import os
 import sys
 if not getattr(sys, "frozen", False):
-    sys.path.insert(0, r"C:\keiri_python\python_embed\Lib\site-packages")
+    _keiri_python = os.environ.get("KEIRI_PYTHON")
+    if _keiri_python:
+        sys.path.insert(0, os.path.join(os.path.dirname(_keiri_python), "Lib", "site-packages"))
 
 import asyncio
 import hashlib
@@ -13,7 +16,6 @@ import io
 import ipaddress
 import json
 import logging
-import os
 import queue
 import re
 import socket

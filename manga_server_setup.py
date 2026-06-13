@@ -1,8 +1,9 @@
 """
 manga_server_setup.py - MangaServer セットアップ
-C:\\keiri_python\\python_embed に必要パッケージを pip インストールする
+環境変数 KEIRI_PYTHON が指す Python 環境に必要パッケージを pip インストールする
 他 PC でも同じ環境を再現できる
 """
+import os
 import subprocess
 import sys
 import threading
@@ -10,8 +11,9 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 from pathlib import Path
 
-PYTHON = Path(r"C:\keiri_python\python_embed\python.exe")
-SP     = Path(r"C:\keiri_python\python_embed\Lib\site-packages")
+_KEIRI_PYTHON = os.environ.get("KEIRI_PYTHON", "")
+PYTHON = Path(_KEIRI_PYTHON) if _KEIRI_PYTHON else None
+SP     = PYTHON.parent / "Lib" / "site-packages" if PYTHON else None
 
 # (表示名, site-packages内のフォルダ/ファイル名, pip パッケージ名, 用途)
 REQUIRED_PACKAGES = [
@@ -34,7 +36,7 @@ ACCENT   = "#89b4fa"
 
 
 def check_package(folder: str) -> bool:
-    return (SP / folder).exists()
+    return SP is not None and (SP / folder).exists()
 
 
 class SetupApp(tk.Tk):
@@ -45,6 +47,7 @@ class SetupApp(tk.Tk):
         self.resizable(False, False)
         self.configure(bg=BG)
 
+        self._status_lbls: dict[str, tk.Label] = {}
         self._build()
         self.after(200, self._check_only)
 
@@ -54,13 +57,14 @@ class SetupApp(tk.Tk):
         tk.Label(self, text="MangaServer セットアップ",
                  bg=BG, fg=FG, font=("Yu Gothic UI", 13, "bold")).pack(pady=(18, 4))
         tk.Label(self,
-                 text="必要なパッケージを C:\\keiri_python\\python_embed にインストールします。",
+                 text="必要なパッケージを KEIRI_PYTHON 環境変数が指す Python 環境にインストールします。",
                  bg=BG, fg=FG_DIM, font=("Yu Gothic UI", 9)).pack()
 
         # python.exe の存在確認
-        if not PYTHON.exists():
+        if PYTHON is None or not PYTHON.exists():
             tk.Label(self,
-                     text=f"[エラー] {PYTHON} が見つかりません。\n先に AI ツールのインストーラーを実行してください。",
+                     text=f"[エラー] Python が見つかりません: {PYTHON or '(KEIRI_PYTHON未設定)'}\n"
+                          "環境変数 KEIRI_PYTHON に python.exe のパスを設定してください。",
                      bg=BG, fg=FG_RED, font=("Yu Gothic UI", 9),
                      justify="center").pack(pady=12)
             return
@@ -132,10 +136,10 @@ class SetupApp(tk.Tk):
 
     # ── 状態確認 ────────────────────────────────────────────────────────────
     def _check_only(self):
-        if not SP.exists():
+        if SP is None or not SP.exists():
             for lbl in self._status_lbls.values():
                 lbl.config(text="未インストール", fg=FG_RED)
-            self._status_var.set("keiri_python が見つかりません。")
+            self._status_var.set("Python環境が見つかりません（KEIRI_PYTHON未設定）。")
             return
         for pkg_name, folder, _, _ in REQUIRED_PACKAGES:
             lbl = self._status_lbls[pkg_name]
@@ -151,8 +155,8 @@ class SetupApp(tk.Tk):
 
     # ── インストール ────────────────────────────────────────────────────────
     def _start_install(self):
-        if not PYTHON.exists():
-            messagebox.showerror("エラー", f"Python が見つかりません:\n{PYTHON}")
+        if PYTHON is None or not PYTHON.exists():
+            messagebox.showerror("エラー", f"Python が見つかりません:\n{PYTHON or '(KEIRI_PYTHON未設定)'}")
             return
         self._btn_install.configure(state="disabled")
         self._btn_check.configure(state="disabled")
