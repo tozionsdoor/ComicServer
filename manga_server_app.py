@@ -1382,7 +1382,7 @@ async def register_device(request: Request):
     # 既承認端末の再ペアリング（トークンは変えない）
     if device_id in devices and devices[device_id].get("status") == "approved":
         _log_queue.put(f"[認証] 既承認端末が再ペアリング: {device_name}")
-        return {"status": "already_approved"}
+        return {"status": "already_approved", "token": devices[device_id].get("token", "")}
     reg_token = secrets.token_urlsafe(32)
     devices[device_id] = {
         "name":         device_name,

@@ -176,7 +176,12 @@ class _LoginScreenState extends State<LoginScreen> {
           return;
         }
         if (status == 'already_approved') {
-          // 既承認（再ペアリング）: トークン要手動入力 or 再度LAN発見
+          // 既承認端末の再ペアリング: 既存トークンが返るのでそのまま接続
+          final token = data['token'] as String? ?? '';
+          if (token.isNotEmpty) {
+            await _saveAndNavigate(baseUrl, token);
+            return;
+          }
           setState(() { _loading = false; _urlCtrl.text = baseUrl; });
           return;
         }
