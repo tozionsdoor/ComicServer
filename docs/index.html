@@ -130,6 +130,11 @@
     display:inline-block;font-size:0.8rem;font-weight:bold;
     background:#fff5e0;color:#a86a00;border-radius:999px;padding:4px 14px;margin-bottom:12px;
   }
+  .status-pill-ready{
+    display:inline-block;font-size:0.8rem;font-weight:bold;
+    background:var(--green-bg);color:var(--green);border-radius:999px;padding:4px 14px;margin-bottom:12px;
+  }
+  .dl-meta{color:var(--dim);font-size:0.8rem;margin:10px 0 0;}
 
   /* footer */
   footer{padding:32px 0;text-align:center;color:var(--dim);font-size:0.85rem;}
@@ -172,7 +177,7 @@
     </p>
     <div class="cta-row">
       <a class="btn btn-primary btn-disabled" href="#download">Androidアプリを見る</a>
-      <a class="btn btn-secondary btn-disabled" href="#download">サーバーソフトを見る</a>
+      <a class="btn btn-secondary" href="#download">サーバーソフトを見る</a>
     </div>
   </div>
 </section>
@@ -343,7 +348,7 @@
 <section id="download">
   <div class="wrap">
     <h2>ダウンロード</h2>
-    <p class="section-sub">公開準備中です。公開され次第、このページからダウンロードできるようになります。</p>
+    <p class="section-sub">サーバーソフト（Windows）は配布を開始しています。Androidアプリは公開準備中です。</p>
     <div class="download-grid">
       <div class="dl-card">
         <div class="status-pill">近日公開</div>
@@ -352,10 +357,11 @@
         <a class="btn btn-primary btn-disabled">Google Play で見る</a>
       </div>
       <div class="dl-card">
-        <div class="status-pill">近日公開</div>
+        <div class="status-pill-ready">v1.0.0 公開中</div>
         <h3>🖥️ サーバーソフト（Windows）</h3>
-        <p>インストーラー形式（.exe）での配布を準備中です。</p>
-        <a class="btn btn-primary btn-disabled">ダウンロード</a>
+        <p>インストーラー（.exe）を実行するだけで、必要なモジュールも含めてセットアップが完了します。</p>
+        <a class="btn btn-primary" href="https://github.com/tozionsdoor/ComicServer/releases/download/v1.0.0/ArcHive_Setup.exe">ダウンロード（Windows用）</a>
+        <p class="dl-meta">ArcHive_Setup.exe ・ 約110MB ・ Windows 10/11</p>
       </div>
     </div>
   </div>
