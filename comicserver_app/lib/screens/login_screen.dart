@@ -430,7 +430,7 @@ class _LoginScreenState extends State<LoginScreen> {
           ),
         ),
         const SizedBox(height: 6),
-        _field(_tokenCtrl, '認証トークン', Icons.key, true),
+        _field(_tokenCtrl, '認証トークン', Icons.key, true, allowReveal: false),
         const SizedBox(height: 12),
         _buildTurnSection(),
         const SizedBox(height: 24),
@@ -499,16 +499,17 @@ class _LoginScreenState extends State<LoginScreen> {
     );
   }
 
-  Widget _field(TextEditingController c, String label, IconData icon, bool isPass) {
+  Widget _field(TextEditingController c, String label, IconData icon, bool isPass,
+      {bool allowReveal = true}) {
     return TextField(
       controller: c,
-      obscureText: isPass && _obscure,
+      obscureText: isPass && (!allowReveal || _obscure),
       style: const TextStyle(color: Color(0xFFcdd6f4)),
       decoration: InputDecoration(
         labelText: label,
         labelStyle: const TextStyle(color: Color(0xFFa6adc8)),
         prefixIcon: Icon(icon, color: const Color(0xFF585b70)),
-        suffixIcon: isPass
+        suffixIcon: (isPass && allowReveal)
             ? IconButton(
                 icon: Icon(_obscure ? Icons.visibility : Icons.visibility_off,
                     color: const Color(0xFF585b70)),

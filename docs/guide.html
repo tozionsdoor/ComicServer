@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>使い方ガイド — ArcHive</title>
+<meta name="description" content="ArcHiveのセットアップ手順（PCサーバーのインストールからスマホアプリのペアリングまで）と、見開き表示・綴じ方向の切り替えなどリーダーの操作方法をまとめた使い方ガイドです。">
+<link rel="icon" href="images/favicon.ico" sizes="any">
+<link rel="apple-touch-icon" href="images/apple-touch-icon.png">
+<style>
+  :root{
+    --bg:#fafafa;
+    --panel:#ffffff;
+    --text:#1a1a1a;
+    --dim:#666666;
+    --line:#e6e6e6;
+    --accent:#5b8def;
+    --accent-dark:#3f6fd1;
+    --accent-bg:#eef3ff;
+    --green:#3aa66b;
+    --green-bg:#eaf7f0;
+  }
+  *{box-sizing:border-box;}
+  body{
+    font-family:'Hiragino Kaku Gothic ProN','Noto Sans JP',sans-serif;
+    margin:0;
+    background:var(--bg);
+    color:var(--text);
+    line-height:1.8;
+  }
+  a{color:var(--accent-dark);}
+  img{max-width:100%;display:block;}
+  .wrap{max-width:1080px;margin:0 auto;padding:0 20px;}
+
+  /* header */
+  header{
+    position:sticky; top:0; z-index:10;
+    background:rgba(250,250,250,0.92);
+    backdrop-filter:blur(6px);
+    border-bottom:1px solid var(--line);
+  }
+  header .wrap{display:flex;align-items:center;justify-content:space-between;height:60px;}
+  .logo{font-size:1.3rem;font-weight:bold;letter-spacing:0.02em;}
+  .logo span{color:var(--accent-dark);}
+  .logo-link{text-decoration:none;color:var(--text);}
+  nav a{margin-left:20px;font-size:0.9rem;text-decoration:none;color:var(--text);font-weight:bold;}
+  nav a:hover{color:var(--accent-dark);}
+
+  /* hero */
+  .hero{padding:64px 0 48px;text-align:center;}
+  .hero h1{font-size:2.2rem;margin:0 0 12px;}
+  .hero p.lead{font-size:1.05rem;color:var(--dim);max-width:640px;margin:0 auto 28px;}
+  .cta-row{display:flex;gap:16px;justify-content:center;flex-wrap:wrap;}
+  .btn{
+    display:inline-block;padding:14px 28px;border-radius:8px;
+    font-weight:bold;font-size:0.95rem;text-decoration:none;
+    border:1px solid var(--line);
+  }
+  .btn-primary{background:var(--accent);color:#fff;border-color:var(--accent);}
+  .btn-secondary{background:#fff;color:var(--text);}
+
+  /* sections */
+  section{padding:48px 0;}
+  section h2{font-size:1.5rem;text-align:center;margin:0 0 8px;}
+  section .section-sub{text-align:center;color:var(--dim);font-size:0.95rem;margin:0 0 36px;}
+  .alt{background:var(--panel);border-top:1px solid var(--line);border-bottom:1px solid var(--line);}
+
+  /* features grid */
+  .features{display:grid;grid-template-columns:repeat(2,1fr);gap:20px;}
+  .feature{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:24px;}
+  .feature .icon{font-size:1.8rem;margin-bottom:8px;}
+  .feature h3{margin:0 0 6px;font-size:1.05rem;}
+  .feature p{margin:0;color:var(--dim);font-size:0.9rem;}
+
+  /* steps */
+  .step{display:flex;gap:32px;align-items:center;margin-bottom:56px;}
+  .step:nth-child(even){flex-direction:row-reverse;}
+  .step .img-col{flex:0 0 280px;}
+  .step .img-col img{border:1px solid var(--line);border-radius:12px;}
+  .step .text-col{flex:1;}
+  .step .step-num{
+    display:inline-flex;align-items:center;justify-content:center;
+    width:32px;height:32px;border-radius:50%;background:var(--accent);color:#fff;
+    font-weight:bold;font-size:0.95rem;margin-bottom:10px;
+  }
+  .step h3{margin:0 0 8px;font-size:1.2rem;}
+  .step p{color:var(--dim);font-size:0.95rem;margin:0;}
+
+  /* footer */
+  footer{padding:32px 0;text-align:center;color:var(--dim);font-size:0.85rem;}
+  footer a{color:var(--dim);text-decoration:underline;}
+  footer .links{margin-bottom:8px;}
+  footer .links a{margin:0 10px;}
+
+  @media (max-width:760px){
+    .features{grid-template-columns:1fr;}
+    .step, .step:nth-child(even){flex-direction:column;}
+    .step .img-col{flex:0 0 auto;width:100%;max-width:280px;}
+    .hero h1{font-size:1.7rem;}
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wrap">
+    <a class="logo-link" href="index.html"><div class="logo">📚 Arc<span>Hive</span></div></a>
+    <nav>
+      <a href="index.html#how">仕組み</a>
+      <a href="index.html#download">ダウンロード</a>
+      <a href="https://github.com/tozionsdoor/ComicServer" target="_blank" rel="noopener">GitHub</a>
+      <a href="privacy.html">プライバシーポリシー</a>
+    </nav>
+  </div>
+</header>
+
+<section class="hero">
+  <div class="wrap">
+    <h1>使い方ガイド</h1>
+    <p class="lead">
+      PCサーバーのインストールからスマホアプリのペアリング、リーダーの操作方法までをまとめました。
+    </p>
+  </div>
+</section>
+
+<section class="alt">
+  <div class="wrap">
+    <h2>セットアップ</h2>
+    <p class="section-sub">
+      下のスクリーンショットはイメージ（モックアップ）です。実際の画面は今後の更新で差し替え予定です。
+    </p>
+
+    <div class="step">
+      <div class="img-col">
+        <img src="images/mockup-server.svg" alt="ArcHiveサーバーのPC画面イメージ。本棚フォルダの一覧、接続トークン、接続端末の管理画面。">
+      </div>
+      <div class="text-col">
+        <div class="step-num">1</div>
+        <h3>PCにサーバーソフトをインストール</h3>
+        <p>
+          インストーラーを実行するだけで準備完了です。本棚として読み込みたいフォルダを登録すると、
+          自動でスキャンして本の一覧を作成します。接続用のトークンも自動で発行されます。
+          あとは「サーバー起動」ボタンを押すだけで、スマホからアクセスできる状態になります。
+          （新しいフォルダを登録した直後は、表紙画像などのキャッシュを一度だけ作成します。
+          書庫の数が多いと、このキャッシュ作成に時間がかかることがあります。）
+        </p>
+      </div>
+    </div>
+
+    <div class="step">
+      <div class="img-col">
+        <img src="images/mockup-app-shelf.svg" alt="ArcHiveアプリの本棚画面イメージ。本の表紙が一覧で並んでいる。">
+      </div>
+      <div class="text-col">
+        <div class="step-num">2</div>
+        <h3>スマホにArcHiveアプリをインストール</h3>
+        <p>
+          Android端末にアプリをインストールします。初回起動時は、自宅Wi-Fiに接続した状態でログイン画面の
+          「LAN内のサーバーを探す」をタップしてください。自動でサーバーが検索され、見つかったサーバーが
+          画面下部に表示されるので、タップして選択します。続けてPC側のサーバーソフトで「端末管理」を開き、
+          表示された接続要求を「承認」するとペアリングが完了します（接続トークンも自動で受け渡しされます）。
+        </p>
+      </div>
+    </div>
+
+    <div class="step">
+      <div class="img-col">
+        <img src="images/mockup-app-reader.svg" alt="ArcHiveアプリのリーダー画面イメージ。見開き表示・フィルムストリップ・前後の巻への移動ボタンなど。">
+      </div>
+      <div class="text-col">
+        <div class="step-num">3</div>
+        <h3>外出先でも、続きから読める</h3>
+        <p>
+          一度ペアリングすれば、外出先でもアプリを開くだけで自動的に自宅PCへ接続します。
+          見開き表示・拡大・しおり（読書履歴）など、快適に読むための機能を備えています。
+          アプリ側で特別な設定をする必要はなく、シンプルな操作のまま必要十分な機能を使えます。
+        </p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>アプリの操作方法</h2>
+    <p class="section-sub">
+      リーダー画面でよく使う操作をまとめています。
+    </p>
+    <div class="features">
+      <div class="feature">
+        <div class="icon">👆</div>
+        <h3>画面中央のタップでメニュー表示・非表示</h3>
+        <p>画面の中央をタップすると、上下のメニュー（戻るボタンやページ操作ボタンなど）の表示・非表示を切り替えられます。メニューを隠すと画面いっぱいにページを表示できます。また、画面を長押しすると、その部分を拡大して確認できる「ルーペ」が表示されます。</p>
+      </div>
+      <div class="feature">
+        <div class="icon">↔️</div>
+        <h3>見開きがズレているときは「1ページずらす」</h3>
+        <p>見開き表示で奇数ページと偶数ページの組み合わせがズレてしまうことがあります。メニューの「1ページずらす」をタップすると、見開きの組み合わせを1ページ分シフトして調整できます。</p>
+      </div>
+      <div class="feature">
+        <div class="icon">📖</div>
+        <h3>右綴じ・左綴じの切り替え</h3>
+        <p>メニューの「右綴じ」「左綴じ」ボタンで、ページを送る方向を切り替えられます。コミックなどの右綴じ作品・洋書などの左綴じ作品の両方に対応しています。切り替えると、画面端をタップしたときのページ送り方向も合わせて入れ替わります。</p>
+      </div>
+      <div class="feature">
+        <div class="icon">⏭️</div>
+        <h3>前の巻・次の巻へすぐ移動</h3>
+        <p>メニューの「前の巻」「次の巻」ボタンから、シリーズ内の別の巻にすぐ移動できます。最後のページまで読み終えたら、そのまま次の巻に進めます。</p>
+      </div>
+      <div class="feature">
+        <div class="icon">🖼️</div>
+        <h3>見開き・単ページの切り替え</h3>
+        <p>メニューの「見開き」「単ページ」ボタンで、2ページを並べて表示する見開き表示と、1ページずつ表示する単ページ表示を切り替えられます。スマホの向きや画面サイズに合わせてお好みの表示方法を選べます。</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="links">
+    <a href="privacy.html">プライバシーポリシー</a>
+    <a href="https://github.com/tozionsdoor/ComicServer" target="_blank" rel="noopener">GitHub リポジトリ</a>
+    <a href="mailto:to.zionsdoor@gmail.com">お問い合わせ</a>
+  </div>
+  &copy; 2026 ArcHive
+</footer>
+
+</body>
+</html>

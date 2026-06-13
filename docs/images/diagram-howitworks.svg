@@ -1,0 +1,138 @@
+<svg viewBox="0 0 880 800" xmlns="http://www.w3.org/2000/svg" font-family="'Hiragino Kaku Gothic ProN','Noto Sans JP',sans-serif">
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L6,3 L0,6 Z" fill="#89b4fa"/>
+    </marker>
+    <marker id="arrowGreen" markerWidth="10" markerHeight="10" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L6,3 L0,6 Z" fill="#a6e3a1"/>
+    </marker>
+    <marker id="arrowTeal" markerWidth="10" markerHeight="10" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L6,3 L0,6 Z" fill="#94e2d5"/>
+    </marker>
+  </defs>
+
+  <rect x="0" y="0" width="880" height="800" rx="16" fill="#1e1e2e"/>
+
+  <!-- ============ Row 1: At home ============ -->
+  <text x="40" y="50" fill="#cdd6f4" font-size="22" font-weight="bold">① 自宅にいるとき</text>
+
+  <!-- PC icon -->
+  <g transform="translate(60,80)">
+    <rect x="0" y="0" width="140" height="90" rx="6" fill="#313244" stroke="#585b70"/>
+    <rect x="10" y="10" width="120" height="60" rx="3" fill="#11111b"/>
+    <rect x="50" y="74" width="40" height="8" rx="2" fill="#585b70"/>
+    <rect x="35" y="84" width="70" height="6" rx="2" fill="#585b70"/>
+    <text x="70" y="46" fill="#a6e3a1" font-size="13" text-anchor="middle">ArcHive</text>
+    <text x="70" y="62" fill="#a6e3a1" font-size="13" text-anchor="middle">サーバー</text>
+    <text x="70" y="115" fill="#a6adc8" font-size="14" text-anchor="middle">自宅PC（本棚）</text>
+  </g>
+
+  <!-- wifi icon -->
+  <g transform="translate(330,95)" stroke="#89b4fa" stroke-width="4" fill="none" stroke-linecap="round">
+    <path d="M0 30 Q40 -10 80 30"/>
+    <path d="M14 38 Q40 14 66 38"/>
+    <circle cx="40" cy="48" r="4" fill="#89b4fa" stroke="none"/>
+  </g>
+  <text x="370" y="100" fill="#cdd6f4" font-size="15" text-anchor="middle">自宅Wi-Fi で自動検出</text>
+  <text x="370" y="120" fill="#a6adc8" font-size="13" text-anchor="middle">（最初のペアリングはここで行う）</text>
+
+  <line x1="210" y1="125" x2="320" y2="125" stroke="#89b4fa" stroke-width="3" marker-end="url(#arrow)"/>
+  <line x1="430" y1="125" x2="540" y2="125" stroke="#89b4fa" stroke-width="3" marker-end="url(#arrow)"/>
+
+  <!-- Phone icon -->
+  <g transform="translate(560,70)">
+    <rect x="0" y="0" width="80" height="120" rx="10" fill="#313244" stroke="#585b70"/>
+    <rect x="8" y="10" width="64" height="92" rx="3" fill="#11111b"/>
+    <rect x="20" y="28" width="40" height="14" rx="2" fill="#89b4fa"/>
+    <rect x="20" y="48" width="40" height="14" rx="2" fill="#f9e2af"/>
+    <rect x="20" y="68" width="40" height="14" rx="2" fill="#f38ba8"/>
+    <circle cx="40" cy="111" r="4" fill="#585b70"/>
+    <text x="40" y="138" fill="#a6adc8" font-size="14" text-anchor="middle">スマホ（アプリ）</text>
+  </g>
+
+  <line x1="0" y1="215" x2="880" y2="215" stroke="#313244" stroke-width="2"/>
+
+  <!-- ============ Row 2: Away from home, IPv6 available ============ -->
+  <text x="40" y="255" fill="#cdd6f4" font-size="22" font-weight="bold">② 外出先・IPv6が使える環境</text>
+
+  <!-- PC icon -->
+  <g transform="translate(60,280)">
+    <rect x="0" y="0" width="140" height="90" rx="6" fill="#313244" stroke="#585b70"/>
+    <rect x="10" y="10" width="120" height="60" rx="3" fill="#11111b"/>
+    <rect x="50" y="74" width="40" height="8" rx="2" fill="#585b70"/>
+    <rect x="35" y="84" width="70" height="6" rx="2" fill="#585b70"/>
+    <text x="70" y="46" fill="#a6e3a1" font-size="13" text-anchor="middle">ArcHive</text>
+    <text x="70" y="62" fill="#a6e3a1" font-size="13" text-anchor="middle">サーバー</text>
+    <text x="70" y="115" fill="#a6adc8" font-size="14" text-anchor="middle">自宅PC（本棚）</text>
+  </g>
+
+  <!-- direct IPv6 line (no relay at all) -->
+  <line x1="208" y1="315" x2="555" y2="315" stroke="#94e2d5" stroke-width="3" marker-end="url(#arrowTeal)"/>
+  <line x1="555" y1="335" x2="208" y2="335" stroke="#94e2d5" stroke-width="3" marker-end="url(#arrowTeal)"/>
+  <text x="385" y="298" fill="#94e2d5" font-size="15" text-anchor="middle" font-weight="bold">IPv6 で直結（インターネット経由・中継なし）</text>
+  <text x="385" y="362" fill="#cdd6f4" font-size="14" text-anchor="middle">⚡ ローカルとほぼ同じ速度で閲覧できます</text>
+
+  <!-- Phone icon -->
+  <g transform="translate(560,270)">
+    <rect x="0" y="0" width="80" height="120" rx="10" fill="#313244" stroke="#585b70"/>
+    <rect x="8" y="10" width="64" height="92" rx="3" fill="#11111b"/>
+    <rect x="20" y="28" width="40" height="14" rx="2" fill="#89b4fa"/>
+    <rect x="20" y="48" width="40" height="14" rx="2" fill="#f9e2af"/>
+    <rect x="20" y="68" width="40" height="14" rx="2" fill="#f38ba8"/>
+    <circle cx="40" cy="111" r="4" fill="#585b70"/>
+    <text x="40" y="138" fill="#a6adc8" font-size="14" text-anchor="middle">スマホ（アプリ）</text>
+  </g>
+
+  <text x="780" y="335" fill="#a6adc8" font-size="13" text-anchor="middle">外出先</text>
+  <text x="430" y="420" fill="#a6adc8" font-size="13" text-anchor="middle">自宅PCとスマホの両方がIPv6に対応していれば、自動的にこの経路が優先されます</text>
+
+  <line x1="0" y1="460" x2="880" y2="460" stroke="#313244" stroke-width="2"/>
+
+  <!-- ============ Row 3: Away from home, no IPv6 (WebRTC P2P) ============ -->
+  <text x="40" y="500" fill="#cdd6f4" font-size="22" font-weight="bold">③ 外出先・IPv6が使えない環境</text>
+
+  <!-- PC icon -->
+  <g transform="translate(60,525)">
+    <rect x="0" y="0" width="140" height="90" rx="6" fill="#313244" stroke="#585b70"/>
+    <rect x="10" y="10" width="120" height="60" rx="3" fill="#11111b"/>
+    <rect x="50" y="74" width="40" height="8" rx="2" fill="#585b70"/>
+    <rect x="35" y="84" width="70" height="6" rx="2" fill="#585b70"/>
+    <text x="70" y="46" fill="#a6e3a1" font-size="13" text-anchor="middle">ArcHive</text>
+    <text x="70" y="62" fill="#a6e3a1" font-size="13" text-anchor="middle">サーバー</text>
+    <text x="70" y="115" fill="#a6adc8" font-size="14" text-anchor="middle">自宅PC（本棚）</text>
+  </g>
+
+  <!-- direct P2P line -->
+  <path d="M210 570 C 380 505, 500 505, 660 570" fill="none" stroke="#a6e3a1" stroke-width="3" marker-end="url(#arrowGreen)"/>
+  <path d="M660 580 C 500 645, 380 645, 210 580" fill="none" stroke="#a6e3a1" stroke-width="3" marker-end="url(#arrowGreen)"/>
+  <text x="430" y="520" fill="#a6e3a1" font-size="15" text-anchor="middle">WebRTC P2P で直接通信</text>
+  <text x="430" y="670" fill="#a6adc8" font-size="13" text-anchor="middle">本のデータは中継サーバーを経由せず、自宅PC ⇔ スマホで直接やり取り</text>
+
+  <!-- small cloud icon for signaling -->
+  <g transform="translate(390,575)">
+    <ellipse cx="40" cy="20" rx="40" ry="20" fill="#45475a"/>
+    <ellipse cx="18" cy="22" rx="20" ry="14" fill="#45475a"/>
+    <ellipse cx="62" cy="22" rx="20" ry="14" fill="#45475a"/>
+    <text x="40" y="26" fill="#cdd6f4" font-size="11" text-anchor="middle">案内役</text>
+  </g>
+  <line x1="280" y1="595" x2="390" y2="595" stroke="#585b70" stroke-width="2" stroke-dasharray="4 4"/>
+  <line x1="470" y1="595" x2="600" y2="595" stroke="#585b70" stroke-width="2" stroke-dasharray="4 4"/>
+  <text x="430" y="620" fill="#a6adc8" font-size="12" text-anchor="middle">最初の接続先案内（住所交換）だけに利用</text>
+
+  <!-- Phone icon -->
+  <g transform="translate(620,515)">
+    <rect x="0" y="0" width="80" height="120" rx="10" fill="#313244" stroke="#585b70"/>
+    <rect x="8" y="10" width="64" height="92" rx="3" fill="#11111b"/>
+    <rect x="20" y="28" width="40" height="14" rx="2" fill="#89b4fa"/>
+    <rect x="20" y="48" width="40" height="14" rx="2" fill="#f9e2af"/>
+    <rect x="20" y="68" width="40" height="14" rx="2" fill="#f38ba8"/>
+    <circle cx="40" cy="111" r="4" fill="#585b70"/>
+    <text x="40" y="138" fill="#a6adc8" font-size="14" text-anchor="middle">スマホ（アプリ）</text>
+  </g>
+
+  <text x="780" y="570" fill="#a6adc8" font-size="13" text-anchor="middle">外出先</text>
+
+  <line x1="0" y1="710" x2="880" y2="710" stroke="#313244" stroke-width="2"/>
+  <text x="440" y="745" fill="#a6adc8" font-size="14" text-anchor="middle">①〜③は状況に応じて自動的に切り替わります。利用者が経路を意識する必要はありません。</text>
+  <text x="440" y="770" fill="#a6adc8" font-size="14" text-anchor="middle">いずれの場合も、自分のファイルは自宅PCの中だけに置かれ、承認した端末だけがアクセスできます。</text>
+</svg>

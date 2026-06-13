@@ -1,0 +1,390 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ArcHive — 自分の本棚を、どこへでも。</title>
+<meta name="description" content="自宅PCを自分専用のファイルサーバーにして、外出先のスマホからも自炊マンガ・電子書籍や仕事のPDF資料などをいつでもどこでも読めるアプリ ArcHive。ファイルはクラウドに上げず、自分のPCとスマホだけで完結します。">
+<link rel="icon" href="images/favicon.ico" sizes="any">
+<link rel="apple-touch-icon" href="images/apple-touch-icon.png">
+<style>
+  :root{
+    --bg:#fafafa;
+    --panel:#ffffff;
+    --text:#1a1a1a;
+    --dim:#666666;
+    --line:#e6e6e6;
+    --accent:#5b8def;
+    --accent-dark:#3f6fd1;
+    --accent-bg:#eef3ff;
+    --green:#3aa66b;
+    --green-bg:#eaf7f0;
+  }
+  *{box-sizing:border-box;}
+  body{
+    font-family:'Hiragino Kaku Gothic ProN','Noto Sans JP',sans-serif;
+    margin:0;
+    background:var(--bg);
+    color:var(--text);
+    line-height:1.8;
+  }
+  a{color:var(--accent-dark);}
+  img{max-width:100%;display:block;}
+  .wrap{max-width:1080px;margin:0 auto;padding:0 20px;}
+
+  /* header */
+  header{
+    position:sticky; top:0; z-index:10;
+    background:rgba(250,250,250,0.92);
+    backdrop-filter:blur(6px);
+    border-bottom:1px solid var(--line);
+  }
+  header .wrap{display:flex;align-items:center;justify-content:space-between;height:60px;}
+  .logo{font-size:1.3rem;font-weight:bold;letter-spacing:0.02em;}
+  .logo span{color:var(--accent-dark);}
+  nav a{margin-left:20px;font-size:0.9rem;text-decoration:none;color:var(--text);font-weight:bold;}
+  nav a:hover{color:var(--accent-dark);}
+
+  /* hero */
+  .hero{padding:64px 0 48px;text-align:center;}
+  .hero h1{font-size:2.2rem;margin:0 0 12px;}
+  .hero p.lead{font-size:1.05rem;color:var(--dim);max-width:640px;margin:0 auto 28px;}
+  .cta-row{display:flex;gap:16px;justify-content:center;flex-wrap:wrap;}
+  .btn{
+    display:inline-block;padding:14px 28px;border-radius:8px;
+    font-weight:bold;font-size:0.95rem;text-decoration:none;
+    border:1px solid var(--line);
+  }
+  .btn-primary{background:var(--accent);color:#fff;border-color:var(--accent);}
+  .btn-secondary{background:#fff;color:var(--text);}
+  .btn-disabled{opacity:0.55;cursor:default;}
+  .badge{
+    display:inline-block;font-size:0.7rem;font-weight:bold;
+    background:var(--accent-bg);color:var(--accent-dark);
+    border-radius:4px;padding:2px 8px;margin-left:6px;vertical-align:middle;
+  }
+
+  /* sections */
+  section{padding:48px 0;}
+  section h2{font-size:1.5rem;text-align:center;margin:0 0 8px;}
+  section .section-sub{text-align:center;color:var(--dim);font-size:0.95rem;margin:0 0 36px;}
+  .alt{background:var(--panel);border-top:1px solid var(--line);border-bottom:1px solid var(--line);}
+
+  /* features grid */
+  .features{display:grid;grid-template-columns:repeat(2,1fr);gap:20px;}
+  .feature{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:24px;}
+  .feature .icon{font-size:1.8rem;margin-bottom:8px;}
+  .feature h3{margin:0 0 6px;font-size:1.05rem;}
+  .feature p{margin:0;color:var(--dim);font-size:0.9rem;}
+
+  /* how it works */
+  .diagram{border:1px solid var(--line);border-radius:12px;overflow:hidden;}
+  .sub-heading{font-size:1.1rem;text-align:center;margin:40px 0 20px;}
+  .note-box{
+    background:var(--accent-bg);border:1px solid var(--accent);border-radius:8px;
+    padding:16px 20px;margin:0 auto 32px;max-width:720px;font-size:0.9rem;color:var(--text);
+  }
+  .note-box strong{color:var(--accent-dark);}
+
+  /* steps */
+  .step{display:flex;gap:32px;align-items:center;margin-bottom:56px;}
+  .step:nth-child(even){flex-direction:row-reverse;}
+  .step .img-col{flex:0 0 280px;}
+  .step .img-col img{border:1px solid var(--line);border-radius:12px;}
+  .step .img-col.wide img{border-radius:8px;}
+  .step .text-col{flex:1;}
+  .step .step-num{
+    display:inline-flex;align-items:center;justify-content:center;
+    width:32px;height:32px;border-radius:50%;background:var(--accent);color:#fff;
+    font-weight:bold;font-size:0.95rem;margin-bottom:10px;
+  }
+  .step h3{margin:0 0 8px;font-size:1.2rem;}
+  .step p{color:var(--dim);font-size:0.95rem;margin:0;}
+
+  /* requirements */
+  .req-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:20px;}
+  .req-card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:24px;}
+  .req-card h3{margin:0 0 10px;font-size:1rem;}
+  .req-card ul{margin:0;padding-left:1.2em;color:var(--dim);font-size:0.9rem;}
+  .req-card li{margin-bottom:4px;}
+
+  /* faq */
+  .faq-item{border-bottom:1px solid var(--line);padding:18px 0;}
+  .faq-item:last-child{border-bottom:none;}
+  .faq-item h3{margin:0 0 6px;font-size:1rem;}
+  .faq-item h3::before{content:"Q. ";color:var(--accent-dark);}
+  .faq-item p{margin:0;color:var(--dim);font-size:0.9rem;}
+  .faq-item p::before{content:"A. ";color:var(--green);font-weight:bold;}
+
+  /* disclaimer */
+  .disclaimer-card{max-width:720px;margin:0 auto;}
+  .disclaimer-card ul{padding-left:1.4em;}
+  .disclaimer-card li{margin-bottom:8px;}
+
+  /* download */
+  .download-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:20px;}
+  .dl-card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:28px;text-align:center;}
+  .dl-card h3{margin:0 0 6px;}
+  .dl-card p{color:var(--dim);font-size:0.9rem;margin:0 0 16px;}
+  .status-pill{
+    display:inline-block;font-size:0.8rem;font-weight:bold;
+    background:#fff5e0;color:#a86a00;border-radius:999px;padding:4px 14px;margin-bottom:12px;
+  }
+
+  /* footer */
+  footer{padding:32px 0;text-align:center;color:var(--dim);font-size:0.85rem;}
+  footer a{color:var(--dim);text-decoration:underline;}
+  footer .links{margin-bottom:8px;}
+  footer .links a{margin:0 10px;}
+
+  @media (max-width:760px){
+    .features{grid-template-columns:1fr;}
+    .req-grid{grid-template-columns:1fr;}
+    .download-grid{grid-template-columns:1fr;}
+    .step, .step:nth-child(even){flex-direction:column;}
+    .step .img-col{flex:0 0 auto;width:100%;max-width:280px;}
+    .hero h1{font-size:1.7rem;}
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wrap">
+    <div class="logo">📚 Arc<span>Hive</span></div>
+    <nav>
+      <a href="#how">仕組み</a>
+      <a href="guide.html">使い方ガイド</a>
+      <a href="#download">ダウンロード</a>
+      <a href="https://github.com/tozionsdoor/ComicServer" target="_blank" rel="noopener">GitHub</a>
+      <a href="privacy.html">プライバシーポリシー</a>
+    </nav>
+  </div>
+</header>
+
+<section class="hero">
+  <div class="wrap">
+    <h1>自分の本棚を、どこへでも。</h1>
+    <p class="lead">
+      自宅のPCを「自分専用のファイルサーバー」にして、外出先のスマホからも
+      趣味の自炊マンガから仕事で使うPDF資料まで、いつでもどこでもそのまま読めるアプリです。<br>
+      ファイルは自分のPCに置いたまま。クラウドにアップロードしません。
+    </p>
+    <div class="cta-row">
+      <a class="btn btn-primary btn-disabled" href="#download">Androidアプリを見る</a>
+      <a class="btn btn-secondary btn-disabled" href="#download">サーバーソフトを見る</a>
+    </div>
+  </div>
+</section>
+
+<section class="alt">
+  <div class="wrap">
+    <h2>ArcHive の特徴</h2>
+    <p class="section-sub">趣味の自炊マンガから仕事用のPDF資料まで、「自分のファイルを、自分の手元から離さずに、いつでもどこでも読める」をコンセプトにしています。</p>
+    <div class="features">
+      <div class="feature">
+        <div class="icon">🔒</div>
+        <h3>ファイルは自宅PCに置いたまま</h3>
+        <p>本棚データを外部のクラウドサーバーにアップロードすることはありません。自分の本は、自分のPCの中だけにあります。</p>
+      </div>
+      <div class="feature">
+        <div class="icon">⚡</div>
+        <h3>外出先でも直接つながる（IPv6 / P2P）</h3>
+        <p>自宅PCとスマホの両方がIPv6に対応していれば、インターネット経由でも自宅と直結し、ローカルとほぼ同じ速度で閲覧できます。IPv6が使えない環境でも、WebRTCによるP2P通信で自宅PCとスマホが直接つながります。どちらも中継サーバーを経由しないので、余計な費用もかかりません。</p>
+      </div>
+      <div class="feature">
+        <div class="icon">📂</div>
+        <h3>幅広いファイル形式に対応</h3>
+        <p>ZIP / RAR / CBZ / CBR / PDF / EPUB に加え、画像ファイルを直接フォルダに入れただけの本棚にも対応しています。</p>
+      </div>
+      <div class="feature">
+        <div class="icon">🛡️</div>
+        <h3>承認制の端末管理で安心</h3>
+        <p>新しい端末からの接続は、PC側で「承認」するまで待機状態になります。家族の端末を追加したり、不要になった端末のアクセスを後から取り消すことも可能です。</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="how">
+  <div class="wrap">
+    <h2>仕組み</h2>
+    <p class="section-sub">
+      自宅にいるときは自宅Wi-Fiで、外出先にいるときはIPv6直結またはWebRTC P2Pで、状況に応じて自動的につながります。<br>
+      特に自宅PCとスマホの両方がIPv6に対応している環境では、外出先からでもローカルとほぼ同じ速度で閲覧できます。
+    </p>
+    <div class="note-box">
+      💡 <strong>ご利用には、自宅PCでArcHiveサーバーソフトを起動しておく必要があります。</strong><br>
+      PCの電源が切れていたり、サーバーソフトが終了していると、外出先からアプリでアクセスすることはできません。普段お使いのPCを「自分専用の本棚サーバー」として動かしておくイメージです。
+    </div>
+    <div class="diagram">
+      <img src="images/diagram-howitworks.svg" alt="自宅では自宅Wi-Fiで自動検出して接続。外出先ではIPv6が使える環境ならローカルとほぼ同じ速度で直結し、使えない環境でもWebRTCのP2Pで自宅PCとスマホが直接通信する仕組みの図解。">
+    </div>
+
+    <h3 class="sub-heading">快適に読むための工夫</h3>
+    <div class="features">
+      <div class="feature">
+        <div class="icon">⚡</div>
+        <h3>強力なキャッシュで外出先でもスムーズ</h3>
+        <p>サーバー・アプリの両方にページ画像のキャッシュ機能を備えており、外出先からでもページ送りがスムーズに行えます。</p>
+      </div>
+      <div class="feature">
+        <div class="icon">📚</div>
+        <h3>一度開いた書庫は次回も瞬時に表示</h3>
+        <p>一度開いた書庫のページは、しばらくの間（最大90日間、ページ数によって変動）スマホ内にキャッシュされます。再び開くときは通信を待たずに瞬時に表示されます。</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="alt">
+  <div class="wrap">
+    <h2>セキュリティについて</h2>
+    <p class="section-sub">自分の本棚を安全に持ち歩けるよう、接続・認証・通信の各段階で対策をしています。</p>
+    <div class="features">
+      <div class="feature">
+        <div class="icon">🏠</div>
+        <h3>新しい端末の登録は自宅ネットワーク内限定</h3>
+        <p>新しい端末を本棚に追加できるのは、その端末が自宅PCと同じWi-Fi（同じネットワーク）に接続しているときだけです。インターネット越しに見知らぬ端末が勝手に登録されることはありません。一度登録した端末だけが、その後は外出先からも利用できます。</p>
+      </div>
+      <div class="feature">
+        <div class="icon">🔐</div>
+        <h3>接続は承認制</h3>
+        <p>新しい端末からの接続要求は、所有者がPC側で「承認」するまで本棚にアクセスできません。見覚えのない端末からの接続は拒否できます。</p>
+      </div>
+      <div class="feature">
+        <div class="icon">🔑</div>
+        <h3>端末ごとに個別の認証トークン</h3>
+        <p>各端末に長いランダムなトークンを個別発行します。万が一どれか1台のトークンが漏れても、その端末だけ登録を取り消せば被害を抑えられます。</p>
+      </div>
+      <div class="feature">
+        <div class="icon">🔒</div>
+        <h3>通信は常に暗号化</h3>
+        <p>自宅Wi-Fi内・外出先を問わず、サーバーとの通信はTLS（暗号化通信）で保護されます。外出先のWebRTC P2P通信もWebRTC標準の暗号化（DTLS/SRTP）で保護されます。</p>
+      </div>
+      <div class="feature">
+        <div class="icon">🚫</div>
+        <h3>ブルートフォース（総当たり）対策</h3>
+        <p>誤ったトークンでの認証が短時間に繰り返されると、そのアクセス元を一定時間ブロックします。</p>
+      </div>
+      <div class="feature">
+        <div class="icon">🗑️</div>
+        <h3>いつでもアクセスを取り消せる</h3>
+        <p>機種変更・紛失などで不要になった端末は、PC側からいつでも登録を解除し、その端末からのアクセスを遮断できます。</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="alt">
+  <div class="wrap">
+    <h2>使い方ガイド</h2>
+    <p class="section-sub">
+      サーバーソフトのインストールからアプリのペアリング、見開き表示・綴じ方向の切り替えなどリーダーの操作方法まで、
+      画面イメージ付きでまとめています。
+    </p>
+    <div class="cta-row">
+      <a class="btn btn-primary" href="guide.html">使い方ガイドを見る</a>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>動作環境</h2>
+    <div class="req-grid">
+      <div class="req-card">
+        <h3>🖥️ サーバー（PC側）</h3>
+        <ul>
+          <li>Windows 10 / 11</li>
+          <li>本棚として使うフォルダ・ファイル（ZIP / RAR / CBZ / CBR / PDF / EPUB など）</li>
+          <li>インターネット接続（外出先からのアクセスを使う場合）</li>
+          <li>外出先から使う間は、サーバーソフトを起動したまま（PCの電源を入れたまま）にしておく必要があります</li>
+        </ul>
+      </div>
+      <div class="req-card">
+        <h3>📱 アプリ（スマホ側）</h3>
+        <ul>
+          <li>Android 6.0（API 23）以降</li>
+          <li>初回ペアリング時のみ、サーバーPCと同じWi-Fiへの接続が必要</li>
+          <li>外出先での利用にはモバイル通信またはWi-Fi</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="alt">
+  <div class="wrap">
+    <h2>よくある質問</h2>
+    <div class="faq-item">
+      <h3>自分の本棚のデータはどこに保存されますか？</h3>
+      <p>すべて自宅PCの中に保存されます。ArcHiveの開発者を含め、第三者のサーバーに本のデータがアップロードされることはありません。</p>
+    </div>
+    <div class="faq-item">
+      <h3>外出先からの接続にお金はかかりますか？</h3>
+      <p>かかりません。外出先からの接続はWebRTCによる端末間の直接通信（P2P）のため、本のデータが開発者のサーバーを経由することはなく、中継費用も発生しません。</p>
+    </div>
+    <div class="faq-item">
+      <h3>IPv6直結もWebRTC P2Pも、どうしても接続できない場合は？</h3>
+      <p>ネットワークの組み合わせによっては、ごく稀にどちらの方法でも接続できないことがあります。その場合に備えて、アプリの詳細設定で「TURNサーバー」を登録するオプションを用意しています。TURNサーバーは中継型の接続方法で、利用には有料サービス（Twilioなど）でご自身のアカウントを取得し、その情報をアプリに設定する必要があります。通常のご利用では設定不要です。</p>
+    </div>
+    <div class="faq-item">
+      <h3>家族の端末からも使えますか？</h3>
+      <p>使えます。新しい端末からの接続要求はPC側で一覧表示され、所有者が「承認」した端末だけが本棚にアクセスできます。不要になった端末は後から接続を取り消せます。</p>
+    </div>
+    <div class="faq-item">
+      <h3>対応しているファイル形式は？</h3>
+      <p>ZIP・RAR・CBZ・CBR・PDF・EPUBに対応しています。また、書庫化されていない画像ファイルが直接入ったフォルダも1冊として認識します。</p>
+    </div>
+  </div>
+</section>
+
+<section id="download">
+  <div class="wrap">
+    <h2>ダウンロード</h2>
+    <p class="section-sub">公開準備中です。公開され次第、このページからダウンロードできるようになります。</p>
+    <div class="download-grid">
+      <div class="dl-card">
+        <div class="status-pill">近日公開</div>
+        <h3>📱 Androidアプリ</h3>
+        <p>Google Play ストアでの公開準備中です。</p>
+        <a class="btn btn-primary btn-disabled">Google Play で見る</a>
+      </div>
+      <div class="dl-card">
+        <div class="status-pill">近日公開</div>
+        <h3>🖥️ サーバーソフト（Windows）</h3>
+        <p>インストーラー形式（.exe）での配布を準備中です。</p>
+        <a class="btn btn-primary btn-disabled">ダウンロード</a>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="alt">
+  <div class="wrap">
+    <h2>ご利用にあたって</h2>
+    <p class="section-sub">ArcHiveをご利用いただく前に、以下の点をご確認ください。</p>
+    <div class="req-card disclaimer-card">
+      <ul>
+        <li>本アプリ・サーバーソフトは、ご自身が所有する書籍データを、ご自身の端末間で楽しむための個人利用ツールです。著作権法上の私的利用の範囲でご利用ください。</li>
+        <li>本ソフトウェアは現状有姿（AS IS）で提供されます。動作の完全性や特定目的への適合性を保証するものではありません。</li>
+        <li>本ソフトウェアの利用により生じたデータの損失・機器の不具合・その他の損害について、開発者は責任を負いかねます。重要なデータは別途バックアップを取ることをお勧めします。</li>
+        <li>セキュリティには配慮していますが、完全な安全性を保証するものではありません。</li>
+        <li>ネットワーク環境（IPv6対応状況・ルーターの設定等）によっては、一部の接続方式が利用できない場合があります。</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="links">
+    <a href="privacy.html">プライバシーポリシー</a>
+    <a href="https://github.com/tozionsdoor/ComicServer" target="_blank" rel="noopener">GitHub リポジトリ</a>
+    <a href="mailto:to.zionsdoor@gmail.com">お問い合わせ</a>
+  </div>
+  &copy; 2026 ArcHive
+</footer>
+
+</body>
+</html>

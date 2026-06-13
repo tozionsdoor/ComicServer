@@ -21,6 +21,7 @@ comicserver_app/.flutter-plugins-dependencies
 comicserver_app/.metadata
 comicserver_app/build/
 comicserver_app/android/.gradle/
+comicserver_app/android/.kotlin/
 comicserver_app/android/local.properties
 comicserver_app/android/key.properties
 comicserver_app/ios/.symlinks/

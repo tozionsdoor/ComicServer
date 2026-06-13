@@ -62,6 +62,8 @@ COVER_W, COVER_H = 200, 280
 PAGE_MAX     = 1800   # 長辺の最大ピクセル（スマホ向けリサイズ）
 
 CONFIG_PATH = Path(__file__).parent / "manga_server_config.json"
+ICON_PATH   = Path(__file__).parent / "assets" / "icon" / "app_icon.ico"
+TRAY_ICON_PATH = Path(__file__).parent / "assets" / "icon" / "tray_icon.png"
 _TLS_DIR    = Path(__file__).parent          # 証明書をスクリプトと同じフォルダに置く
 CERT_PATH   = _TLS_DIR / "server.crt"
 KEY_PATH    = _TLS_DIR / "server.key"
@@ -2130,6 +2132,10 @@ class App(tk.Tk):
         self.geometry("720x560")
         self.minsize(620, 480)
         self.configure(bg=BG)
+        try:
+            self.iconbitmap(str(ICON_PATH))
+        except Exception:
+            pass
         self._tray = None
         self.protocol("WM_DELETE_WINDOW", self._on_close_window)
 
@@ -2597,13 +2603,16 @@ class App(tk.Tk):
 
     # ── 閉じる / 最小化 / システムトレイ ──────────────────────────────────────
     def _make_tray_image(self):
-        """トレイ用の簡易アイコン（本のシルエット）を生成する。"""
-        img = Image.new("RGB", (64, 64), (24, 24, 37))
-        d = ImageDraw.Draw(img)
-        d.rectangle([16, 10, 50, 54], fill=(137, 180, 250))   # 表紙
-        d.rectangle([16, 10, 26, 54], fill=(203, 166, 247))   # 背表紙
-        d.rectangle([30, 20, 46, 23], fill=(24, 24, 37))      # 帯
-        return img
+        """トレイ用アイコンを読み込む（無ければ本のシルエットを生成）。"""
+        try:
+            return Image.open(TRAY_ICON_PATH).convert("RGBA").resize((64, 64), Image.LANCZOS)
+        except Exception:
+            img = Image.new("RGB", (64, 64), (24, 24, 37))
+            d = ImageDraw.Draw(img)
+            d.rectangle([16, 10, 50, 54], fill=(137, 180, 250))   # 表紙
+            d.rectangle([16, 10, 26, 54], fill=(203, 166, 247))   # 背表紙
+            d.rectangle([30, 20, 46, 23], fill=(24, 24, 37))      # 帯
+            return img
 
     def _ask_action(self, title, prompt, o1_label, o1_val, o2_label, o2_val):
         """2択（+「次回も記憶」）ダイアログ。戻り値 (選択値 or None, 記憶するか)。"""

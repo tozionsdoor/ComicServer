@@ -1,0 +1,42 @@
+<svg viewBox="0 0 360 720" xmlns="http://www.w3.org/2000/svg" font-family="'Hiragino Kaku Gothic ProN','Noto Sans JP',sans-serif">
+  <!-- phone frame -->
+  <rect x="0" y="0" width="360" height="720" rx="28" fill="#11111b"/>
+  <rect x="10" y="10" width="340" height="700" rx="20" fill="#1e1e2e"/>
+
+  <!-- status bar -->
+  <text x="330" y="34" fill="#a6adc8" font-size="13" text-anchor="end">12:34</text>
+
+  <!-- app bar -->
+  <rect x="10" y="46" width="340" height="56" fill="#181825"/>
+  <text x="32" y="80" fill="#cdd6f4" font-size="20" font-weight="bold">ArcHive</text>
+  <g transform="translate(260,58)" stroke="#cdd6f4" stroke-width="2.5" fill="none" stroke-linecap="round">
+    <path d="M18 4 A14 14 0 1 1 4 18"/>
+    <path d="M18 4 L18 12 L10 12"/>
+  </g>
+  <g transform="translate(304,58)" stroke="#cdd6f4" stroke-width="2.5" fill="none" stroke-linecap="round">
+    <circle cx="13" cy="14" r="13"/>
+    <path d="M13 7 L13 14 L18 18"/>
+  </g>
+
+  <!-- shelf grid: 2 columns x 3 rows -->
+  <g>
+    <!-- row1 -->
+    <rect x="24" y="118" width="148" height="200" rx="6" fill="#89b4fa"/>
+    <rect x="188" y="118" width="148" height="200" rx="6" fill="#f9e2af"/>
+    <text x="98" y="338" fill="#cdd6f4" font-size="13" text-anchor="middle">巻数_第01巻</text>
+    <text x="262" y="338" fill="#cdd6f4" font-size="13" text-anchor="middle">巻数_第02巻</text>
+
+    <!-- row2 -->
+    <rect x="24" y="362" width="148" height="200" rx="6" fill="#f38ba8"/>
+    <rect x="188" y="362" width="148" height="200" rx="6" fill="#a6e3a1"/>
+    <text x="98" y="582" fill="#cdd6f4" font-size="13" text-anchor="middle">巻数_第03巻</text>
+    <text x="262" y="582" fill="#cdd6f4" font-size="13" text-anchor="middle">巻数_第04巻</text>
+  </g>
+
+  <!-- banner ad placeholder -->
+  <rect x="10" y="630" width="340" height="60" fill="#313244"/>
+  <text x="180" y="665" fill="#6c7086" font-size="13" text-anchor="middle">広告バナー</text>
+
+  <!-- bottom home indicator -->
+  <rect x="140" y="700" width="80" height="5" rx="2.5" fill="#45475a"/>
+</svg>
