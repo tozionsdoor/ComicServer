@@ -1,16 +1,18 @@
 import 'dart:convert';
 import 'package:flutter/material.dart';
-import 'package:cached_network_image/cached_network_image.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../models/book.dart';
 import '../services/api_service.dart';
 import '../services/ads_service.dart';
+import '../widgets/cover_image.dart';
 import 'reader_screen.dart';
 
 /// 読書履歴（続きから / 既読一覧）。端末内 SharedPreferences の 'history' を表示する。
 class HistoryScreen extends StatefulWidget {
   final ApiService api;
-  const HistoryScreen({super.key, required this.api});
+  // 本を閉じて履歴画面ごと閉じた後、本棚側でこのフォルダへ移動するためのコールバック
+  final void Function(String folderPath)? onOpenFolder;
+  const HistoryScreen({super.key, required this.api, this.onOpenFolder});
 
   @override
   State<HistoryScreen> createState() => _HistoryScreenState();
@@ -21,7 +23,8 @@ class _HistoryScreenState extends State<HistoryScreen> {
   bool _loading = true;
   bool _opening = false;   // 本を開く処理の多重実行ガード（広告後の誤オープン対策）
 
-  // カバー画像の自己回復（shelf_screen/reader_screenの_onImageErrorと同方式）
+  // カバー画像の取りこぼしは CoverImage が画像ごとに再取得して救う。
+  // 使い切っても直らない時だけ、経路死の保険として1回 reconnect()。
   int      _imgGen         = 0;
   bool     _imgRecovering  = false;
   DateTime _lastImgRecover = DateTime.fromMillisecondsSinceEpoch(0);
@@ -34,9 +37,11 @@ class _HistoryScreenState extends State<HistoryScreen> {
     _lastImgRecover = now;
     () async {
       try {
+        final before = widget.api.baseUrl;
         final ok = await widget.api.reconnect();
         if (!mounted || !ok) return;
-        setState(() => _imgGen++);
+        // 経路が実際に張り替わった時だけ全表紙を作り直す
+        if (widget.api.baseUrl != before) setState(() => _imgGen++);
       } finally {
         _imgRecovering = false;
       }
@@ -129,11 +134,11 @@ class _HistoryScreenState extends State<HistoryScreen> {
 
     // relを使ってフォルダ内の兄弟巻リストを取得する
     // rel自体が親フォルダパスなので getFolders(rel) で直接取得できる
+    final folderPath = (rel.isEmpty || rel == '.') ? '' : rel;
     List<BookItem> siblings = [book];
     int bookIndex = 0;
     if (rel.isNotEmpty) {
       try {
-        final folderPath = rel == '.' ? '' : rel;
         final contents = await widget.api.getFolders(folderPath);
         final idx = contents.books.indexWhere((b) => b.id == book.id);
         if (idx >= 0) {
@@ -156,10 +161,17 @@ class _HistoryScreenState extends State<HistoryScreen> {
         context,
         MaterialPageRoute(
           builder: (_) => ReaderScreen(
-              api: widget.api, book: book, siblings: siblings, bookIndex: bookIndex),
+            api: widget.api, book: book, siblings: siblings, bookIndex: bookIndex,
+            // 本を閉じた（巻送りではなく完全に閉じた）時に履歴画面ごと閉じ、
+            // 本棚側をその本のフォルダへ移動させる。巻送り(pushReplacement)では
+            // 呼ばれないよう、ReaderScreen側で完全クローズ時のみ実行する。
+            onExitToFolder: widget.onOpenFolder == null ? null : () {
+              Navigator.of(context).popUntil((route) => route.isFirst);
+              widget.onOpenFolder!(folderPath);
+            },
+          ),
         ),
       );
-      if (mounted) _load(); // 戻ったら進捗を反映して並び替え
     } finally {
       _opening = false;
     }
@@ -223,22 +235,19 @@ class _HistoryScreenState extends State<HistoryScreen> {
                   child: ClipRRect(
                     borderRadius:
                         const BorderRadius.vertical(top: Radius.circular(8)),
-                    child: CachedNetworkImage(
+                    child: CoverImage(
                       key: ValueKey('cover_${id}_$_imgGen'),
                       imageUrl: widget.api.coverUrl(id),
-                      httpHeaders: widget.api.headers,
+                      headers: widget.api.headers,
                       cacheManager: widget.api.cacheManager,
                       fit: BoxFit.cover,
                       width: double.infinity,
-                      placeholder: (_, __) =>
-                          Container(color: const Color(0xFF313244)),
-                      errorWidget: (_, __, ___) {
-                        _onImageError();
-                        return Container(
-                            color: const Color(0xFF313244),
-                            child: const Icon(Icons.broken_image,
-                                color: Color(0xFF585b70)));
-                      },
+                      onGaveUp: _onImageError,
+                      placeholder: Container(color: const Color(0xFF313244)),
+                      errorWidget: Container(
+                          color: const Color(0xFF313244),
+                          child: const Icon(Icons.broken_image,
+                              color: Color(0xFF585b70))),
                     ),
                   ),
                 ),

@@ -1,12 +1,12 @@
 import 'dart:async';
 import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:flutter/material.dart';
-import 'package:cached_network_image/cached_network_image.dart';
 import '../models/book.dart';
 import '../services/api_service.dart';
 import 'reader_screen.dart';
 import 'login_screen.dart';
 import 'history_screen.dart';
+import '../widgets/cover_image.dart';
 import '../widgets/reconnect_banner.dart';
 import '../widgets/banner_ad_widget.dart';
 import '../services/ads_service.dart';
@@ -30,10 +30,14 @@ class _ShelfScreenState extends State<ShelfScreen> with WidgetsBindingObserver {
   List<BookItem> _allBooks = [];
   StreamSubscription<List<ConnectivityResult>>? _connectivitySub;
 
-  // カバー画像の自己回復（reader_screenの_onImageErrorと同方式）。
-  // 認証直後など経路確立直後は表紙の一括取得で取りこぼしが起きやすく、
-  // 一度失敗すると_imgGenが変わらない限りCachedNetworkImageが再取得しないため、
-  // reconnect()→世代カウンタ更新で作り直す。
+  // フォルダ毎のスクロール位置（パス→オフセット）。戻った時に復元する。
+  final ScrollController _gridScroll = ScrollController();
+  final Map<String, double> _scrollOffsets = {};
+
+  // カバー画像の取りこぼしは CoverImage が画像ごとに再取得して救う。
+  // それでも直らない＝経路が死んでいる疑いがある時だけ、ここで1回 reconnect()
+  // を試み、経路が実際に張り替わった場合のみ全表紙を作り直す（_imgGen++）。
+  // 生きている（＝張り替わらない）なら作り直さず、無駄なリトライ連鎖を断つ。
   int      _imgGen         = 0;
   bool     _imgRecovering  = false;
   DateTime _lastImgRecover = DateTime.fromMillisecondsSinceEpoch(0);
@@ -57,6 +61,7 @@ class _ShelfScreenState extends State<ShelfScreen> with WidgetsBindingObserver {
     WidgetsBinding.instance.removeObserver(this);
     _connectivitySub?.cancel();
     _searchCtrl.dispose();
+    _gridScroll.dispose();
     super.dispose();
   }
 
@@ -77,6 +82,7 @@ class _ShelfScreenState extends State<ShelfScreen> with WidgetsBindingObserver {
     }
   }
 
+  // CoverImage が再試行を使い切っても直らなかった時の保険（経路死の疑い）。
   void _onImageError() {
     if (_imgRecovering) return;
     final now = DateTime.now();
@@ -85,9 +91,12 @@ class _ShelfScreenState extends State<ShelfScreen> with WidgetsBindingObserver {
     _lastImgRecover = now;
     () async {
       try {
+        final before = widget.api.baseUrl;
         final ok = await widget.api.reconnect();
         if (!mounted || !ok) return;
-        setState(() => _imgGen++);
+        // 経路が実際に張り替わった時だけ全表紙を作り直す。生きていれば何もしない
+        // （ミッシングな表紙に対して永久リトライしないため）。
+        if (widget.api.baseUrl != before) setState(() => _imgGen++);
       } finally {
         _imgRecovering = false;
       }
@@ -107,9 +116,20 @@ class _ShelfScreenState extends State<ShelfScreen> with WidgetsBindingObserver {
     try {
       final c = await widget.api.getFolders(path);
       setState(() { _contents = c; _loading = false; });
+      _restoreScroll(path);
     } catch (e) {
       setState(() { _loading = false; _error = e.toString(); });
     }
+  }
+
+  // 指定フォルダで保存していたスクロール位置を、再描画後に復元する。
+  void _restoreScroll(String path) {
+    final target = _scrollOffsets[path];
+    if (target == null || target <= 0) return;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || !_gridScroll.hasClients) return;
+      _gridScroll.jumpTo(target.clamp(0.0, _gridScroll.position.maxScrollExtent));
+    });
   }
 
   Future<void> _rescan() async {
@@ -134,14 +154,33 @@ class _ShelfScreenState extends State<ShelfScreen> with WidgetsBindingObserver {
   }
 
   void _openFolder(String path) {
+    if (_gridScroll.hasClients) _scrollOffsets[_currentPath] = _gridScroll.offset;
     _pathStack.add(_contents!.path);
     _load(path);
   }
 
   void _goBack() {
     if (_pathStack.isEmpty) return;
+    if (_gridScroll.hasClients) _scrollOffsets[_currentPath] = _gridScroll.offset;
     final prev = _pathStack.removeLast();
     _load(prev);
+  }
+
+  // 履歴から開いた本を閉じた後、その本のフォルダへ移動する。
+  // pathの祖先フォルダをすべて_pathStackに積み直し、戻るボタンで通常の
+  // 階層ナビゲーションに合流できるようにする。
+  void _navigateToFolder(String path) {
+    _pathStack.clear();
+    if (path.isNotEmpty) {
+      final parts = path.split('/').where((p) => p.isNotEmpty).toList();
+      String acc = '';
+      _pathStack.add(acc);
+      for (var i = 0; i < parts.length - 1; i++) {
+        acc = acc.isEmpty ? parts[i] : '$acc/${parts[i]}';
+        _pathStack.add(acc);
+      }
+    }
+    _load(path);
   }
 
   Future<void> _openBook(BookItem book, {List<BookItem>? siblings}) async {
@@ -218,8 +257,10 @@ class _ShelfScreenState extends State<ShelfScreen> with WidgetsBindingObserver {
             IconButton(
               icon: const Icon(Icons.history, color: Color(0xFF89b4fa)),
               tooltip: '続き / 履歴',
-              onPressed: () => Navigator.push(context, MaterialPageRoute(
-                  builder: (_) => HistoryScreen(api: widget.api))),
+              onPressed: () {
+                Navigator.push(context, MaterialPageRoute(
+                    builder: (_) => HistoryScreen(api: widget.api, onOpenFolder: _navigateToFolder)));
+              },
             ),
           ],
           bottom: PreferredSize(
@@ -309,6 +350,8 @@ class _ShelfScreenState extends State<ShelfScreen> with WidgetsBindingObserver {
     }
 
     return GridView.builder(
+      // フォルダ毎のスクロール位置は_scrollOffsets/_restoreScrollで管理する
+      controller: _gridScroll,
       padding: const EdgeInsets.all(10),
       gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
           maxCrossAxisExtent: 160,
@@ -371,18 +414,15 @@ class _ShelfScreenState extends State<ShelfScreen> with WidgetsBindingObserver {
       mainAxisSpacing: 1,
       crossAxisSpacing: 1,
       children: ids
-          .map((id) => CachedNetworkImage(
+          .map((id) => CoverImage(
                 key: ValueKey('coverprev_${id}_$_imgGen'),
                 imageUrl: widget.api.coverUrl(id),
-                httpHeaders: widget.api.headers,
+                headers: widget.api.headers,
                 cacheManager: widget.api.cacheManager,
                 fit: BoxFit.cover,
-                placeholder: (_, __) =>
-                    Container(color: const Color(0xFF313244)),
-                errorWidget: (_, __, ___) {
-                  _onImageError();
-                  return Container(color: const Color(0xFF313244));
-                },
+                onGaveUp: _onImageError,
+                placeholder: Container(color: const Color(0xFF313244)),
+                errorWidget: Container(color: const Color(0xFF313244)),
               ))
           .toList(),
     );
@@ -400,22 +440,19 @@ class _ShelfScreenState extends State<ShelfScreen> with WidgetsBindingObserver {
             Expanded(
               child: ClipRRect(
                 borderRadius: const BorderRadius.vertical(top: Radius.circular(8)),
-                child: CachedNetworkImage(
+                child: CoverImage(
                   key: ValueKey('cover_${book.id}_$_imgGen'),
                   imageUrl: widget.api.coverUrl(book.id),
-                  httpHeaders: widget.api.headers,
+                  headers: widget.api.headers,
                   cacheManager: widget.api.cacheManager,
                   fit: BoxFit.cover,
                   width: double.infinity,
-                  placeholder: (_, __) =>
-                      Container(color: const Color(0xFF313244)),
-                  errorWidget: (_, __, ___) {
-                    _onImageError();
-                    return Container(
-                        color: const Color(0xFF313244),
-                        child: const Icon(Icons.broken_image,
-                            color: Color(0xFF585b70)));
-                  },
+                  onGaveUp: _onImageError,
+                  placeholder: Container(color: const Color(0xFF313244)),
+                  errorWidget: Container(
+                      color: const Color(0xFF313244),
+                      child: const Icon(Icons.broken_image,
+                          color: Color(0xFF585b70))),
                 ),
               ),
             ),

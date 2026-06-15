@@ -30,14 +30,18 @@ class ReaderScreen extends StatefulWidget {
   final List<BookItem> siblings;
   final int bookIndex;
   final bool startFromEnd;
+  // 履歴から開いた場合、完全に閉じる時に呼ぶコールバック（巻送りでは呼ばない）。
+  // nullなら通常通りNavigator.pop(context)で閉じる。
+  final VoidCallback? onExitToFolder;
 
   const ReaderScreen({
     super.key,
     required this.api,
     required this.book,
-    this.siblings     = const [],
-    this.bookIndex    = 0,
-    this.startFromEnd = false,
+    this.siblings       = const [],
+    this.bookIndex      = 0,
+    this.startFromEnd   = false,
+    this.onExitToFolder,
   });
 
   @override
@@ -535,8 +539,20 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
           api: widget.api, book: target,
           siblings: widget.siblings, bookIndex: idx,
           startFromEnd: prev,
+          onExitToFolder: widget.onExitToFolder,
         ),
       ));
+    }
+  }
+
+  // リーダーを完全に閉じる（巻送りのpushReplacementとは区別する）。
+  // 履歴から開いた場合はonExitToFolderを呼び、履歴画面を経由せず本棚の該当フォルダへ戻す。
+  void _close() {
+    final cb = widget.onExitToFolder;
+    if (cb != null) {
+      cb();
+    } else {
+      Navigator.pop(context);
     }
   }
 
@@ -708,7 +724,7 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
                   },
                   child: const Text('再試行')),
               const SizedBox(width: 12),
-              TextButton(onPressed: () => Navigator.pop(context),
+              TextButton(onPressed: _close,
                   child: const Text('戻る')),
             ]),
           ])));
@@ -718,7 +734,7 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
           appBar: AppBar(backgroundColor: Colors.black,
               leading: IconButton(
                   icon: const Icon(Icons.arrow_back, color: Colors.white),
-                  onPressed: () => Navigator.pop(context))),
+                  onPressed: _close)),
           body: const Center(child: Text('ページが見つかりませんでした',
               style: TextStyle(color: Colors.white54))));
     }
@@ -733,7 +749,14 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
     }
     if (_H == 0) _H = _defaultH(size);
 
-    return Scaffold(
+    return PopScope(
+      // 履歴から開いた場合、システムの戻る操作でも履歴画面を経由せず
+      // 本棚の該当フォルダへ戻す（巻送りのpushReplacementには影響しない）。
+      canPop: widget.onExitToFolder == null,
+      onPopInvokedWithResult: (didPop, result) {
+        if (!didPop) _close();
+      },
+      child: Scaffold(
       backgroundColor: Colors.black,
       body: Listener(
         onPointerDown:   _onPtrDown,
@@ -795,6 +818,7 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
 
           ReconnectBanner(api: widget.api),
         ]),
+      ),
       ),
     );
   }
@@ -866,7 +890,7 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
           child: Row(children: [
             IconButton(
               icon: const Icon(Icons.arrow_back, color: Colors.white),
-              onPressed: () => Navigator.pop(context)),
+              onPressed: _close),
             Expanded(
               child: _MarqueeText(
                 text: widget.book.title,
