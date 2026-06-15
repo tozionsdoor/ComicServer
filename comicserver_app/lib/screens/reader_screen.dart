@@ -6,7 +6,6 @@ import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
 import 'package:cached_network_image/cached_network_image.dart';
-import 'package:flutter_cache_manager/flutter_cache_manager.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 import '../models/book.dart';
@@ -1197,7 +1196,7 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
 
     final magW  = min(390.0, screenSize.width);
     final magH  = min(300.0, screenSize.height);
-    final scale = _magnifierScale;
+    const scale = _magnifierScale;
 
     final ix = (fingerPos.dx - contentRect.left).clamp(0.0, contentRect.width);
     final iy = (fingerPos.dy - contentRect.top).clamp(0.0, contentRect.height);
@@ -1527,12 +1526,16 @@ class _ScrollUnitState extends State<_ScrollUnit> {
     return max <= 0 || _c.position.pixels <= 1;
   }
   void animateToEnd() {
-    if (_c.hasClients) _c.animateTo(_c.position.maxScrollExtent,
-        duration: const Duration(milliseconds: 220), curve: Curves.easeOut);
+    if (_c.hasClients) {
+      _c.animateTo(_c.position.maxScrollExtent,
+          duration: const Duration(milliseconds: 220), curve: Curves.easeOut);
+    }
   }
   void animateToStart() {
-    if (_c.hasClients) _c.animateTo(0,
-        duration: const Duration(milliseconds: 220), curve: Curves.easeOut);
+    if (_c.hasClients) {
+      _c.animateTo(0,
+          duration: const Duration(milliseconds: 220), curve: Curves.easeOut);
+    }
   }
 
   // 虫眼鏡用: コンテンツのグローバルRect

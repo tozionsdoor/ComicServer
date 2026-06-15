@@ -1,7 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/material.dart';
-import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 import '../services/api_service.dart';
 import '../services/device_service.dart';
@@ -32,7 +31,6 @@ class _LoginScreenState extends State<LoginScreen> {
   // 端末登録・承認待ちフロー
   bool   _waitingApproval  = false;
   String _regToken         = '';
-  String _pendingBaseUrl   = '';
   String _certFingerprint  = '';   // LAN発見で取得した証明書フィンガープリント
   int    _approvalTimeout  = 180;
   Timer? _approvalTimer;
@@ -169,7 +167,6 @@ class _LoginScreenState extends State<LoginScreen> {
             _loading        = false;
             _waitingApproval = true;
             _regToken       = data['reg_token'] as String? ?? '';
-            _pendingBaseUrl = baseUrl;
             _approvalTimeout = 180;
           });
           _startApprovalPolling(baseUrl, _regToken);
@@ -395,7 +392,6 @@ class _LoginScreenState extends State<LoginScreen> {
             setState(() {
               _waitingApproval = false;
               _regToken        = '';
-              _pendingBaseUrl  = '';
               _approvalTimeout = 180;
               _error           = '';
             });

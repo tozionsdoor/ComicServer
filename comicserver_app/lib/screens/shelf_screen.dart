@@ -215,10 +215,10 @@ class _ShelfScreenState extends State<ShelfScreen> with WidgetsBindingObserver {
 
   @override
   Widget build(BuildContext context) {
-    return WillPopScope(
-      onWillPop: () async {
-        if (_canGoBack) { _goBack(); return false; }
-        return true;
+    return PopScope(
+      canPop: !_canGoBack,
+      onPopInvokedWithResult: (didPop, result) {
+        if (!didPop) _goBack();
       },
       child: Scaffold(
         backgroundColor: const Color(0xFF1e1e2e),
