@@ -30,6 +30,14 @@ class _ShelfScreenState extends State<ShelfScreen> with WidgetsBindingObserver {
   List<BookItem> _allBooks = [];
   StreamSubscription<List<ConnectivityResult>>? _connectivitySub;
 
+  // カバー画像の自己回復（reader_screenの_onImageErrorと同方式）。
+  // 認証直後など経路確立直後は表紙の一括取得で取りこぼしが起きやすく、
+  // 一度失敗すると_imgGenが変わらない限りCachedNetworkImageが再取得しないため、
+  // reconnect()→世代カウンタ更新で作り直す。
+  int      _imgGen         = 0;
+  bool     _imgRecovering  = false;
+  DateTime _lastImgRecover = DateTime.fromMillisecondsSinceEpoch(0);
+
   @override
   void initState() {
     super.initState();
@@ -67,6 +75,23 @@ class _ShelfScreenState extends State<ShelfScreen> with WidgetsBindingObserver {
       _load(_currentPath);
       _loadAllBooks();
     }
+  }
+
+  void _onImageError() {
+    if (_imgRecovering) return;
+    final now = DateTime.now();
+    if (now.difference(_lastImgRecover) < const Duration(seconds: 8)) return;
+    _imgRecovering = true;
+    _lastImgRecover = now;
+    () async {
+      try {
+        final ok = await widget.api.reconnect();
+        if (!mounted || !ok) return;
+        setState(() => _imgGen++);
+      } finally {
+        _imgRecovering = false;
+      }
+    }();
   }
 
   Future<void> _loadAllBooks() async {
@@ -347,14 +372,17 @@ class _ShelfScreenState extends State<ShelfScreen> with WidgetsBindingObserver {
       crossAxisSpacing: 1,
       children: ids
           .map((id) => CachedNetworkImage(
+                key: ValueKey('coverprev_${id}_$_imgGen'),
                 imageUrl: widget.api.coverUrl(id),
                 httpHeaders: widget.api.headers,
                 cacheManager: widget.api.cacheManager,
                 fit: BoxFit.cover,
                 placeholder: (_, __) =>
                     Container(color: const Color(0xFF313244)),
-                errorWidget: (_, __, ___) =>
-                    Container(color: const Color(0xFF313244)),
+                errorWidget: (_, __, ___) {
+                  _onImageError();
+                  return Container(color: const Color(0xFF313244));
+                },
               ))
           .toList(),
     );
@@ -373,6 +401,7 @@ class _ShelfScreenState extends State<ShelfScreen> with WidgetsBindingObserver {
               child: ClipRRect(
                 borderRadius: const BorderRadius.vertical(top: Radius.circular(8)),
                 child: CachedNetworkImage(
+                  key: ValueKey('cover_${book.id}_$_imgGen'),
                   imageUrl: widget.api.coverUrl(book.id),
                   httpHeaders: widget.api.headers,
                   cacheManager: widget.api.cacheManager,
@@ -380,10 +409,13 @@ class _ShelfScreenState extends State<ShelfScreen> with WidgetsBindingObserver {
                   width: double.infinity,
                   placeholder: (_, __) =>
                       Container(color: const Color(0xFF313244)),
-                  errorWidget: (_, __, ___) => Container(
-                      color: const Color(0xFF313244),
-                      child: const Icon(Icons.broken_image,
-                          color: Color(0xFF585b70))),
+                  errorWidget: (_, __, ___) {
+                    _onImageError();
+                    return Container(
+                        color: const Color(0xFF313244),
+                        child: const Icon(Icons.broken_image,
+                            color: Color(0xFF585b70)));
+                  },
                 ),
               ),
             ),

@@ -21,6 +21,28 @@ class _HistoryScreenState extends State<HistoryScreen> {
   bool _loading = true;
   bool _opening = false;   // 本を開く処理の多重実行ガード（広告後の誤オープン対策）
 
+  // カバー画像の自己回復（shelf_screen/reader_screenの_onImageErrorと同方式）
+  int      _imgGen         = 0;
+  bool     _imgRecovering  = false;
+  DateTime _lastImgRecover = DateTime.fromMillisecondsSinceEpoch(0);
+
+  void _onImageError() {
+    if (_imgRecovering) return;
+    final now = DateTime.now();
+    if (now.difference(_lastImgRecover) < const Duration(seconds: 8)) return;
+    _imgRecovering = true;
+    _lastImgRecover = now;
+    () async {
+      try {
+        final ok = await widget.api.reconnect();
+        if (!mounted || !ok) return;
+        setState(() => _imgGen++);
+      } finally {
+        _imgRecovering = false;
+      }
+    }();
+  }
+
   @override
   void initState() {
     super.initState();
@@ -202,6 +224,7 @@ class _HistoryScreenState extends State<HistoryScreen> {
                     borderRadius:
                         const BorderRadius.vertical(top: Radius.circular(8)),
                     child: CachedNetworkImage(
+                      key: ValueKey('cover_${id}_$_imgGen'),
                       imageUrl: widget.api.coverUrl(id),
                       httpHeaders: widget.api.headers,
                       cacheManager: widget.api.cacheManager,
@@ -209,10 +232,13 @@ class _HistoryScreenState extends State<HistoryScreen> {
                       width: double.infinity,
                       placeholder: (_, __) =>
                           Container(color: const Color(0xFF313244)),
-                      errorWidget: (_, __, ___) => Container(
-                          color: const Color(0xFF313244),
-                          child: const Icon(Icons.broken_image,
-                              color: Color(0xFF585b70))),
+                      errorWidget: (_, __, ___) {
+                        _onImageError();
+                        return Container(
+                            color: const Color(0xFF313244),
+                            child: const Icon(Icons.broken_image,
+                                color: Color(0xFF585b70)));
+                      },
                     ),
                   ),
                 ),
