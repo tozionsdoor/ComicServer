@@ -1582,6 +1582,7 @@ import urllib.request
 import urllib.error
 
 _signaling_running: bool = False
+_signaling_auth:    dict | None = None   # 終了時の presence 削除用
 _active_peers:  dict     = {}   # session_id → RTCPeerConnection
 
 
@@ -1699,6 +1700,79 @@ def _fb_delete_retry(db_url: str, path: str, auth: dict) -> None:
         try:
             _fb_delete(db_url, path, auth["token"])
         except _FbAuthError:
+            pass
+
+
+def _sse_sessions(payload: dict) -> dict:
+    """Firebase SSEイベントのペイロードから {sid: sdata} を抽出する。
+    put/patch ともに path="/" の場合と path="/{sid}" の場合を処理する。"""
+    if not isinstance(payload, dict):
+        return {}
+    path = payload.get("path", "/")
+    data = payload.get("data")
+    if data is None:
+        return {}
+    if path in ("/", ""):
+        return data if isinstance(data, dict) else {}
+    parts = [p for p in path.split("/") if p]
+    if len(parts) == 1 and isinstance(data, dict):
+        return {parts[0]: data}
+    return {}
+
+
+def _fb_sse_listen(db_url: str, path: str, auth: dict,
+                   out_q: asyncio.Queue,
+                   loop: asyncio.AbstractEventLoop,
+                   stop_fn) -> None:
+    """Firebase Realtime Database の SSE ストリームを監視するスレッド関数。
+    新しいセッションデータを (sid, sdata) として out_q に送る。
+    エラー時は ("__reauth__", None) または ("__error__", msg) を送って終了する。
+    ポーリングと異なり変化があったときだけデータが届くためダウンロード量がほぼゼロになる。"""
+    url = f"{db_url}/{path}.json?auth={auth['token']}"
+    req = urllib.request.Request(url, headers={"Accept": "text/event-stream"})
+    try:
+        resp = urllib.request.urlopen(req, timeout=65)
+    except urllib.error.HTTPError as e:
+        sentinel = ("__reauth__", None) if e.code == 401 else ("__error__", f"HTTP {e.code}")
+        loop.call_soon_threadsafe(out_q.put_nowait, sentinel)
+        return
+    except Exception as e:
+        loop.call_soon_threadsafe(out_q.put_nowait, ("__error__", str(e)))
+        return
+
+    try:
+        event_type: str | None = None
+        for raw_line in resp:
+            if stop_fn():
+                return
+            line = raw_line.decode("utf-8").rstrip("\r\n")
+            if line.startswith("event: "):
+                event_type = line[7:].strip()
+                continue
+            if not line.startswith("data: "):
+                continue
+            if event_type in (None, "keep-alive"):
+                event_type = None
+                continue
+            if event_type == "cancel":
+                loop.call_soon_threadsafe(out_q.put_nowait, ("__error__", "SSEキャンセル"))
+                return
+            if event_type in ("put", "patch"):
+                try:
+                    payload = json.loads(line[6:])
+                except json.JSONDecodeError:
+                    event_type = None
+                    continue
+                for sid, sdata in _sse_sessions(payload).items():
+                    loop.call_soon_threadsafe(out_q.put_nowait, (sid, sdata))
+            event_type = None
+    except Exception as e:
+        if not stop_fn():
+            loop.call_soon_threadsafe(out_q.put_nowait, ("__error__", str(e)))
+    finally:
+        try:
+            resp.close()
+        except Exception:
             pass
 
 
@@ -1983,7 +2057,9 @@ async def _run_peer_async(session_id: str, offer_sdp: str,
 
 
 async def _signaling_loop_async(api_key: str, db_url: str, room_id: str) -> None:
-    """Firebase をポーリングして新セッションが来たら _run_peer_async をタスク起動する。"""
+    """Firebase SSE ストリームで新セッションを監視し _run_peer_async をタスク起動する。
+    ポーリング(3秒ごと全量GET)を廃止し変化時のみデータが届く方式に変更。
+    Firebase ダウンロード量をほぼゼロに抑えられる。"""
     loop = asyncio.get_event_loop()
 
     token = await loop.run_in_executor(None, lambda: _firebase_anon_signin(api_key))
@@ -1992,6 +2068,8 @@ async def _signaling_loop_async(api_key: str, db_url: str, room_id: str) -> None
         return
     # 全Firebase呼び出しで共有する認証状態。401検知時に token が更新され全員に反映される
     auth = {"api_key": api_key, "token": token}
+    global _signaling_auth
+    _signaling_auth = auth   # 終了時の presence 削除で参照する
 
     await loop.run_in_executor(None, lambda: _fb_put_retry(
         db_url, f"rooms/{room_id}/presence", {"host": True}, auth,
@@ -2003,40 +2081,71 @@ async def _signaling_loop_async(api_key: str, db_url: str, room_id: str) -> None
     next_refresh = time.time() + 3300   # 有効期限1時間の5分前
 
     while _signaling_running:
-        try:
-            if time.time() >= next_refresh:
-                ok = await loop.run_in_executor(None, lambda: _reauth(auth))
-                next_refresh = time.time() + (3300 if ok else 60)  # 失敗時は1分後に再試行
+        # トークン先回り更新
+        if time.time() >= next_refresh:
+            ok = await loop.run_in_executor(None, lambda: _reauth(auth))
+            next_refresh = time.time() + (3300 if ok else 60)
 
-            sessions = (await loop.run_in_executor(
-                None, lambda: _fb_get_retry(db_url, f"rooms/{room_id}/sessions", auth),
-            )) or {}
+        out_q: asyncio.Queue = asyncio.Queue()
+        sse_done = asyncio.Event()
 
-            for sid, sdata in sessions.items():
-                if sid in known:
-                    continue
-                if (isinstance(sdata, dict)
-                        and sdata.get("offer")
-                        and not sdata.get("answer")):
-                    known.add(sid)
-                    offer_sdp = sdata["offer"].get("sdp", "")
-                    # サーバー停止中にアプリが書いた古いoffer(ゾンビ)は応答せず破棄する。
-                    # Answerしても相手は居らず30秒タイムアウトするだけなのでログも無駄に流れる。
-                    ts = _push_id_time_ms(sid)
-                    if ts is not None and time.time() * 1000 - ts > 90_000:
-                        _log_queue.put(f"[WebRTC] 古いセッションを破棄: {sid[:8]}")
-                        await loop.run_in_executor(None, lambda s=sid: _fb_delete_retry(
-                            db_url, f"rooms/{room_id}/sessions/{s}", auth))
-                        continue
-                    _log_queue.put(
-                        f"[WebRTC] 新セッション: {sid[:8]}  接続元: {_offer_origin(offer_sdp)}")
-                    asyncio.create_task(
-                        _run_peer_async(sid, offer_sdp, db_url, room_id, auth, loop)
-                    )
-        except Exception as e:
-            _log_queue.put(f"[WebRTC] シグナリングエラー: {e}")
+        def _sse_thread(q=out_q, done=sse_done):
+            try:
+                _fb_sse_listen(
+                    db_url, f"rooms/{room_id}/sessions", auth, q, loop,
+                    lambda: not _signaling_running,
+                )
+            finally:
+                loop.call_soon_threadsafe(done.set)
 
-        await asyncio.sleep(3)
+        loop.run_in_executor(None, _sse_thread)
+
+        reauth_needed = False
+        while _signaling_running and not sse_done.is_set():
+            try:
+                sid, sdata = await asyncio.wait_for(out_q.get(), timeout=1.0)
+            except asyncio.TimeoutError:
+                continue
+
+            if sid == "__reauth__":
+                _log_queue.put("[WebRTC] Firebase token期限切れ、再認証中...")
+                reauth_needed = True
+                break
+            if sid == "__error__":
+                _log_queue.put(f"[WebRTC] シグナリングエラー: {sdata}")
+                break
+
+            if sid in known:
+                continue
+            if not (isinstance(sdata, dict) and sdata.get("offer") and not sdata.get("answer")):
+                continue
+
+            known.add(sid)
+            offer_sdp = sdata["offer"].get("sdp", "")
+            # サーバー停止中にアプリが書いた古いoffer(ゾンビ)は応答せず破棄する。
+            ts = _push_id_time_ms(sid)
+            if ts is not None and time.time() * 1000 - ts > 90_000:
+                _log_queue.put(f"[WebRTC] 古いセッションを破棄: {sid[:8]}")
+                await loop.run_in_executor(None, lambda s=sid: _fb_delete_retry(
+                    db_url, f"rooms/{room_id}/sessions/{s}", auth))
+                continue
+            _log_queue.put(
+                f"[WebRTC] 新セッション: {sid[:8]}  接続元: {_offer_origin(offer_sdp)}")
+            asyncio.create_task(
+                _run_peer_async(sid, offer_sdp, db_url, room_id, auth, loop)
+            )
+
+        await sse_done.wait()  # SSEスレッドの終了を待ってから再接続
+
+        if not _signaling_running:
+            break
+        if reauth_needed:
+            if await loop.run_in_executor(None, lambda: _reauth(auth)):
+                next_refresh = time.time() + 3300
+            else:
+                await asyncio.sleep(60)
+        else:
+            await asyncio.sleep(3)  # 切断後、短い待機を入れてから再接続
 
 
 def _signaling_thread_main() -> None:
@@ -2738,7 +2847,23 @@ class App(tk.Tk):
             try: self._tray.stop()
             except Exception: pass
             self._tray = None
-        global _server_thread
+        # Firebase の presence ノードを削除してから終了（蓄積防止）
+        global _server_thread, _signaling_running
+        _signaling_running = False
+        if _signaling_auth:
+            def _delete_presence():
+                try:
+                    fb = _fb_cfg()
+                    if fb:
+                        db_url = fb["database_url"].rstrip("/")
+                        room_id = _config.get("room_id", "")
+                        _fb_delete(db_url, f"rooms/{room_id}/presence",
+                                   _signaling_auth["token"])
+                except Exception:
+                    pass
+            t = threading.Thread(target=_delete_presence, daemon=True)
+            t.start()
+            t.join(timeout=3)   # 最大3秒待って終了
         if _server_thread:
             try: _server_thread.stop()
             except Exception: pass
