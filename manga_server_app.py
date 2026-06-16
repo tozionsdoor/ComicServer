@@ -1584,6 +1584,7 @@ import urllib.error
 _signaling_running: bool = False
 _signaling_auth:    dict | None = None   # 終了時の presence 削除用
 _active_peers:  dict     = {}   # session_id → RTCPeerConnection
+_ipv6_monitor_running: bool = False
 
 
 def _fb_cfg() -> dict | None:
@@ -2194,6 +2195,92 @@ def start_webrtc_signaling() -> None:
     _signaling_running = True
     threading.Thread(target=_signaling_thread_main, daemon=True).start()
 
+
+# ─── IPv6監視 + UPnP + Firebase登録 ──────────────────────────────────────────
+def _upnp_open_ipv6(ipv6: str, port: int) -> bool:
+    """miniupnpc でルーターのIPv6ファイアウォールを自動開放する。
+    miniupnpc 未導入・ルーター非対応でも失敗を無視してサーバーは動き続ける。"""
+    try:
+        import miniupnpc  # type: ignore
+        u = miniupnpc.UPnP()
+        u.discoverdelay = 1000
+        if u.discover() == 0:
+            _log_queue.put("[IPv6] UPnP: ルーターが見つかりません（手動でポート開放してください）")
+            return False
+        u.selectigd()
+        try:
+            u.addpinhole('', 0, ipv6, port, 'TCP', 3600)
+            _log_queue.put(f"[IPv6] UPnP: TCPポート {port} を自動開放しました")
+            return True
+        except Exception as pe:
+            _log_queue.put(f"[IPv6] UPnP: ルーターがIPv6ピンホールに対応していません ({pe})")
+            return False
+    except ImportError:
+        _log_queue.put("[IPv6] UPnP: miniupnpc未導入（pip install miniupnpc でインストール可能）")
+        return False
+    except Exception as e:
+        _log_queue.put(f"[IPv6] UPnP: 失敗 ({e})")
+        return False
+
+
+def _ipv6_monitor_thread() -> None:
+    """サーバーのグローバルIPv6アドレスを60秒ごとに監視する。
+    起動時と変化時にFirebaseへ登録し、UPnPでルーターのFWを開放する。
+    Firebase未設定 / IPv6なし環境では即終了（LAN動作に影響なし）。"""
+    global _ipv6_monitor_running
+    fb = _fb_cfg()
+    if not fb:
+        _ipv6_monitor_running = False
+        return
+    room_id = _config.get("room_id", "")
+    if not room_id:
+        _ipv6_monitor_running = False
+        return
+    port = int(_config.get("port", 8765))
+
+    token = _firebase_anon_signin(fb["api_key"])
+    if not token:
+        _log_queue.put("[IPv6] Firebase認証失敗: IPv6監視を無効化")
+        _ipv6_monitor_running = False
+        return
+    auth: dict = {"api_key": fb["api_key"], "token": token}
+
+    last_ipv6 = ""
+    while _ipv6_monitor_running:
+        ipv6 = get_global_ipv6()
+        if ipv6 != last_ipv6:
+            if ipv6:
+                _upnp_open_ipv6(ipv6, port)
+                try:
+                    _fb_put_retry(
+                        fb["database_url"],
+                        f"rooms/{room_id}/host",
+                        {"ipv6": ipv6, "ts": int(time.time())},
+                        auth,
+                    )
+                    if last_ipv6:
+                        _log_queue.put(f"[IPv6] アドレス変更を検知 → Firebase更新: {ipv6}")
+                    else:
+                        _log_queue.put(f"[IPv6] Firebase登録完了: {ipv6}")
+                except Exception as e:
+                    _log_queue.put(f"[IPv6] Firebase更新エラー: {e}")
+            last_ipv6 = ipv6
+        # 60秒待機（1秒刻みで終了フラグをチェックするので即座に止まれる）
+        for _ in range(60):
+            if not _ipv6_monitor_running:
+                break
+            time.sleep(1)
+
+
+def start_ipv6_monitor() -> None:
+    """IPv6監視スレッドを起動（多重起動防止）。"""
+    global _ipv6_monitor_running
+    if _ipv6_monitor_running:
+        return
+    _ipv6_monitor_running = True
+    threading.Thread(target=_ipv6_monitor_thread, daemon=True).start()
+
+
 # ─── Uvicorn スレッド ──────────────────────────────────────────────────────────
 class _NoSignalServer(uvicorn.Server):
     """スレッド内で動かすため、シグナルハンドラ登録をスキップする"""
@@ -2664,6 +2751,7 @@ class App(tk.Tk):
 
             start_discovery_responder()   # LAN自動発見の応答を開始
             start_webrtc_signaling()      # WebRTC P2Pシグナリングを開始（Firebase未設定なら即終了）
+            start_ipv6_monitor()          # IPv6監視 + Firebase登録 + UPnP自動開放
 
             self._log("[DEBUG] IPアドレス取得中...")
             ip  = get_local_ip()
@@ -2708,13 +2796,14 @@ class App(tk.Tk):
                 f"サーバーを起動できませんでした。\n\n{err}")
 
     def _stop_server(self):
-        global _server_thread, _server_thread_v6
+        global _server_thread, _server_thread_v6, _ipv6_monitor_running
         if _server_thread:
             _server_thread.stop()
             _server_thread = None
         if _server_thread_v6:
             _server_thread_v6.stop()
             _server_thread_v6 = None
+        _ipv6_monitor_running = False   # IPv6監視スレッドを停止
         self._dot.configure(fg=FG_RED)
         self._status_lbl.configure(text="停止中", fg=FG_DIM)
         self._start_btn.configure(state=tk.NORMAL)

@@ -1,10 +1,12 @@
 import 'dart:async';
 import 'dart:convert';
+import 'package:firebase_database/firebase_database.dart';
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../services/api_service.dart';
 import '../services/device_service.dart';
 import '../services/discovery_service.dart';
+import '../services/firebase_signaling.dart';
 import '../services/http_pinned_client.dart';
 import '../services/webrtc_service.dart';
 import 'shelf_screen.dart';
@@ -279,9 +281,19 @@ class _LoginScreenState extends State<LoginScreen> {
     await prefs.setString('turn_url',        _turnUrlCtrl.text.trim());
     await prefs.setString('turn_username',   _turnUserCtrl.text.trim());
     await prefs.setString('turn_credential', _turnCredCtrl.text.trim());
-    final ipv6            = prefs.getString('ipv6');
+    final savedIpv6       = prefs.getString('ipv6');
     final roomId          = prefs.getString('room_id') ?? '';
     final certFingerprint = prefs.getString('cert_fingerprint') ?? '';
+    // Firebaseから最新IPv6を取得（LAN外でアドレスが変わっていた場合に対応）
+    String? ipv6 = savedIpv6;
+    if (roomId.isNotEmpty) {
+      final fbIpv6 = await FirebaseSignaling.readServerIpv6(
+          FirebaseDatabase.instance, roomId);
+      if (fbIpv6 != null && fbIpv6.isNotEmpty) {
+        ipv6 = fbIpv6;
+        await prefs.setString('ipv6', fbIpv6);  // 最新値を保存
+      }
+    }
     final candidates = buildCandidates(primaryUrl: url, ipv6: ipv6);
     final working = await ApiService.resolveBaseUrl(candidates, token,
         certFingerprint: certFingerprint);

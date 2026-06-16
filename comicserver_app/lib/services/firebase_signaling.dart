@@ -51,4 +51,20 @@ class FirebaseSignaling {
   Future<void> deleteSession(String sessionId) async {
     await _sessionRef(sessionId).remove();
   }
+
+  /// サーバーが登録した最新のグローバルIPv6アドレスをFirebaseから取得する。
+  /// 取得失敗・未登録の場合は null を返す（接続候補なしとして扱う）。
+  static Future<String?> readServerIpv6(
+      FirebaseDatabase db, String roomId) async {
+    try {
+      final snap = await db
+          .ref('rooms/$roomId/host/ipv6')
+          .get()
+          .timeout(const Duration(seconds: 4));
+      final v = snap.value;
+      return (v is String && v.isNotEmpty) ? v : null;
+    } catch (_) {
+      return null;
+    }
+  }
 }
