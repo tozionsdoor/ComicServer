@@ -517,6 +517,8 @@ def get_global_ipv6() -> str:
                 ["netsh", "interface", "ipv6", "show", "address"],
                 capture_output=True, text=True, timeout=3,
                 encoding="utf-8", errors="replace",
+                # GUIアプリからnetshを呼ぶとコンソール窓が一瞬チラつくため抑制（Windows専用）。
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             ).stdout
             for block in out.split("\n\n"):
                 public_addr = None
@@ -2397,12 +2399,32 @@ class _UvicornThread(threading.Thread):
             kw["ssl_certfile"] = ssl_certfile
             kw["ssl_keyfile"]  = ssl_keyfile
         self._srv = _NoSignalServer(uvicorn.Config(api, **kw))
+        self._sock: socket.socket | None = None
+        # host="::" で IPv4/IPv6 を1本のソケットで受けたいが、Windowsの既定では
+        # IPv6ソケットが V6ONLY=1（IPv6のみ）になりIPv4を取りこぼす（uvicorn任せだと
+        # これが起きる）。自前でソケットを作り V6ONLY=0（デュアルスタック）を明示設定し
+        # uvicornに渡すことで、1本でIPv4(::ffff:a.b.c.d形式)とIPv6を同時に受ける。
+        if host in ("::", "::0"):
+            try:
+                sk = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+                sk.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+                sk.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                sk.bind(("::", port))
+                sk.listen(2048)
+                self._sock = sk
+            except OSError as e:
+                # デュアルスタック不可の環境では uvicorn 任せ（IPv6のみ）にフォールバック
+                _log_queue.put(f"[WARN] デュアルスタック設定失敗、IPv6のみで継続: {e}")
+                self._sock = None
         self.error: str = ""
 
     def run(self) -> None:
         import traceback
         try:
-            asyncio.run(self._srv.serve())
+            if self._sock is not None:
+                asyncio.run(self._srv.serve(sockets=[self._sock]))
+            else:
+                asyncio.run(self._srv.serve())
         except Exception as e:
             tb = traceback.format_exc()
             self.error = str(e)
@@ -2413,7 +2435,6 @@ class _UvicornThread(threading.Thread):
         self._srv.should_exit = True
 
 _server_thread:    _UvicornThread | None = None
-_server_thread_v6: _UvicornThread | None = None
 
 # uvicorn のログを _log_queue に流す
 class _QueueHandler(logging.Handler):
@@ -2835,20 +2856,15 @@ class App(tk.Tk):
             port = _config.get("port", 8765)
             cert = str(CERT_PATH)
             key  = str(KEY_PATH)
-            _server_thread = _UvicornThread(host, port, cert, key)
+            # "0.0.0.0"(IPv4全アドレス)は"::"(デュアルスタック)に昇格し、1本のソケットで
+            # IPv4/IPv6を同時に受ける。以前はIPv4とIPv6を別スレッドで2本立てていたが、
+            # uvicornのIPv6ソケットはIPv4空間も掴む(V6ONLY=0)ため、同じポートでIPv4側と
+            # 衝突しWindowsで10048エラーになっていた。1本に統合してこれを解消する。
+            listen_host = "::" if host in ("0.0.0.0", "") else host
+            _server_thread = _UvicornThread(listen_host, port, cert, key)
             self._log("[DEBUG] start() 呼び出し...")
             _server_thread.start()
             self._log("[DEBUG] start() 完了")
-
-            # IPv6 デュアルリッスン（失敗しても本体は動く）
-            global _server_thread_v6
-            try:
-                _server_thread_v6 = _UvicornThread("::", port, cert, key)
-                _server_thread_v6.start()
-                self._log(f"IPv6 HTTPS listen 開始 (:::){port}")
-            except Exception as _e6:
-                self._log(f"IPv6 listen: 起動失敗（無視）: {_e6}")
-                _server_thread_v6 = None
 
             start_discovery_responder()   # LAN自動発見の応答を開始
             start_webrtc_signaling()      # WebRTC P2Pシグナリングを開始（Firebase未設定なら即終了）
@@ -2897,13 +2913,10 @@ class App(tk.Tk):
                 f"サーバーを起動できませんでした。\n\n{err}")
 
     def _stop_server(self):
-        global _server_thread, _server_thread_v6, _ipv6_monitor_running
+        global _server_thread, _ipv6_monitor_running
         if _server_thread:
             _server_thread.stop()
             _server_thread = None
-        if _server_thread_v6:
-            _server_thread_v6.stop()
-            _server_thread_v6 = None
         _ipv6_monitor_running = False   # IPv6監視スレッドを停止
         self._dot.configure(fg=FG_RED)
         self._status_lbl.configure(text="停止中", fg=FG_DIM)
