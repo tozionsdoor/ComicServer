@@ -2197,38 +2197,118 @@ def start_webrtc_signaling() -> None:
 
 
 # ─── IPv6監視 + UPnP + Firebase登録 ──────────────────────────────────────────
+def _upnp_ssdp_discover(timeout: float = 2.0) -> str:
+    """SSDP M-SEARCH で WANIPv6FirewallControl:1 に対応したルーターを探す。
+    見つかれば device description の URL を返す。見つからなければ空文字。"""
+    msg = (
+        "M-SEARCH * HTTP/1.1\r\n"
+        "HOST: 239.255.255.250:1900\r\n"
+        'MAN: "ssdp:discover"\r\n'
+        "MX: 2\r\n"
+        "ST: urn:schemas-upnp-org:service:WANIPv6FirewallControl:1\r\n"
+        "\r\n"
+    ).encode()
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        sock.settimeout(timeout)
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+        try:
+            sock.sendto(msg, ("239.255.255.250", 1900))
+            while True:
+                try:
+                    data, _ = sock.recvfrom(65507)
+                    for line in data.decode(errors="replace").split("\r\n"):
+                        if line.upper().startswith("LOCATION:"):
+                            return line.split(":", 1)[1].strip()
+                except OSError:
+                    break
+        finally:
+            sock.close()
+    except Exception:
+        pass
+    return ""
+
+
+def _upnp_get_control_url(location: str) -> tuple[str, str]:
+    """device description XML から WANIPv6FirewallControl:1 の controlURL を取得する。
+    戻り値: (control_url, base_url)。失敗時は両方空文字。"""
+    import urllib.request as _ur
+    import xml.etree.ElementTree as ET
+    try:
+        with _ur.urlopen(location, timeout=5) as r:
+            xml_data = r.read()
+    except Exception:
+        return "", ""
+    # http://host:port 部分を base_url として確保
+    parts = location.split("/")
+    base_url = "/".join(parts[:3])
+    try:
+        root = ET.fromstring(xml_data)
+    except ET.ParseError:
+        return "", ""
+    # UPnP device description は namespace を使うので tag を部分一致で探す
+    for elem in root.iter():
+        tag = elem.tag.split("}")[-1] if "}" in elem.tag else elem.tag
+        if tag == "service":
+            stype, ctrl = "", ""
+            for child in elem:
+                ctag = child.tag.split("}")[-1] if "}" in child.tag else child.tag
+                if ctag == "serviceType":
+                    stype = child.text or ""
+                elif ctag == "controlURL":
+                    ctrl = child.text or ""
+            if "WANIPv6FirewallControl" in stype and ctrl:
+                return ctrl, base_url
+    return "", ""
+
+
+def _upnp_add_pinhole(base_url: str, ctrl_path: str, ipv6: str, port: int) -> None:
+    """WANIPv6FirewallControl:1 の AddPinhole SOAP アクションを実行する。"""
+    import urllib.request as _ur
+    url = base_url + ctrl_path if ctrl_path.startswith("/") else base_url + "/" + ctrl_path
+    body = (
+        '<?xml version="1.0"?>'
+        '<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"'
+        ' s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">'
+        "<s:Body>"
+        '<u:AddPinhole xmlns:u="urn:schemas-upnp-org:service:WANIPv6FirewallControl:1">'
+        "<NewRemoteHost></NewRemoteHost>"
+        "<NewRemotePort>0</NewRemotePort>"
+        f"<NewInternalClient>{ipv6}</NewInternalClient>"
+        f"<NewInternalPort>{port}</NewInternalPort>"
+        "<NewProtocol>TCP</NewProtocol>"
+        "<NewLeaseTime>3600</NewLeaseTime>"
+        "</u:AddPinhole>"
+        "</s:Body>"
+        "</s:Envelope>"
+    ).encode()
+    req = _ur.Request(
+        url, data=body,
+        headers={
+            "Content-Type": 'text/xml; charset="utf-8"',
+            "SOAPAction": '"urn:schemas-upnp-org:service:WANIPv6FirewallControl:1#AddPinhole"',
+        },
+    )
+    with _ur.urlopen(req, timeout=5) as r:
+        r.read()
+
+
 def _upnp_open_ipv6(ipv6: str, port: int) -> bool:
-    """miniupnpc でルーターのIPv6ファイアウォールを自動開放する。
-    miniupnpc 未導入の場合は自動インストールを試みる。
+    """純PythonでUPnP IGD2 AddPinholeを実行しルーターのIPv6 FWを自動開放する。
+    外部ライブラリ不要（Python標準ライブラリのみ）。
     ルーター非対応でも失敗を無視してサーバーは動き続ける。"""
     try:
-        import miniupnpc  # type: ignore
-    except ImportError:
-        _log_queue.put("[IPv6] UPnP: miniupnpcを自動インストール中...")
-        try:
-            subprocess.run(
-                [sys.executable, "-m", "pip", "install", "miniupnpc", "--quiet"],
-                capture_output=True, check=True, timeout=60,
-            )
-            import miniupnpc  # type: ignore  # noqa: F811
-            _log_queue.put("[IPv6] UPnP: miniupnpcのインストール完了")
-        except Exception as ie:
-            _log_queue.put(f"[IPv6] UPnP: 自動インストール失敗 ({ie})")
+        location = _upnp_ssdp_discover()
+        if not location:
+            _log_queue.put("[IPv6] UPnP: IPv6ファイアウォール制御対応ルーターが見つかりません")
             return False
-    try:
-        u = miniupnpc.UPnP()
-        u.discoverdelay = 1000
-        if u.discover() == 0:
-            _log_queue.put("[IPv6] UPnP: ルーターが見つかりません（手動でポート開放が必要な場合があります）")
+        ctrl, base = _upnp_get_control_url(location)
+        if not ctrl:
+            _log_queue.put("[IPv6] UPnP: ルーターがIPv6ピンホールに非対応です")
             return False
-        u.selectigd()
-        try:
-            u.addpinhole('', 0, ipv6, port, 'TCP', 3600)
-            _log_queue.put(f"[IPv6] UPnP: TCPポート {port} を自動開放しました")
-            return True
-        except Exception as pe:
-            _log_queue.put(f"[IPv6] UPnP: ルーターがIPv6ピンホールに対応していません ({pe})")
-            return False
+        _upnp_add_pinhole(base, ctrl, ipv6, port)
+        _log_queue.put(f"[IPv6] UPnP: TCPポート {port} を自動開放しました")
+        return True
     except Exception as e:
         _log_queue.put(f"[IPv6] UPnP: 失敗 ({e})")
         return False
