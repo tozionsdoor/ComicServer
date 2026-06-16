@@ -1706,19 +1706,29 @@ def _fb_delete_retry(db_url: str, path: str, auth: dict) -> None:
 
 def _sse_sessions(payload: dict) -> dict:
     """Firebase SSEイベントのペイロードから {sid: sdata} を抽出する。
-    put/patch ともに path="/" の場合と path="/{sid}" の場合を処理する。"""
+    監視ルート rooms/{room}/sessions からの相対 path を解析する:
+      path="/"            : data = {sid: sdata, ...}（初回スナップショット/全置換）
+      path="/{sid}"       : data = sdata（セッション全体を1回で書いた場合）
+      path="/{sid}/offer" : data = offer本体（アプリが offer 子ノードだけを後から
+                            書いた場合。Firebaseは"書き込んだ深さ"のpathで通知する）
+    先頭セグメントを sid とみなし、残りのセグメントでネストを復元して
+    {sid: sdata} に正規化する。以前は2階層以上を捨てていたため、サーバー起動後に
+    アプリが書く新規offer(path="/{sid}/offer")を取りこぼしていた。"""
     if not isinstance(payload, dict):
         return {}
     path = payload.get("path", "/")
     data = payload.get("data")
     if data is None:
         return {}
-    if path in ("/", ""):
-        return data if isinstance(data, dict) else {}
     parts = [p for p in path.split("/") if p]
-    if len(parts) == 1 and isinstance(data, dict):
-        return {parts[0]: data}
-    return {}
+    if not parts:                       # path="/"
+        return data if isinstance(data, dict) else {}
+    sid = parts[0]
+    # 残りのセグメント（例: ["offer"]）を内側から包んで sdata を復元する。
+    sdata = data
+    for key in reversed(parts[1:]):
+        sdata = {key: sdata}
+    return {sid: sdata} if isinstance(sdata, dict) else {}
 
 
 def _fb_sse_listen(db_url: str, path: str, auth: dict,

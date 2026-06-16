@@ -18,10 +18,15 @@ class FirebaseSignaling {
       _db.ref('rooms/$roomId/sessions/$sessionId');
 
   /// Offer SDPをFirebaseに書き込む。
+  /// セッションノード全体を1回のsetで書く（offer子ノードだけを書くと、
+  /// サーバーのSSE監視には path="/{sid}/offer" の深いイベントとして届く。
+  /// 全体setなら path="/{sid}" で届き、サーバーが確実に新セッションとして拾える）。
   Future<void> sendOffer(String sessionId, RTCSessionDescription offer) async {
-    await _sessionRef(sessionId).child('offer').set({
-      'sdp': offer.sdp,
-      'type': offer.type,
+    await _sessionRef(sessionId).set({
+      'offer': {
+        'sdp': offer.sdp,
+        'type': offer.type,
+      },
     });
   }
 
