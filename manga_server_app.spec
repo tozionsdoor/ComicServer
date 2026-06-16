@@ -16,7 +16,7 @@ hiddenimports = []
 # collect_all で datas/binaries/hiddenimports を丸ごと取り込む。
 for pkg in (
     'aiortc', 'aioice', 'av', 'pylibsrtp', 'google_crc32c', 'pyee', 'OpenSSL',
-    'cryptography', 'pymupdf', 'uvicorn', 'pystray', 'rarfile',
+    'cryptography', 'pymupdf', 'uvicorn', 'pystray', 'rarfile', 'miniupnpc',
 ):
     d, b, h = collect_all(pkg)
     datas += d
