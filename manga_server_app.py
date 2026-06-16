@@ -2199,13 +2199,27 @@ def start_webrtc_signaling() -> None:
 # ─── IPv6監視 + UPnP + Firebase登録 ──────────────────────────────────────────
 def _upnp_open_ipv6(ipv6: str, port: int) -> bool:
     """miniupnpc でルーターのIPv6ファイアウォールを自動開放する。
-    miniupnpc 未導入・ルーター非対応でも失敗を無視してサーバーは動き続ける。"""
+    miniupnpc 未導入の場合は自動インストールを試みる。
+    ルーター非対応でも失敗を無視してサーバーは動き続ける。"""
     try:
         import miniupnpc  # type: ignore
+    except ImportError:
+        _log_queue.put("[IPv6] UPnP: miniupnpcを自動インストール中...")
+        try:
+            subprocess.run(
+                [sys.executable, "-m", "pip", "install", "miniupnpc", "--quiet"],
+                capture_output=True, check=True, timeout=60,
+            )
+            import miniupnpc  # type: ignore  # noqa: F811
+            _log_queue.put("[IPv6] UPnP: miniupnpcのインストール完了")
+        except Exception as ie:
+            _log_queue.put(f"[IPv6] UPnP: 自動インストール失敗 ({ie})")
+            return False
+    try:
         u = miniupnpc.UPnP()
         u.discoverdelay = 1000
         if u.discover() == 0:
-            _log_queue.put("[IPv6] UPnP: ルーターが見つかりません（手動でポート開放してください）")
+            _log_queue.put("[IPv6] UPnP: ルーターが見つかりません（手動でポート開放が必要な場合があります）")
             return False
         u.selectigd()
         try:
@@ -2215,9 +2229,6 @@ def _upnp_open_ipv6(ipv6: str, port: int) -> bool:
         except Exception as pe:
             _log_queue.put(f"[IPv6] UPnP: ルーターがIPv6ピンホールに対応していません ({pe})")
             return False
-    except ImportError:
-        _log_queue.put("[IPv6] UPnP: miniupnpc未導入（pip install miniupnpc でインストール可能）")
-        return False
     except Exception as e:
         _log_queue.put(f"[IPv6] UPnP: 失敗 ({e})")
         return False
