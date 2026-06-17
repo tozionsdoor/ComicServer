@@ -223,7 +223,7 @@
       PCの電源が切れていたり、サーバーソフトが終了していると、外出先からアプリでアクセスすることはできません。普段お使いのPCを「自分専用の本棚サーバー」として動かしておくイメージです。
     </div>
     <div class="diagram">
-      <img src="images/diagram-howitworks.svg" alt="自宅では自宅Wi-Fiで自動検出して接続。外出先ではIPv6が使える環境ならローカルとほぼ同じ速度で直結し、使えない環境でもWebRTCのP2Pで自宅PCとスマホが直接通信する仕組みの図解。">
+      <img src="images/diagram-howitworks.svg" alt="接続方式4種類の図解。①自宅ではWi-Fiで自動検出。②外出先でIPv6が使える環境ならIPv6で高速直結。③IPv4回線ではUPnPでポートを自動開放して直結（MAP-E/v6プラスにも対応）。④どちらも使えない環境ではWebRTC P2Pで直接通信。いずれも自動で切り替わる。">
     </div>
 
     <h3 class="sub-heading">外出先での接続方式（自動選択）</h3>
