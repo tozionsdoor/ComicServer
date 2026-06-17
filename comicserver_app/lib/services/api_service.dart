@@ -9,6 +9,23 @@ import 'firebase_signaling.dart';
 import 'http_pinned_client.dart';
 import 'webrtc_service.dart';
 
+/// HttpFileService にダウンロードタイムアウトを付与するラッパー。
+/// flutter_cache_manager のデフォルトはタイムアウト無し（ハングが永続する）。
+class _TimeoutFileService implements FileService {
+  final FileService _inner;
+  const _TimeoutFileService(this._inner);
+
+  @override
+  int get concurrentFetches => _inner.concurrentFetches;
+
+  @override
+  set concurrentFetches(int value) => _inner.concurrentFetches = value;
+
+  @override
+  Future<FileServiceResponse> get(String url, {Map<String, String>? headers}) =>
+      _inner.get(url, headers: headers).timeout(const Duration(seconds: 10));
+}
+
 class ApiService {
   String baseUrl;
   String token;              // 認証トークン（LANペアリングで受け取る or 手動入力）
@@ -48,7 +65,8 @@ class ApiService {
       'comicPageCache',
       stalePeriod: const Duration(days: 90),
       maxNrOfCacheObjects: 2000,
-      fileService: HttpFileService(httpClient: makePinnedClient(certFingerprint)),
+      fileService: _TimeoutFileService(
+          HttpFileService(httpClient: makePinnedClient(certFingerprint))),
     ));
     if (viaWebRtc) _startHostWatcher();
   }
