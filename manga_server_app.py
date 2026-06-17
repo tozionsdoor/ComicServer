@@ -2606,12 +2606,20 @@ def _upnp_open_ipv4(internal_ip: str, port: int) -> str:
         attempts: list[str] = []
         prev = int(_config.get("upnp_external_port", 0) or 0)
 
-        # 1) キャッシュ済み成功ポートを最優先（普段の60秒ループはここでリース更新して終わり）
+        # 1) キャッシュ済み成功ポートを最優先（普段の60秒ループはここでリース更新して終わり）。
+        #    ★維持は冪等な再Addのみで判定し、GetSpecificPortMappingEntry(_mapped)に依存しない。
+        #    PR-400NE系では _add が成功(fault無し)を返しても _mapped が不定でFalseを返すことがあり、
+        #    それを「失敗」と誤判定して別候補へ流れ、外部ポートが60秒ごとに無限ローテーションしていた。
+        #    AddPortMapping は冪等なので、成功 or 718(既に自分の登録あり)なら「開いている」と確定扱い。
         if prev:
-            ok, f = _try_open(prev)
-            if ok:
+            resp = _add(prev, 0)                 # 永続リースで再登録（既存ならルーターは維持）
+            f = _upnp_fault(resp)
+            if f is not None and f[0] != "718":  # 永続拒否(725)等は有限リースで再試行
+                resp = _add(prev, 3600)
+                f = _upnp_fault(resp)
+            if f is None or f[0] == "718":        # 成功 or 既存 = 開いている → 固定
                 chosen = prev
-            elif f:
+            else:
                 last_fault = f
                 attempts.append(f"{prev}=NG({f[0]})")
 
