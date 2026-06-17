@@ -2672,6 +2672,7 @@ def _upnp_open_ipv4(internal_ip: str, port: int) -> str:
         if not chosen and last_fault and last_fault[0] == "718":
             gw = _pcp_gateway_ip(url)
             if gw:
+                _log_queue.put(f"[IPv4] PCP: ルーター {gw}:5351 へ MAP リクエスト送信中...")
                 pcp_ext_ip, pcp_port = _pcp_map(gw, internal_ip, port)
                 if pcp_port:
                     chosen = pcp_port
@@ -2680,6 +2681,30 @@ def _upnp_open_ipv4(internal_ip: str, port: int) -> str:
                     _log_queue.put(
                         f"[IPv4] PCP: MAP-E許可帯から外部ポート {pcp_port} を自動取得しました"
                         f"（外部 {ext}:{pcp_port}）。次回は UPnP でこのポートを維持します")
+                else:
+                    _log_queue.put(f"[IPv4] PCP: 失敗（ルーターが非対応またはタイムアウト）。ポート帯スキャンを試みます")
+
+        # MAP-E ポート帯スキャン ──────────────────────────────────────────────────
+        # v6プラス系MAP-EのPSIDは4bitなので、許可帯の先頭残余は 0,16,32,...,1008 の64通りのみ。
+        # AddPortMapping を各先頭残余で試し、通ったら帯が判明（そのままそのポートを採用）。
+        # UPnPが通る回線であれば帯が必ず見つかる。最悪64試行≒数秒。
+        if not chosen and last_fault and last_fault[0] == "718":
+            _log_queue.put("[IPv4] MAP-E: ポート帯スキャン開始（最大64試行）...")
+            sweep_residue = None
+            for residue_start in range(0, 1024, 16):
+                sweep_port = 49 * 1024 + residue_start   # 50176〜51200 の範囲
+                ok, f = _try_open(sweep_port)
+                if ok:
+                    sweep_residue = residue_start
+                    chosen = sweep_port   # そのまま採用（既にマッピング登録済み）
+                    _log_queue.put(
+                        f"[IPv4] MAP-E: ポート帯スキャンで残余 {residue_start} を発見、"
+                        f"外部ポート {sweep_port} を開放しました（外部 {ext}:{sweep_port}）")
+                    break
+                if f and f[0] != "718":
+                    break  # 718以外のエラーはUPnP自体の問題なのでスキャン中止
+            if sweep_residue is None:
+                _log_queue.put("[IPv4] MAP-E: ポート帯スキャン失敗（全64残余が718）")
 
         if not chosen:
             if (ext, 0) != (_external_ipv4, _external_ipv4_port):
