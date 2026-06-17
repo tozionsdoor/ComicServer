@@ -77,9 +77,11 @@ class _StartScreenState extends State<_StartScreen> {
 
     if (url != null && token != null && token.isNotEmpty) {
       _setStatus('保存した接続先を確認中…');
-      // 初回/外出先で prefs に直結情報が無いときは、Firebaseの最新接続先で補完する。
-      // これでWebRTCに落ちる前にIPv6/IPv4直結（サーバーがUPnPで開けた外部ポート）を試せる。
-      if (roomId.isNotEmpty && (ipv4Port == 0 || ipv6 == null || ipv6.isEmpty)) {
+      // 常にFirebaseから最新接続先を読んで prefs を上書きする。
+      // IPv6はWindowsのプライバシーアドレス機能で数時間〜数日おきにローテーションするため、
+      // prefs に保存した値はすぐ陳腐化する。UPnPポートもルーター再起動で変わりうる。
+      // Firebase には monitor スレッドが60秒ごとに最新値を書き込んでいるので常に新鮮。
+      if (roomId.isNotEmpty) {
         final host = await FirebaseSignaling.readServerHost(roomId);
         if (host != null) {
           final fv6 = (host['ipv6'] ?? '').toString();
