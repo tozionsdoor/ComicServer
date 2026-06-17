@@ -57,6 +57,21 @@ class FirebaseSignaling {
     await _sessionRef(sessionId).remove();
   }
 
+  /// rooms/{roomId}/host の変化をリアルタイム監視するストリーム。
+  /// WebRTC接続中に直結経路（IPv4/IPv6）が使えるようになったときアプリ側に通知するために使う。
+  /// Firebase onValue はSSE型（変化時のみ受信）なので課金・通信量への影響は軽微。
+  Stream<Map<String, dynamic>> watchHost() =>
+      _db.ref('rooms/$roomId/host').onValue
+          .where((e) => e.snapshot.value is Map)
+          .map((e) {
+            final v = e.snapshot.value as Map;
+            return {
+              'ipv6':      (v['ipv6']      ?? '').toString(),
+              'ipv4':      (v['ipv4']      ?? '').toString(),
+              'ipv4_port': (v['ipv4_port'] is num) ? (v['ipv4_port'] as num).toInt() : 0,
+            };
+          });
+
   /// サーバーがFirebaseに登録した最新の接続先を取得する。
   /// 返り値: {'ipv6': String, 'ipv4': String, 'ipv4_port': int}。失敗・未登録は null。
   /// 初回起動や外出先で prefs に直結情報が無いとき、WebRTCに落ちる前に

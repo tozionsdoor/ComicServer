@@ -1,9 +1,11 @@
 import 'dart:async';
 import 'dart:convert';
+import 'package:firebase_database/firebase_database.dart';
 import 'package:flutter/foundation.dart';   // ValueNotifier
 import 'package:flutter_cache_manager/flutter_cache_manager.dart';
 import 'package:http/http.dart' as http;
 import '../models/book.dart';
+import 'firebase_signaling.dart';
 import 'http_pinned_client.dart';
 import 'webrtc_service.dart';
 
@@ -26,6 +28,8 @@ class ApiService {
   late final CacheManager cacheManager;
 
   Future<bool>? _reconnectInFlight;   // 同時多発の繋ぎ直しを1本に集約
+  StreamSubscription<Map<String, dynamic>>? _hostWatcher; // 直結アップグレード監視
+  bool _upgrading = false;            // _onHostUpdate の多重実行防止
 
   ApiService({
     required this.baseUrl,
@@ -46,7 +50,10 @@ class ApiService {
       maxNrOfCacheObjects: 2000,
       fileService: HttpFileService(httpClient: makePinnedClient(certFingerprint)),
     ));
+    if (viaWebRtc) _startHostWatcher();
   }
+
+  void dispose() => _stopHostWatcher();
 
   String get _auth => 'Bearer $token';
 
@@ -131,6 +138,7 @@ class ApiService {
         if (viaWebRtc) await WebRtcService.instance.dispose();  // 古いP2Pを片付け
         baseUrl = working;
         viaWebRtc = false;
+        _stopHostWatcher();
         return true;
       }
       // 2) WebRTC P2P を張り直す（loopbackポートは変わるのでbaseUrlを差し替え）
@@ -146,6 +154,7 @@ class ApiService {
         if (localUrl != null) {
           baseUrl = localUrl;
           viaWebRtc = true;
+          _startHostWatcher(); // IPv4/IPv6が復活したら自動で直結に切り替える
           return true;
         }
       }
@@ -154,6 +163,66 @@ class ApiService {
       status.value = null;   // バナーを消す（失敗時は呼び出し側がエラー表示を出す）
     }
   }
+
+  // ── 直結アップグレード監視 ──────────────────────────────────────────────────
+  // WebRTC接続中にサーバーがFirebaseの rooms/{id}/host を更新したとき、
+  // IPv4/IPv6直結が使えるなら静かにHTTPへ切り替える。
+  // Firebase onValue はSSEプッシュ型（ポーリングではない）。
+
+  void _startHostWatcher() {
+    if ((roomId ?? '').isEmpty) return;
+    _hostWatcher?.cancel();
+    final sig = FirebaseSignaling(FirebaseDatabase.instance, roomId!);
+    _hostWatcher = sig.watchHost().listen(_onHostUpdate);
+  }
+
+  void _stopHostWatcher() {
+    _hostWatcher?.cancel();
+    _hostWatcher = null;
+    _upgrading = false;
+  }
+
+  Future<void> _onHostUpdate(Map<String, dynamic> host) async {
+    if (!viaWebRtc) { _stopHostWatcher(); return; }
+    if (_upgrading) return;
+    _upgrading = true;
+    try {
+      final ipv6 = (host['ipv6'] ?? '').toString();
+      final ipv4 = (host['ipv4'] ?? '').toString();
+      final p4   = (host['ipv4_port'] as num?)?.toInt() ?? 0;
+      final port = _portFromCandidates();
+
+      final newCands = <String>[
+        if (ipv6.isNotEmpty) 'https://[$ipv6]:$port',
+        if (ipv4.isNotEmpty && p4 > 0) 'https://$ipv4:$p4',
+      ];
+      if (newCands.isEmpty) return;
+
+      final working = await resolveBaseUrl(newCands, token);
+      if (working == null || !viaWebRtc) return;
+
+      await WebRtcService.instance.dispose();
+      baseUrl   = working;
+      viaWebRtc = false;
+      for (final c in newCands) {
+        if (!candidates.contains(c)) candidates.add(c);
+      }
+      _stopHostWatcher();
+      status.value = '直結接続に切り替えました';
+      Future.delayed(const Duration(seconds: 3), () => status.value = null);
+    } finally {
+      _upgrading = false;
+    }
+  }
+
+  int _portFromCandidates() {
+    for (final c in candidates) {
+      final u = Uri.tryParse(c);
+      if (u != null && u.hasPort) return u.port;
+    }
+    return 8765;
+  }
+  // ──────────────────────────────────────────────────────────────────────────
 
   Future<bool> _ping(String base) async {
     try {
