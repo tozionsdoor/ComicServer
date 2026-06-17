@@ -6,6 +6,7 @@ import 'screens/login_screen.dart';
 import 'screens/shelf_screen.dart';
 import 'services/ads_service.dart';
 import 'services/api_service.dart';
+import 'services/firebase_signaling.dart';
 import 'services/webrtc_service.dart';
 
 void main() async {
@@ -64,7 +65,9 @@ class _StartScreenState extends State<_StartScreen> {
     final prefs  = await SharedPreferences.getInstance();
     final url    = prefs.getString('url');
     final token  = prefs.getString('token');
-    final ipv6   = prefs.getString('ipv6');
+    var ipv6   = prefs.getString('ipv6');
+    var ipv4Global = prefs.getString('ipv4_global');
+    var ipv4Port   = prefs.getInt('ipv4_port') ?? 0;
     final roomId = prefs.getString('room_id') ?? '';
     final turnUrl  = prefs.getString('turn_url');
     final turnUser = prefs.getString('turn_username');
@@ -74,7 +77,21 @@ class _StartScreenState extends State<_StartScreen> {
 
     if (url != null && token != null && token.isNotEmpty) {
       _setStatus('保存した接続先を確認中…');
-      final candidates = buildCandidates(primaryUrl: url, ipv6: ipv6);
+      // 初回/外出先で prefs に直結情報が無いときは、Firebaseの最新接続先で補完する。
+      // これでWebRTCに落ちる前にIPv6/IPv4直結（サーバーがUPnPで開けた外部ポート）を試せる。
+      if (roomId.isNotEmpty && (ipv4Port == 0 || ipv6 == null || ipv6.isEmpty)) {
+        final host = await FirebaseSignaling.readServerHost(roomId);
+        if (host != null) {
+          final fv6 = (host['ipv6'] ?? '').toString();
+          final fv4 = (host['ipv4'] ?? '').toString();
+          final fp4 = (host['ipv4_port'] as num?)?.toInt() ?? 0;
+          if (fv6.isNotEmpty) { ipv6 = fv6; await prefs.setString('ipv6', fv6); }
+          if (fv4.isNotEmpty) { ipv4Global = fv4; await prefs.setString('ipv4_global', fv4); }
+          if (fp4 > 0) { ipv4Port = fp4; await prefs.setInt('ipv4_port', fp4); }
+        }
+      }
+      final candidates = buildCandidates(
+          primaryUrl: url, ipv6: ipv6, ipv4Global: ipv4Global, ipv4Port: ipv4Port);
       final working = await ApiService.resolveBaseUrl(candidates, token,
           certFingerprint: certFingerprint);
       if (!mounted) return;
@@ -88,6 +105,10 @@ class _StartScreenState extends State<_StartScreen> {
           if (info == null) return;
           final v6 = (info['ipv6'] ?? '').toString();
           if (v6.isNotEmpty) await prefs.setString('ipv6', v6);
+          final g4 = (info['ipv4_global'] ?? '').toString();
+          if (g4.isNotEmpty) await prefs.setString('ipv4_global', g4);
+          final p4 = (info['ipv4_port'] as num?)?.toInt() ?? 0;
+          if (p4 > 0) await prefs.setInt('ipv4_port', p4);
         });
         await _finish('接続しました', () => ShelfScreen(api: api));
         return;
@@ -115,6 +136,10 @@ class _StartScreenState extends State<_StartScreen> {
             if (info == null) return;
             final v6 = (info['ipv6'] ?? '').toString();
             if (v6.isNotEmpty) await prefs.setString('ipv6', v6);
+            final g4 = (info['ipv4_global'] ?? '').toString();
+            if (g4.isNotEmpty) await prefs.setString('ipv4_global', g4);
+            final p4 = (info['ipv4_port'] as num?)?.toInt() ?? 0;
+            if (p4 > 0) await prefs.setInt('ipv4_port', p4);
           });
           await _finish('P2Pで接続しました', () => ShelfScreen(api: api));
           return;

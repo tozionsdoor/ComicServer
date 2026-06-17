@@ -57,19 +57,26 @@ class FirebaseSignaling {
     await _sessionRef(sessionId).remove();
   }
 
-  /// サーバーが登録した最新のグローバルIPv6アドレスをFirebaseから取得する。
-  /// 取得失敗・未登録の場合は null を返す（接続候補なしとして扱う）。
-  static Future<String?> readServerIpv6(
-      FirebaseDatabase db, String roomId) async {
+  /// サーバーがFirebaseに登録した最新の接続先を取得する。
+  /// 返り値: {'ipv6': String, 'ipv4': String, 'ipv4_port': int}。失敗・未登録は null。
+  /// 初回起動や外出先で prefs に直結情報が無いとき、WebRTCに落ちる前に
+  /// IPv6/IPv4直結の候補を用意するために使う（外部ポートはサーバーがUPnPで開けた値）。
+  static Future<Map<String, dynamic>?> readServerHost(String roomId) async {
+    if (roomId.isEmpty) return null;
     try {
-      final snap = await db
-          .ref('rooms/$roomId/host/ipv6')
+      final snap = await FirebaseDatabase.instance
+          .ref('rooms/$roomId/host')
           .get()
           .timeout(const Duration(seconds: 4));
       final v = snap.value;
-      return (v is String && v.isNotEmpty) ? v : null;
-    } catch (_) {
-      return null;
-    }
+      if (v is Map) {
+        return {
+          'ipv6': (v['ipv6'] ?? '').toString(),
+          'ipv4': (v['ipv4'] ?? '').toString(),
+          'ipv4_port': (v['ipv4_port'] is num) ? (v['ipv4_port'] as num).toInt() : 0,
+        };
+      }
+    } catch (_) {/* 取得失敗時は prefs の値で続行 */}
+    return null;
   }
 }

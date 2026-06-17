@@ -8,6 +8,8 @@ class DiscoveredServer {
   final String host;      // LAN内IPv4
   final int    port;      // TCPポート
   final String ipv6;      // グローバルIPv6（外出先用、無ければ空）
+  final String ipv4Global; // グローバルIPv4（PPPoE等＋UPnP自動開放、無ければ空）
+  final int    ipv4Port;   // UPnPで開けた外部ポート（内部ポートと異なることがある。0=未開放）
   final String token;     // 旧サーバー互換（新サーバーは空）
   final String regNonce;        // 端末登録ノンス（新サーバー）
   final String roomId;          // WebRTC部屋ID
@@ -18,6 +20,8 @@ class DiscoveredServer {
     required this.host,
     required this.port,
     required this.ipv6,
+    this.ipv4Global      = '',
+    this.ipv4Port        = 0,
     this.token           = '',
     this.regNonce        = '',
     required this.roomId,
@@ -54,6 +58,8 @@ Future<List<DiscoveredServer>> discoverServers({
           host:            (m['host']             ?? dg.address.address).toString(),
           port:            (m['port']             as num?)?.toInt() ?? 8765,
           ipv6:            (m['ipv6']             ?? '').toString(),
+          ipv4Global:      (m['ipv4_global']      ?? '').toString(),
+          ipv4Port:        (m['ipv4_port']        as num?)?.toInt() ?? 0,
           token:           (m['token']            ?? '').toString(),
           regNonce:        (m['reg_nonce']        ?? '').toString(),
           roomId:          (m['room_id']          ?? '').toString(),

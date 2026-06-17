@@ -109,6 +109,7 @@ DEFAULT_CONFIG: dict = {
     "room_id":      "",   # WebRTC部屋ID（初回生成。LANペアリングでアプリに渡す）
     "port":         8765,
     "host":         "0.0.0.0",
+    "upnp_ipv4_open": True,  # UPnPでルーターのIPv4ポートを自動開放（PPPoE等でグローバルIPv4を持つ回線向け）
     "on_close":     "ask",   # ウィンドウ×ボタン押下時: "ask"(毎回確認)/"exit"/"tray"
     "on_minimize":  "ask",   # 最小化ボタン押下時:     "ask"(毎回確認)/"minimize"/"tray"
     "firebase":     {},   # 空＝DEFAULT_FIREBASEを使う。値を入れればそれで上書き
@@ -552,7 +553,9 @@ def _connection_info(requester_ip: str = "") -> dict:
                     "service": "comicserver", "name": socket.gethostname(),
                     "room_id": _config.get("room_id", ""),
                     "host": get_local_ip(), "port": int(_config.get("port", 8765)),
-                    "ipv6": get_global_ipv6(), "reg_nonce": nonce,
+                    "ipv6": get_global_ipv6(), "ipv4_global": _external_ipv4,
+                    "ipv4_port": _external_ipv4_port,
+                    "reg_nonce": nonce,
                     "cert_fingerprint": _cert_fingerprint,
                 }
     nonce = secrets.token_urlsafe(16)
@@ -567,7 +570,9 @@ def _connection_info(requester_ip: str = "") -> dict:
         "service": "comicserver", "name": socket.gethostname(),
         "room_id": _config.get("room_id", ""),
         "host": get_local_ip(), "port": int(_config.get("port", 8765)),
-        "ipv6": get_global_ipv6(), "reg_nonce": nonce,
+        "ipv6": get_global_ipv6(), "ipv4_global": _external_ipv4,
+        "ipv4_port": _external_ipv4_port,
+        "reg_nonce": nonce,
         "cert_fingerprint": _cert_fingerprint,
     }
 
@@ -2209,21 +2214,35 @@ def start_webrtc_signaling() -> None:
 
 
 # ─── IPv6監視 + UPnP + Firebase登録 ──────────────────────────────────────────
-def _upnp_ssdp_discover(timeout: float = 2.0) -> str:
-    """SSDP M-SEARCH で WANIPv6FirewallControl:1 に対応したルーターを探す。
+def _upnp_ssdp_discover(
+    service_type: str = "urn:schemas-upnp-org:service:WANIPv6FirewallControl:1",
+    timeout: float = 2.0,
+) -> str:
+    """SSDP M-SEARCH で指定サービス（既定: WANIPv6FirewallControl:1）に対応したルーターを探す。
     見つかれば device description の URL を返す。見つからなければ空文字。"""
     msg = (
         "M-SEARCH * HTTP/1.1\r\n"
         "HOST: 239.255.255.250:1900\r\n"
         'MAN: "ssdp:discover"\r\n'
         "MX: 2\r\n"
-        "ST: urn:schemas-upnp-org:service:WANIPv6FirewallControl:1\r\n"
+        f"ST: {service_type}\r\n"
         "\r\n"
     ).encode()
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
         sock.settimeout(timeout)
         sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+        # 複数NIC環境（VirtualBox/Hyper-V/WSL等の仮想アダプタ）では、マルチキャストが
+        # 既定で別IF（169.254や192.168.56等）から出てルーターに届かないことがある。
+        # 既定ルートのLAN IFを明示してそこから送受信する。
+        try:
+            lan_ip = get_local_ip()
+            if lan_ip and not lan_ip.startswith("169.254"):
+                sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF,
+                                socket.inet_aton(lan_ip))
+                sock.bind((lan_ip, 0))
+        except OSError:
+            pass
         try:
             sock.sendto(msg, ("239.255.255.250", 1900))
             while True:
@@ -2241,23 +2260,25 @@ def _upnp_ssdp_discover(timeout: float = 2.0) -> str:
     return ""
 
 
-def _upnp_get_control_url(location: str) -> tuple[str, str]:
-    """device description XML から WANIPv6FirewallControl:1 の controlURL を取得する。
-    戻り値: (control_url, base_url)。失敗時は両方空文字。"""
+def _upnp_get_control_url(
+    location: str, service_match: str = "WANIPv6FirewallControl",
+) -> tuple[str, str, str]:
+    """device description XML から service_match を含むサービスの controlURL を取得する。
+    戻り値: (control_url, base_url, service_type)。失敗時は3つとも空文字。"""
     import urllib.request as _ur
     import xml.etree.ElementTree as ET
     try:
         with _ur.urlopen(location, timeout=5) as r:
             xml_data = r.read()
     except Exception:
-        return "", ""
+        return "", "", ""
     # http://host:port 部分を base_url として確保
     parts = location.split("/")
     base_url = "/".join(parts[:3])
     try:
         root = ET.fromstring(xml_data)
     except ET.ParseError:
-        return "", ""
+        return "", "", ""
     # UPnP device description は namespace を使うので tag を部分一致で探す
     for elem in root.iter():
         tag = elem.tag.split("}")[-1] if "}" in elem.tag else elem.tag
@@ -2269,9 +2290,9 @@ def _upnp_get_control_url(location: str) -> tuple[str, str]:
                     stype = child.text or ""
                 elif ctag == "controlURL":
                     ctrl = child.text or ""
-            if "WANIPv6FirewallControl" in stype and ctrl:
-                return ctrl, base_url
-    return "", ""
+            if service_match in stype and ctrl:
+                return ctrl, base_url, stype
+    return "", "", ""
 
 
 def _upnp_add_pinhole(base_url: str, ctrl_path: str, ipv6: str, port: int) -> None:
@@ -2314,7 +2335,7 @@ def _upnp_open_ipv6(ipv6: str, port: int) -> bool:
         if not location:
             _log_queue.put("[IPv6] UPnP: IPv6ファイアウォール制御対応ルーターが見つかりません")
             return False
-        ctrl, base = _upnp_get_control_url(location)
+        ctrl, base, _ = _upnp_get_control_url(location)
         if not ctrl:
             _log_queue.put("[IPv6] UPnP: ルーターがIPv6ピンホールに非対応です")
             return False
@@ -2326,10 +2347,275 @@ def _upnp_open_ipv6(ipv6: str, port: int) -> bool:
         return False
 
 
+# ─── IPv4 UPnPポート開放（PPPoE等でグローバルIPv4を持つ回線向け） ───────────────────
+_external_ipv4: str = ""                      # 直近に確認したグローバルIPv4（connection-infoで公開）
+_external_ipv4_port: int = 0                  # UPnPで開けた外部ポート（内部ポートと異なる場合あり。0=未開放）
+_upnp_v4: dict = {"url": "", "stype": ""}     # 探索済みWAN接続サービスのキャッシュ（再SSDP回避）
+
+
+def _is_global_ipv4(ip: str) -> bool:
+    """グローバル（外部到達可能）なIPv4か。プライベート/CGN(100.64/10)/ループバック等はFalse。"""
+    try:
+        return ipaddress.IPv4Address(ip).is_global
+    except Exception:
+        return False
+
+
+def _upnp_fault(resp: str):
+    """SOAPレスポンスがUPnPエラー（フォルト）なら (errorCode, errorDescription) を返す。
+    正常レスポンスなら None。"""
+    # ルーターは <errorCode xmlns="">714</errorCode> のように属性付きで返すことがある
+    m = re.search(r"<errorCode[^>]*>(\w+)</errorCode>", resp)
+    if not m:
+        return None
+    d = re.search(r"<errorDescription[^>]*>(.*?)</errorDescription>", resp)
+    return (m.group(1), (d.group(1).strip() if d else ""))
+
+
+def _upnp_soap(url: str, service_type: str, action: str, body_args: str = "") -> str:
+    """指定 controlURL に SOAP アクションを投げ、レスポンス本文を返す。
+    UPnPはエラーをHTTP 500＋SOAPフォルト本文（<errorCode>）で返すため、
+    500時も例外にせず本文を返す（呼び出し側は _upnp_fault でコードを判定する）。"""
+    import urllib.request as _ur
+    import urllib.error as _ue
+    body = (
+        '<?xml version="1.0"?>'
+        '<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"'
+        ' s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">'
+        "<s:Body>"
+        f'<u:{action} xmlns:u="{service_type}">{body_args}</u:{action}>'
+        "</s:Body></s:Envelope>"
+    ).encode()
+    req = _ur.Request(
+        url, data=body,
+        headers={
+            "Content-Type": 'text/xml; charset="utf-8"',
+            "SOAPAction": f'"{service_type}#{action}"',
+        },
+    )
+    try:
+        with _ur.urlopen(req, timeout=5) as r:
+            return r.read().decode("utf-8", "replace")
+    except _ue.HTTPError as e:
+        # SOAPフォルトは HTTP 500 + 本文で返る。本文を読めればエラーコードを拾える
+        try:
+            return e.read().decode("utf-8", "replace")
+        except Exception:
+            return f"<errorCode>HTTP{e.code}</errorCode>"
+
+
+def _upnp_discover_wan_ipv4() -> tuple[str, str]:
+    """ルーターのIPv4 WAN接続サービスを探す。戻り値: (control_url, service_type)。失敗時は両方空文字。
+    サービス単位の検索(PPP→IP)を先に試し、ダメならIGDデバイスを取得してXMLから探す。"""
+    attempts = [
+        ("urn:schemas-upnp-org:service:WANPPPConnection:1", "WANPPPConnection"),
+        ("urn:schemas-upnp-org:service:WANIPConnection:1",  "WANIPConnection"),
+        ("urn:schemas-upnp-org:device:InternetGatewayDevice:1", "WANPPPConnection"),
+        ("urn:schemas-upnp-org:device:InternetGatewayDevice:1", "WANIPConnection"),
+    ]
+    for st, match in attempts:
+        location = _upnp_ssdp_discover(st)
+        if not location:
+            continue
+        ctrl, base, stype = _upnp_get_control_url(location, match)
+        if ctrl:
+            url = base + ctrl if ctrl.startswith("/") else base + "/" + ctrl
+            return url, stype
+    return "", ""
+
+
+def _upnp_list_mapped_ports(url: str, stype: str, limit: int = 64) -> list[int]:
+    """既存ポートマッピングの外部ポート番号を列挙する（読み取り専用）。
+    MAP-E(v6プラス系)回線で「利用可能なポート帯」(mod 1024 の剰余)を学習するのに使う。
+    既に通っているマッピング(例: Plex)は許可帯の中にあるので、同じ剰余なら確実に通る。"""
+    out: list[int] = []
+    for i in range(limit):
+        try:
+            resp = _upnp_soap(url, stype, "GetGenericPortMappingEntry",
+                              f"<NewPortMappingIndex>{i}</NewPortMappingIndex>")
+        except Exception:
+            break
+        if _upnp_fault(resp):                 # 713 SpecifiedArrayIndexInvalid 等＝末尾
+            break
+        m = re.search(r"<NewExternalPort>(\d+)</NewExternalPort>", resp)
+        if m:
+            out.append(int(m.group(1)))
+    return out
+
+
+def _upnp_open_ipv4(internal_ip: str, port: int) -> str:
+    """UPnP IGD(v1) でIPv4ポートを自動開放し、ルーターのグローバルIPv4を返す。
+    グローバルIPv4が無い（CGN/MAP-E回線）・ルーター非対応・設定OFF なら空文字。
+    毎回呼ぶことでポートマッピングのリースも更新される。失敗してもサーバーは動き続ける。"""
+    global _external_ipv4, _external_ipv4_port
+    if not _config.get("upnp_ipv4_open", True):
+        return ""
+    try:
+        if not _upnp_v4["url"]:
+            url, stype = _upnp_discover_wan_ipv4()
+            if not url:
+                _log_queue.put("[IPv4] UPnP: IPv4ポート開放対応ルーターが見つかりません")
+                return ""
+            _upnp_v4["url"], _upnp_v4["stype"] = url, stype
+        url, stype = _upnp_v4["url"], _upnp_v4["stype"]
+        resp = _upnp_soap(url, stype, "GetExternalIPAddress")
+        fault = _upnp_fault(resp)
+        if fault:
+            _log_queue.put(f"[IPv4] UPnP: 外部IP取得を拒否されました (code={fault[0]} {fault[1]})")
+            _external_ipv4 = ""
+            _external_ipv4_port = 0
+            return ""
+        m = re.search(r"<NewExternalIPAddress>(.*?)</NewExternalIPAddress>", resp)
+        ext = m.group(1).strip() if m else ""
+        if not ext or not _is_global_ipv4(ext):
+            if ext and ext != _external_ipv4:
+                _log_queue.put(
+                    f"[IPv4] グローバルでないIPv4（{ext}）のため自動開放をスキップ"
+                    "（CGN/MAP-E回線の可能性。WebRTC/IPv6で接続してください）")
+            _external_ipv4 = ""
+            _external_ipv4_port = 0
+            return ""
+
+        def _add(ext_port: int, lease: int) -> str:
+            return _upnp_soap(
+                url, stype, "AddPortMapping",
+                "<NewRemoteHost></NewRemoteHost>"
+                f"<NewExternalPort>{ext_port}</NewExternalPort>"
+                "<NewProtocol>TCP</NewProtocol>"
+                f"<NewInternalPort>{port}</NewInternalPort>"
+                f"<NewInternalClient>{internal_ip}</NewInternalClient>"
+                "<NewEnabled>1</NewEnabled>"
+                "<NewPortMappingDescription>ArcHive</NewPortMappingDescription>"
+                f"<NewLeaseDuration>{lease}</NewLeaseDuration>")
+
+        def _del(ext_port: int) -> None:
+            _upnp_soap(
+                url, stype, "DeletePortMapping",
+                "<NewRemoteHost></NewRemoteHost>"
+                f"<NewExternalPort>{ext_port}</NewExternalPort>"
+                "<NewProtocol>TCP</NewProtocol>")
+
+        def _mapped(ext_port: int) -> bool:
+            chk = _upnp_soap(
+                url, stype, "GetSpecificPortMappingEntry",
+                "<NewRemoteHost></NewRemoteHost>"
+                f"<NewExternalPort>{ext_port}</NewExternalPort>"
+                "<NewProtocol>TCP</NewProtocol>")
+            # フォルト（714 NoSuchEntryInArray 等）なら実際には未登録
+            return _upnp_fault(chk) is None
+
+        # ── 外部ポートの選定 ───────────────────────────────────────────────
+        # まず内部ポートと同じ番号（普通のルーターはこれで通り、外部=内部で単純）。
+        # ダメな場合に備えMAP-E（v6プラス系のIPv4 over IPv6）を考慮する。MAP-Eはグローバル
+        # IPv4が複数ユーザーで共有され、使えるTCPポートがPSIDで決まる飛び飛びの帯に限られる
+        # （帯の外は 718 で拒否）。既存マッピング(例: Plex)や前回成功ポートの「下位10bit
+        # (mod 1024)」は許可帯に入っているので、同じ剰余の高位ポートを候補にすれば確実に通る。
+        # 直近成功ポートは config に控え次回最優先で試す（外部ポートを安定させアプリの学習を保つ）。
+        def _try_open(ext_port: int):
+            resp = _add(ext_port, 0)            # 永続リース(0)優先（NTT系は有限リースを725で拒否）
+            f = _upnp_fault(resp)
+            if f and f[0] == "718":             # 衝突：自分の古い割当なら消して再登録
+                try:
+                    _del(ext_port)
+                except Exception:
+                    pass
+                resp = _add(ext_port, 0)
+                f = _upnp_fault(resp)
+            if f and f[0] != "718":             # 永続拒否(725)等は有限リースで再試行
+                resp = _add(ext_port, 3600)
+                f = _upnp_fault(resp)
+            if f:
+                return (False, f)
+            return (_mapped(ext_port), None)    # 成功応答でも実登録を確認（黙殺対策）
+
+        chosen = 0
+        last_fault = None
+        attempts: list[str] = []
+        prev = int(_config.get("upnp_external_port", 0) or 0)
+
+        # 1) キャッシュ済み成功ポートを最優先（普段の60秒ループはここでリース更新して終わり）
+        if prev:
+            ok, f = _try_open(prev)
+            if ok:
+                chosen = prev
+            elif f:
+                last_fault = f
+                attempts.append(f"{prev}=NG({f[0]})")
+
+        # 2) 未確定なら候補を組み立てて順に試す
+        if not chosen:
+            cands: list[int] = [port]
+            existing = _upnp_list_mapped_ports(url, stype)   # 既存マッピング（読み取り専用）
+            residues: list[int] = []
+            if prev:
+                residues.append(prev % 1024)
+            for ep in existing:
+                if ep % 1024 not in residues:
+                    residues.append(ep % 1024)
+            taken = set(existing)
+            for r in residues:                  # MAP-E許可帯（既存ポートと同じ剰余）の高位ポート
+                for n in (49, 50, 51, 48):
+                    p = n * 1024 + r
+                    if 1024 <= p <= 65535 and p != port and p not in taken:
+                        cands.append(p)
+            base = 49152 + (port % 16000)        # 非MAP-E（普通の）ルーター用の高位フォールバック
+            for off in (0, 277):
+                p = base + off
+                cands.append(p - 16000 if p > 65535 else p)
+            seen: set[int] = set()
+            cands = [p for p in cands
+                     if p and p != prev and not (p in seen or seen.add(p))]
+            for ext_port in cands:
+                ok, f = _try_open(ext_port)
+                if ok:
+                    chosen = ext_port
+                    break
+                if f:
+                    last_fault = f
+                    attempts.append(f"{ext_port}=NG({f[0]})")
+                else:
+                    attempts.append(f"{ext_port}=黙殺")
+
+        if not chosen:
+            if (ext, 0) != (_external_ipv4, _external_ipv4_port):
+                _log_queue.put(f"[IPv4] UPnP: ポート開放の試行結果 [{', '.join(attempts)}]")
+                if last_fault:
+                    _log_queue.put(
+                        f"[IPv4] UPnP: ポート開放を拒否されました (code={last_fault[0]} {last_fault[1]})。"
+                        "MAP-E(v6プラス系)で利用可能ポート帯を特定できないか、UPnP追加不可のルーターの可能性"
+                        "（IPv6/WebRTCで接続してください）")
+                else:
+                    _log_queue.put(
+                        "[IPv4] UPnP: ルーターがポート開放を受理しませんでした（マッピング未登録）。"
+                        "ルーターのUPnP設定をご確認ください")
+            _external_ipv4 = ""
+            _external_ipv4_port = 0
+            return ""
+
+        _config["upnp_external_port"] = chosen   # 次回最優先で試す（外部ポートの安定化）
+        if (ext, chosen) != (_external_ipv4, _external_ipv4_port):
+            if chosen == port:
+                _log_queue.put(f"[IPv4] UPnP: TCPポート {port} を自動開放しました（外部 {ext}:{port}）")
+            else:
+                _log_queue.put(
+                    f"[IPv4] UPnP: 外部ポート {chosen}→内部 {port} を自動開放しました（外部 {ext}:{chosen}）")
+        _external_ipv4 = ext
+        _external_ipv4_port = chosen
+        return ext
+    except Exception as e:
+        _log_queue.put(f"[IPv4] UPnP: 失敗 ({e})")
+        _upnp_v4["url"] = ""          # 次回は再探索（controlURLが変わった可能性に備える）
+        _external_ipv4 = ""
+        _external_ipv4_port = 0
+        return ""
+
+
 def _ipv6_monitor_thread() -> None:
-    """サーバーのグローバルIPv6アドレスを60秒ごとに監視する。
-    起動時と変化時にFirebaseへ登録し、UPnPでルーターのFWを開放する。
-    Firebase未設定 / IPv6なし環境では即終了（LAN動作に影響なし）。"""
+    """サーバーのグローバルIPv6/IPv4アドレスを60秒ごとに監視する。
+    変化時にFirebaseへ登録し、UPnPでルーターのIPv6 FW（ピンホール）と
+    IPv4ポート（PPPoE等でグローバルIPv4がある回線）を自動開放する。
+    IPv4ポートマッピングは毎ループ呼び出しでリースを更新する。
+    Firebase未設定 / IPv6・IPv4なし環境では該当処理をスキップ（LAN動作に影響なし）。"""
     global _ipv6_monitor_running
     fb = _fb_cfg()
     if not fb:
@@ -2349,25 +2635,37 @@ def _ipv6_monitor_thread() -> None:
     auth: dict = {"api_key": fb["api_key"], "token": token}
 
     last_ipv6 = ""
+    last_ipv4 = ""
+    last_ipv4_port = 0
     while _ipv6_monitor_running:
+        changed = False
         ipv6 = get_global_ipv6()
-        if ipv6 != last_ipv6:
-            if ipv6:
-                _upnp_open_ipv6(ipv6, port)
-                try:
-                    _fb_put_retry(
-                        fb["database_url"],
-                        f"rooms/{room_id}/host",
-                        {"ipv6": ipv6, "ts": int(time.time())},
-                        auth,
-                    )
-                    if last_ipv6:
-                        _log_queue.put(f"[IPv6] アドレス変更を検知 → Firebase更新: {ipv6}")
-                    else:
-                        _log_queue.put(f"[IPv6] Firebase登録完了: {ipv6}")
-                except Exception as e:
-                    _log_queue.put(f"[IPv6] Firebase更新エラー: {e}")
+        if ipv6 and ipv6 != last_ipv6:
+            _upnp_open_ipv6(ipv6, port)       # IPv6 FWはアドレス変化時に開く
             last_ipv6 = ipv6
+            changed = True
+
+        # IPv4は毎ループ呼び出し＝ポートマッピングのリース更新も兼ねる（設定OFF/非対応なら""）。
+        ext_v4 = _upnp_open_ipv4(get_local_ip(), port)
+        if (ext_v4, _external_ipv4_port) != (last_ipv4, last_ipv4_port):
+            last_ipv4 = ext_v4
+            last_ipv4_port = _external_ipv4_port
+            changed = True
+
+        if changed:
+            try:
+                _fb_put_retry(
+                    fb["database_url"],
+                    f"rooms/{room_id}/host",
+                    {"ipv6": last_ipv6, "ipv4": last_ipv4,
+                     "ipv4_port": last_ipv4_port, "ts": int(time.time())},
+                    auth,
+                )
+                _log_queue.put(
+                    f"[接続情報] Firebase更新: IPv6={last_ipv6 or 'なし'} / "
+                    f"IPv4={(f'{last_ipv4}:{last_ipv4_port}' if last_ipv4 else 'なし')}")
+            except Exception as e:
+                _log_queue.put(f"[接続情報] Firebase更新エラー: {e}")
         # 60秒待機（1秒刻みで終了フラグをチェックするので即座に止まれる）
         for _ in range(60):
             if not _ipv6_monitor_running:
@@ -2564,15 +2862,23 @@ class App(tk.Tk):
                  wraplength=240, justify="left").grid(
             row=1, column=0, columnspan=2, sticky="w", padx=8, pady=(2, 0))
 
+        # 外部からのIPv4自動接続（UPnPでルーターのポートを自動開放）
+        self._upnp4_var = tk.BooleanVar(value=bool(_config.get("upnp_ipv4_open", True)))
+        tk.Checkbutton(
+            rf, text="外部からのIPv4自動接続を許可（UPnP）",
+            variable=self._upnp4_var, bg=BG, fg=FG_DIM, selectcolor=PANEL,
+            activebackground=BG, activeforeground=FG, font=("Yu Gothic UI", 8),
+            anchor="w").grid(row=2, column=0, columnspan=2, sticky="w", padx=6, pady=(4, 0))
+
         tk.Button(rf, text="設定を保存", bg="#2a2a4a", fg=FG, relief="flat",
                   font=("Yu Gothic UI", 9), padx=8,
                   command=self._save_settings).grid(
-            row=2, column=0, columnspan=2, pady=(8, 4))
+            row=3, column=0, columnspan=2, pady=(8, 4))
 
         tk.Button(rf, text="端末管理...", bg="#1a2a3a", fg=ACCENT, relief="flat",
                   font=("Yu Gothic UI", 9), padx=8,
                   command=self._manage_devices).grid(
-            row=3, column=0, columnspan=2, pady=(0, 4))
+            row=4, column=0, columnspan=2, pady=(0, 4))
 
     def _build_log(self):
         f = tk.Frame(self, bg=BG)
@@ -2661,8 +2967,9 @@ class App(tk.Tk):
         except ValueError:
             messagebox.showerror("エラー", "ポート番号は整数で入力してください")
             return
+        _config["upnp_ipv4_open"] = bool(self._upnp4_var.get())
         save_config(_config)
-        self._log("設定を保存しました")
+        self._log("設定を保存しました（IPv4自動開放の変更は60秒以内に反映）")
 
     # ── 端末管理 ─────────────────────────────────────────────────────────────────
     def _manage_devices(self):

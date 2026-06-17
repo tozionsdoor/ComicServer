@@ -103,7 +103,8 @@ class _LoginScreenState extends State<LoginScreen> {
                     style: const TextStyle(color: Color(0xFFcdd6f4))),
                 subtitle: Text(
                     '${s.host}:${s.port}'
-                    '${s.ipv6.isNotEmpty ? '   ・IPv6あり' : ''}',
+                    '${s.ipv6.isNotEmpty ? '   ・IPv6あり' : ''}'
+                    '${s.ipv4Global.isNotEmpty ? '   ・IPv4直結可' : ''}',
                     style: const TextStyle(color: Color(0xFFa6adc8))),
                 onTap: () => Navigator.pop(ctx, s),
               ),
@@ -125,6 +126,8 @@ class _LoginScreenState extends State<LoginScreen> {
         });
         final prefs = await SharedPreferences.getInstance();
         await prefs.setString('ipv6', selected.ipv6);
+        await prefs.setString('ipv4_global', selected.ipv4Global);
+        await prefs.setInt('ipv4_port', selected.ipv4Port);
         if (selected.roomId.isNotEmpty) {
           await prefs.setString('room_id', selected.roomId);
         }
@@ -139,6 +142,8 @@ class _LoginScreenState extends State<LoginScreen> {
     final deviceId = await DeviceService.getDeviceId();
     final baseUrl  = server.baseUrl;
     await prefs.setString('ipv6', server.ipv6);
+    await prefs.setString('ipv4_global', server.ipv4Global);
+    await prefs.setInt('ipv4_port', server.ipv4Port);
     if (server.roomId.isNotEmpty) await prefs.setString('room_id', server.roomId);
     // フィンガープリントを保存し、以降の接続でピン留めに使う
     _certFingerprint = server.certFingerprint;
@@ -236,9 +241,12 @@ class _LoginScreenState extends State<LoginScreen> {
   Future<void> _saveAndNavigate(String baseUrl, String token) async {
     final prefs           = await SharedPreferences.getInstance();
     final ipv6            = prefs.getString('ipv6');
+    final ipv4Global      = prefs.getString('ipv4_global');
+    final ipv4Port        = prefs.getInt('ipv4_port') ?? 0;
     final roomId          = prefs.getString('room_id') ?? '';
     final certFingerprint = prefs.getString('cert_fingerprint') ?? '';
-    final candidates      = buildCandidates(primaryUrl: baseUrl, ipv6: ipv6);
+    final candidates      = buildCandidates(
+        primaryUrl: baseUrl, ipv6: ipv6, ipv4Global: ipv4Global, ipv4Port: ipv4Port);
     await prefs.setString('url',   baseUrl);
     await prefs.setString('token', token);
     final working = await ApiService.resolveBaseUrl(candidates, token,
@@ -264,6 +272,10 @@ class _LoginScreenState extends State<LoginScreen> {
       final pr = await SharedPreferences.getInstance();
       final v6 = (info['ipv6'] ?? '').toString();
       if (v6.isNotEmpty) await pr.setString('ipv6', v6);
+      final g4 = (info['ipv4_global'] ?? '').toString();
+      if (g4.isNotEmpty) await pr.setString('ipv4_global', g4);
+      final p4 = (info['ipv4_port'] as num?)?.toInt() ?? 0;
+      if (p4 > 0) await pr.setInt('ipv4_port', p4);
       final rid = (info['room_id'] ?? '').toString();
       if (rid.isNotEmpty) await pr.setString('room_id', rid);
     });
@@ -280,9 +292,12 @@ class _LoginScreenState extends State<LoginScreen> {
     await prefs.setString('turn_username',   _turnUserCtrl.text.trim());
     await prefs.setString('turn_credential', _turnCredCtrl.text.trim());
     final ipv6            = prefs.getString('ipv6');
+    final ipv4Global      = prefs.getString('ipv4_global');
+    final ipv4Port        = prefs.getInt('ipv4_port') ?? 0;
     final roomId          = prefs.getString('room_id') ?? '';
     final certFingerprint = prefs.getString('cert_fingerprint') ?? '';
-    final candidates = buildCandidates(primaryUrl: url, ipv6: ipv6);
+    final candidates = buildCandidates(
+        primaryUrl: url, ipv6: ipv6, ipv4Global: ipv4Global, ipv4Port: ipv4Port);
     final working = await ApiService.resolveBaseUrl(candidates, token,
         certFingerprint: certFingerprint);
 

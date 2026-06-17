@@ -247,6 +247,15 @@ class ApiService {
           final url = 'https://[$v6]:$port';
           if (!candidates.contains(url)) candidates.add(url);
         }
+        final g4 = (info['ipv4_global'] ?? '').toString();
+        if (g4.isNotEmpty) {
+          // 外部ポートはサーバーがUPnPで実際に開けた値（内部ポートと異なることがある）
+          final p4 = (info['ipv4_port'] as num?)?.toInt() ?? 0;
+          final p = Uri.tryParse(baseUrl);
+          final port = p4 > 0 ? p4 : ((p != null && p.hasPort) ? p.port : 8765);
+          final url = 'https://$g4:$port';
+          if (!candidates.contains(url)) candidates.add(url);
+        }
         return info;
       }
     } catch (_) {}
@@ -268,10 +277,14 @@ class ApiService {
 /// 保存済み設定から接続候補URLを優先順に作る（重複は除去）。
 /// 1) primaryUrl（LAN直 / 手動。VPN接続中もLAN IPで到達できる）
 /// 2) [ipv6]:port（IPv6が使える回線で勝つ）
+/// 3) ipv4Global:ipv4Port（PPPoE等でグローバルIPv4があり、UPnPでポート開放済みの回線で勝つ。
+///    外部ポートはサーバーが実際に開けた値で、内部ポートと異なることがある＝指定なければprimaryのport）
 /// 遠隔時の最後の保険は Phase 2 で WebRTC 候補として足す。
 List<String> buildCandidates({
   required String primaryUrl,
   String? ipv6,
+  String? ipv4Global,
+  int? ipv4Port,
 }) {
   final list = <String>[];
   void add(String? u) {
@@ -289,6 +302,12 @@ List<String> buildCandidates({
     final p = Uri.tryParse(primaryUrl);
     final port = (p != null && p.hasPort) ? p.port : 8765;
     add('https://[$ipv6]:$port');
+  }
+  if (ipv4Global != null && ipv4Global.isNotEmpty) {
+    final p = Uri.tryParse(primaryUrl);
+    final defPort = (p != null && p.hasPort) ? p.port : 8765;
+    final port = (ipv4Port != null && ipv4Port > 0) ? ipv4Port : defPort;
+    add('https://$ipv4Global:$port');
   }
   return list;
 }
