@@ -2443,6 +2443,94 @@ def _upnp_list_mapped_ports(url: str, stype: str, limit: int = 64) -> list[int]:
     return out
 
 
+def _pcp_gateway_ip(control_url: str) -> str:
+    """UPnP controlURL（例: http://192.168.1.1:49000/...）からルーターのIPv4アドレスを抽出する。"""
+    try:
+        from urllib.parse import urlparse
+        host = urlparse(control_url).hostname or ""
+        # IPv4かどうか簡易チェック（IPv6リテラルは除外）
+        socket.inet_aton(host)
+        return host
+    except Exception:
+        return ""
+
+
+def _pcp_map(gateway_ip: str, internal_ip: str, internal_port: int,
+             lifetime: int = 7200) -> tuple[str, int]:
+    """PCP (RFC 6887) MAP opcode でルーターにTCPポートマッピングを要求する。
+    suggested_external_port=0 にすることでルーターが MAP-E 許可帯から自動選択して返す。
+    UPnP AddPortMapping が全ポート 718 (ConflictInMappingEntry) になる新規MAP-Eユーザーへの対応。
+    戻り値: (assigned_ext_ip, assigned_ext_port)。失敗は ("", 0)。"""
+    PCP_PORT = 5351
+    OPCODE_MAP = 1
+    PROTO_TCP = 6
+
+    # クライアント IP を IPv4-mapped IPv6 形式 (::ffff:x.x.x.x) に変換
+    try:
+        client_ip128 = b'\x00' * 10 + b'\xff\xff' + socket.inet_aton(internal_ip)
+    except OSError:
+        return ("", 0)
+
+    nonce = os.urandom(12)
+
+    # Common Request Header (24 bytes): version | R=0|opcode | reserved(2) | lifetime(4) | client_ip(16)
+    header = struct.pack("!BBHI16s", 2, OPCODE_MAP, 0, lifetime, client_ip128)
+    # MAP Opcode Request (36 bytes): nonce(12) | protocol(1) | reserved(3) | int_port(2) | sug_ext_port(2) | sug_ext_ip(16)
+    map_body = struct.pack(
+        "!12sB3sHH16s",
+        nonce, PROTO_TCP, b'\x00\x00\x00',
+        internal_port,
+        0,              # suggested_external_port=0 → ルーターが許可帯から選ぶ
+        b'\x00' * 16,  # suggested_external_ip=all-zero → ルーターが選ぶ
+    )
+    request = header + map_body  # 60 bytes
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(3.0)
+    try:
+        sock.sendto(request, (gateway_ip, PCP_PORT))
+        data, _ = sock.recvfrom(1100)
+    except (socket.timeout, OSError):
+        return ("", 0)
+    finally:
+        sock.close()
+
+    if len(data) < 60:
+        return ("", 0)
+
+    # Response header: version(0) | R=1|opcode(1) | reserved(2) | result_code(3) | lifetime(4-7) | epoch(8-11) | reserved(12-23)
+    version = data[0]
+    r_opcode = data[1]   # MAP response: R=1(bit7) | opcode=1 → 0x81
+    result_code = data[3]
+    if version != 2 or r_opcode != 0x81 or result_code != 0:
+        return ("", 0)
+
+    # MAP Opcode Response at offset 24: nonce(12) | proto(1) | reserved(3) | int_port(2) | ext_port(2) | ext_ip(16)
+    resp_nonce = data[24:36]
+    if resp_nonce != nonce:  # nonce不一致は他クライアントのレスポンスか改ざん
+        return ("", 0)
+
+    assigned_ext_port = struct.unpack_from("!H", data, 42)[0]
+    assigned_ext_ip_raw = data[44:60]
+
+    if assigned_ext_port == 0:
+        return ("", 0)
+
+    # IPv4-mapped IPv6 (::ffff:x.x.x.x) を IPv4文字列に変換
+    if assigned_ext_ip_raw[:12] == b'\x00' * 10 + b'\xff\xff':
+        try:
+            ext_ip = socket.inet_ntoa(assigned_ext_ip_raw[12:])
+        except OSError:
+            ext_ip = ""
+    else:
+        try:
+            ext_ip = socket.inet_ntop(socket.AF_INET6, assigned_ext_ip_raw)
+        except OSError:
+            ext_ip = ""
+
+    return (ext_ip, assigned_ext_port)
+
+
 def _upnp_open_ipv4(internal_ip: str, port: int) -> str:
     """UPnP IGD(v1) でIPv4ポートを自動開放し、ルーターのグローバルIPv4を返す。
     グローバルIPv4が無い（CGN/MAP-E回線）・ルーター非対応・設定OFF なら空文字。
@@ -2575,6 +2663,23 @@ def _upnp_open_ipv4(internal_ip: str, port: int) -> str:
                     attempts.append(f"{ext_port}=NG({f[0]})")
                 else:
                     attempts.append(f"{ext_port}=黙殺")
+
+        # PCP (RFC 6887) フォールバック ─────────────────────────────────────────
+        # UPnP AddPortMapping が全て 718 (ConflictInMappingEntry) で失敗した場合、
+        # MAP-E 回線で許可ポート帯を事前に特定できなかった可能性が高い。
+        # PCP の MAP opcode は suggested_external_port=0 にするとルーターが
+        # 許可帯から自動的にポートを割り当てて返すので、帯の知識が不要。
+        if not chosen and last_fault and last_fault[0] == "718":
+            gw = _pcp_gateway_ip(url)
+            if gw:
+                pcp_ext_ip, pcp_port = _pcp_map(gw, internal_ip, port)
+                if pcp_port:
+                    chosen = pcp_port
+                    if _is_global_ipv4(pcp_ext_ip):
+                        ext = pcp_ext_ip
+                    _log_queue.put(
+                        f"[IPv4] PCP: MAP-E許可帯から外部ポート {pcp_port} を自動取得しました"
+                        f"（外部 {ext}:{pcp_port}）。次回は UPnP でこのポートを維持します")
 
         if not chosen:
             if (ext, 0) != (_external_ipv4, _external_ipv4_port):
