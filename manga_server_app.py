@@ -2424,24 +2424,6 @@ def _upnp_discover_wan_ipv4() -> tuple[str, str]:
     return "", ""
 
 
-def _upnp_list_mapped_ports(url: str, stype: str, limit: int = 64) -> list[int]:
-    """既存ポートマッピングの外部ポート番号を列挙する（読み取り専用）。
-    MAP-E(v6プラス系)回線で「利用可能なポート帯」(mod 1024 の剰余)を学習するのに使う。
-    既に通っているマッピング(例: Plex)は許可帯の中にあるので、同じ剰余なら確実に通る。"""
-    out: list[int] = []
-    for i in range(limit):
-        try:
-            resp = _upnp_soap(url, stype, "GetGenericPortMappingEntry",
-                              f"<NewPortMappingIndex>{i}</NewPortMappingIndex>")
-        except Exception:
-            break
-        if _upnp_fault(resp):                 # 713 SpecifiedArrayIndexInvalid 等＝末尾
-            break
-        m = re.search(r"<NewExternalPort>(\d+)</NewExternalPort>", resp)
-        if m:
-            out.append(int(m.group(1)))
-    return out
-
 
 def _pcp_gateway_ip(control_url: str) -> str:
     """UPnP controlURL（例: http://192.168.1.1:49000/...）からルーターのIPv4アドレスを抽出する。"""
@@ -2632,19 +2614,12 @@ def _upnp_open_ipv4(internal_ip: str, port: int) -> str:
 
         # 2) 未確定なら候補を組み立てて順に試す
         if not chosen:
+            # prevの残余が判明している場合は同じ帯の候補を先に試す（スキャン前の高速パス）
             cands: list[int] = [port]
-            existing = _upnp_list_mapped_ports(url, stype)   # 既存マッピング（読み取り専用）
-            residues: list[int] = []
             if prev:
-                residues.append(prev % 1024)
-            for ep in existing:
-                if ep % 1024 not in residues:
-                    residues.append(ep % 1024)
-            taken = set(existing)
-            for r in residues:                  # MAP-E許可帯（既存ポートと同じ剰余）の高位ポート
                 for n in (49, 50, 51, 48):
-                    p = n * 1024 + r
-                    if 1024 <= p <= 65535 and p != port and p not in taken:
+                    p = n * 1024 + (prev % 1024)
+                    if 1024 <= p <= 65535 and p != port and p != prev:
                         cands.append(p)
             base = 49152 + (port % 16000)        # 非MAP-E（普通の）ルーター用の高位フォールバック
             for off in (0, 277):
