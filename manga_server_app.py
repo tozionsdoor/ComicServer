@@ -1442,9 +1442,16 @@ async def device_status(request: Request):
 
 
 def _conn_type(ip: str) -> str:
-    """クライアントIPから接続経路を判定する。"""
+    """クライアントIPから接続経路を判定する。
+    デュアルスタックソケットはIPv4接続を ::ffff:x.x.x.x 形式で渡すので正規化する。"""
     if ip in ("127.0.0.1", "::1", "unknown"):
         return "ローカル"
+    try:
+        addr = ipaddress.ip_address(ip)
+        if addr.ipv4_mapped:          # ::ffff:x.x.x.x → IPv4として扱う
+            ip = str(addr.ipv4_mapped)
+    except Exception:
+        pass
     if ":" in ip:
         return "IPv6直結"
     if _is_global_ipv4(ip):
