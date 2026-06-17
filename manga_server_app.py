@@ -2697,7 +2697,9 @@ def _upnp_open_ipv4(internal_ip: str, port: int) -> str:
             _external_ipv4_port = 0
             return ""
 
-        _config["upnp_external_port"] = chosen   # 次回最優先で試す（外部ポートの安定化）
+        if _config.get("upnp_external_port") != chosen:
+            _config["upnp_external_port"] = chosen   # 次回最優先で試す（外部ポートの安定化）
+            save_config(_config)                      # 再起動後もポートを記憶
         if (ext, chosen) != (_external_ipv4, _external_ipv4_port):
             if chosen == port:
                 _log_queue.put(f"[IPv4] UPnP: TCPポート {port} を自動開放しました（外部 {ext}:{port}）")
