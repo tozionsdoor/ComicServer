@@ -2714,34 +2714,9 @@ def _upnp_open_ipv4(internal_ip: str, port: int) -> str:
             save_config(_config)                      # 再起動後もポートを記憶
 
         # 起動後1回限り：ローテーションバグ等で残ったゴミマッピング（ArcHive説明・異ポート）を削除。
-        # GetGenericPortMappingEntry でインデックス順に列挙し、chosen 以外の ArcHive エントリを一括削除。
-        global _upnp_cleanup_done
-        if not _upnp_cleanup_done:
-            _upnp_cleanup_done = True
-            stale: list[int] = []
-            idx = 0
-            while idx < 300:  # ルーターの全マッピング上限を超えないよう安全上限
-                chk = _upnp_soap(
-                    url, stype, "GetGenericPortMappingEntry",
-                    f"<NewPortMappingIndex>{idx}</NewPortMappingIndex>")
-                if _upnp_fault(chk):
-                    break  # 713(SpecifiedArrayIndexInvalid)等 = リスト末尾
-                desc_m = re.search(r"<NewPortMappingDescription>(.*?)</NewPortMappingDescription>", chk)
-                ext_m  = re.search(r"<NewExternalPort>(.*?)</NewExternalPort>", chk)
-                if desc_m and ext_m:
-                    desc_val  = desc_m.group(1).strip()
-                    stale_ext = int(ext_m.group(1).strip())
-                    if desc_val == "ArcHive" and stale_ext != chosen:
-                        stale.append(stale_ext)
-                idx += 1
-            for sp in stale:
-                try:
-                    _del(sp)
-                except Exception:
-                    pass
-            if stale:
-                _log_queue.put(
-                    f"[IPv4] UPnP: 古い ArcHive マッピング {len(stale)} 件を削除しました: {stale}")
+        # NOTE: PR-400NEでDeletePortMappingが他のエントリに影響する可能性があるため一時無効化中。
+        # global _upnp_cleanup_done
+        # if not _upnp_cleanup_done: ...
 
         if (ext, chosen) != (_external_ipv4, _external_ipv4_port):
             if chosen == port:
