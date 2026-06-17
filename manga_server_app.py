@@ -2584,7 +2584,10 @@ def _upnp_open_ipv4(internal_ip: str, port: int) -> str:
         def _try_open(ext_port: int):
             resp = _add(ext_port, 0)            # 永続リース(0)優先（NTT系は有限リースを725で拒否）
             f = _upnp_fault(resp)
-            if f and f[0] == "718":             # 衝突：自分の古い割当なら消して再登録
+            if f and f[0] == "718":             # 衝突：まず既存マッピングが自分のものか確認
+                if _mapped(ext_port):
+                    return (True, None)         # 既に自分のマッピングが生きている→そのままOK
+                # 他デバイスの割当 or 確認失敗 → 消して再登録
                 try:
                     _del(ext_port)
                 except Exception:
