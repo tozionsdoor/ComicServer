@@ -2351,6 +2351,7 @@ def _upnp_open_ipv6(ipv6: str, port: int) -> bool:
 _external_ipv4: str = ""                      # 直近に確認したグローバルIPv4（connection-infoで公開）
 _external_ipv4_port: int = 0                  # UPnPで開けた外部ポート（内部ポートと異なる場合あり。0=未開放）
 _upnp_v4: dict = {"url": "", "stype": ""}     # 探索済みWAN接続サービスのキャッシュ（再SSDP回避）
+_upnp_cleanup_done: bool = False              # 起動後1回限りの古いArcHiveマッピング削除が済んだか
 
 
 def _is_global_ipv4(ip: str) -> bool:
@@ -2711,6 +2712,37 @@ def _upnp_open_ipv4(internal_ip: str, port: int) -> str:
         if _config.get("upnp_external_port") != chosen:
             _config["upnp_external_port"] = chosen   # 次回最優先で試す（外部ポートの安定化）
             save_config(_config)                      # 再起動後もポートを記憶
+
+        # 起動後1回限り：ローテーションバグ等で残ったゴミマッピング（ArcHive説明・異ポート）を削除。
+        # GetGenericPortMappingEntry でインデックス順に列挙し、chosen 以外の ArcHive エントリを一括削除。
+        global _upnp_cleanup_done
+        if not _upnp_cleanup_done:
+            _upnp_cleanup_done = True
+            stale: list[int] = []
+            idx = 0
+            while idx < 300:  # ルーターの全マッピング上限を超えないよう安全上限
+                chk = _upnp_soap(
+                    url, stype, "GetGenericPortMappingEntry",
+                    f"<NewPortMappingIndex>{idx}</NewPortMappingIndex>")
+                if _upnp_fault(chk):
+                    break  # 713(SpecifiedArrayIndexInvalid)等 = リスト末尾
+                desc_m = re.search(r"<NewPortMappingDescription>(.*?)</NewPortMappingDescription>", chk)
+                ext_m  = re.search(r"<NewExternalPort>(.*?)</NewExternalPort>", chk)
+                if desc_m and ext_m:
+                    desc_val  = desc_m.group(1).strip()
+                    stale_ext = int(ext_m.group(1).strip())
+                    if desc_val == "ArcHive" and stale_ext != chosen:
+                        stale.append(stale_ext)
+                idx += 1
+            for sp in stale:
+                try:
+                    _del(sp)
+                except Exception:
+                    pass
+            if stale:
+                _log_queue.put(
+                    f"[IPv4] UPnP: 古い ArcHive マッピング {len(stale)} 件を削除しました: {stale}")
+
         if (ext, chosen) != (_external_ipv4, _external_ipv4_port):
             if chosen == port:
                 _log_queue.put(f"[IPv4] UPnP: TCPポート {port} を自動開放しました（外部 {ext}:{port}）")
