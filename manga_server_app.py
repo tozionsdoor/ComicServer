@@ -3420,7 +3420,12 @@ class App(tk.Tk):
         dlg = tk.Toplevel(self)
         dlg.title(title)
         dlg.configure(bg=BG)
-        dlg.transient(self); dlg.grab_set(); dlg.resizable(False, False)
+        # 親が非表示(withdraw/iconic)のときtransientにすると
+        # ダイアログも非表示になるため、その場合はtransientを省略する
+        parent_visible = self.state() not in ("withdrawn", "iconic")
+        if parent_visible:
+            dlg.transient(self)
+        dlg.grab_set(); dlg.resizable(False, False)
         res = {"val": None, "remember": False}
         tk.Label(dlg, text=prompt, bg=BG, fg=FG, font=("Yu Gothic UI", 10),
                  wraplength=340, justify="left").pack(padx=22, pady=(18, 10))
@@ -3442,9 +3447,14 @@ class App(tk.Tk):
                   relief="flat", font=("Yu Gothic UI", 9), pady=4,
                   command=dlg.destroy).pack(side=tk.LEFT, padx=6)
         dlg.update_idletasks()
-        x = self.winfo_x() + (self.winfo_width()  - dlg.winfo_width())  // 2
-        y = self.winfo_y() + (self.winfo_height() - dlg.winfo_height()) // 2
+        if parent_visible:
+            x = self.winfo_x() + (self.winfo_width()  - dlg.winfo_width())  // 2
+            y = self.winfo_y() + (self.winfo_height() - dlg.winfo_height()) // 2
+        else:
+            x = (dlg.winfo_screenwidth()  - dlg.winfo_width())  // 2
+            y = (dlg.winfo_screenheight() - dlg.winfo_height()) // 2
         dlg.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        dlg.lift(); dlg.focus_force()
         self.wait_window(dlg)
         return res["val"], res["remember"]
 
