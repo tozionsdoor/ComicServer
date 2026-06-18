@@ -3025,9 +3025,9 @@ class App(tk.Tk):
         self._port_entry.insert(0, str(_config.get("port", 8765)))
         self._port_entry.grid(row=0, column=1, padx=(0, 8), pady=5, sticky="ew")
 
-        tk.Label(rf, text="※ アプリは同じWi-Fiで「LAN内を探す」ボタンを押すと自動でペアリングできます",
+        tk.Label(rf, text="※ LAN内はアプリの「LAN内を探す」で自動検出、外出先はUPnP＋Firebase経由",
                  bg=BG, fg=FG_DIM, font=("Yu Gothic UI", 8),
-                 wraplength=240, justify="left").grid(
+                 wraplength=400, justify="left").grid(
             row=1, column=0, columnspan=2, sticky="w", padx=8, pady=(2, 0))
 
         # 外部からのIPv4自動接続（UPnPでルーターのポートを自動開放）
@@ -3038,15 +3038,14 @@ class App(tk.Tk):
             activebackground=BG, activeforeground=FG, font=("Yu Gothic UI", 8),
             anchor="w").grid(row=2, column=0, columnspan=2, sticky="w", padx=6, pady=(4, 0))
 
-        tk.Button(rf, text="設定を保存", bg="#2a2a4a", fg=FG, relief="flat",
+        btn_rf = tk.Frame(rf, bg=BG)
+        btn_rf.grid(row=3, column=0, columnspan=2, sticky="e", padx=8, pady=(8, 4))
+        tk.Button(btn_rf, text="端末管理...", bg="#1a2a3a", fg=ACCENT, relief="flat",
                   font=("Yu Gothic UI", 9), padx=8,
-                  command=self._save_settings).grid(
-            row=3, column=0, columnspan=2, pady=(8, 4))
-
-        tk.Button(rf, text="端末管理...", bg="#1a2a3a", fg=ACCENT, relief="flat",
+                  command=self._manage_devices).pack(side=tk.LEFT, padx=(0, 4))
+        tk.Button(btn_rf, text="設定を保存", bg="#2a2a4a", fg=FG, relief="flat",
                   font=("Yu Gothic UI", 9), padx=8,
-                  command=self._manage_devices).grid(
-            row=4, column=0, columnspan=2, pady=(0, 4))
+                  command=self._save_settings).pack(side=tk.LEFT)
 
         # ウィンドウ操作
         _MINIMIZE_LABELS = {"minimize": "タスクバーに最小化", "tray": "システムトレイに格納"}
