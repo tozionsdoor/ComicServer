@@ -3422,6 +3422,8 @@ class App(tk.Tk):
         dlg.withdraw()   # 位置確定まで非表示にする（表示位置ちらつき防止）
         dlg.title(title)
         dlg.configure(bg=BG)
+        try: dlg.iconbitmap(str(ICON_PATH))
+        except Exception: pass
         if parent_visible:
             dlg.transient(self)
         dlg.resizable(False, False)
