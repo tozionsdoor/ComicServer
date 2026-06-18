@@ -3490,23 +3490,26 @@ class App(tk.Tk):
     def _setup_minimize_intercept(self):
         """Win32ウィンドウプロシージャを乗っ取り、タイトルバーの最小化ボタンを
         SC_MINIMIZEレベルで横取りする。ウィンドウが実際に動く前にキャンセルするため
-        チラつきが出ない。"""
+        チラつきが出ない。
+        wm_frame() でタイトルバーを持つ外側フレームのHWNDを取得する（winfo_id()は内側）。"""
         try:
+            user32 = ctypes.windll.user32
             WNDPROCTYPE = ctypes.WINFUNCTYPE(
-                ctypes.c_ssize_t, _wt.HWND, _wt.UINT, _wt.WPARAM, _wt.LPARAM)
-            _CallWndProc = ctypes.windll.user32.CallWindowProcW
-            _CallWndProc.restype = ctypes.c_ssize_t
-            hwnd = self.winfo_id()
+                ctypes.c_longlong, _wt.HWND, _wt.UINT, _wt.WPARAM, _wt.LPARAM)
+            user32.CallWindowProcW.restype  = ctypes.c_longlong
+            user32.SetWindowLongPtrW.argtypes = [_wt.HWND, ctypes.c_int, ctypes.c_void_p]
+            user32.SetWindowLongPtrW.restype  = ctypes.c_void_p
+
+            hwnd = _wt.HWND(int(self.wm_frame(), 16))  # タイトルバーのある外側フレーム
 
             def _wndproc(hwnd, msg, wparam, lparam):
                 if msg == 0x0112 and (wparam & 0xFFF0) == 0xF020:  # WM_SYSCOMMAND / SC_MINIMIZE
                     self.after(0, self._minimize_action)
                     return 0
-                return _CallWndProc(self._orig_wndproc, hwnd, msg, wparam, lparam)
+                return user32.CallWindowProcW(self._orig_wndproc, hwnd, msg, wparam, lparam)
 
             self._new_wndproc = WNDPROCTYPE(_wndproc)
-            self._orig_wndproc = ctypes.windll.user32.SetWindowLongPtrW(
-                hwnd, -4, self._new_wndproc)  # GWLP_WNDPROC = -4
+            self._orig_wndproc = user32.SetWindowLongPtrW(hwnd, -4, self._new_wndproc)
         except Exception:
             pass  # 失敗しても他の機能に影響なし
 
