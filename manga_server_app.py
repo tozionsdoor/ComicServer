@@ -2986,7 +2986,7 @@ class App(tk.Tk):
         main.columnconfigure(1, weight=2)
 
         # 左: スキャンフォルダ
-        lf = tk.LabelFrame(main, text=" スキャンフォルダ ", bg=BG, fg=FG,
+        lf = tk.LabelFrame(main, text=" 本棚登録 ", bg=BG, fg=FG,
                             font=("Yu Gothic UI", 9), pady=4)
         lf.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
         lf.columnconfigure(0, weight=1)
