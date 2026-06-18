@@ -3417,15 +3417,14 @@ class App(tk.Tk):
 
     def _ask_action(self, title, prompt, o1_label, o1_val, o2_label, o2_val):
         """2択（+「次回も記憶」）ダイアログ。戻り値 (選択値 or None, 記憶するか)。"""
+        parent_visible = self.state() not in ("withdrawn", "iconic")
         dlg = tk.Toplevel(self)
+        dlg.withdraw()   # 位置確定まで非表示にする（表示位置ちらつき防止）
         dlg.title(title)
         dlg.configure(bg=BG)
-        # 親が非表示(withdraw/iconic)のときtransientにすると
-        # ダイアログも非表示になるため、その場合はtransientを省略する
-        parent_visible = self.state() not in ("withdrawn", "iconic")
         if parent_visible:
             dlg.transient(self)
-        dlg.grab_set(); dlg.resizable(False, False)
+        dlg.resizable(False, False)
         res = {"val": None, "remember": False}
         tk.Label(dlg, text=prompt, bg=BG, fg=FG, font=("Yu Gothic UI", 10),
                  wraplength=340, justify="left").pack(padx=22, pady=(18, 10))
@@ -3446,9 +3445,11 @@ class App(tk.Tk):
         tk.Button(bf, text="キャンセル", width=8, bg="#3a0a0a", fg=FG_RED,
                   relief="flat", font=("Yu Gothic UI", 9), pady=4,
                   command=dlg.destroy).pack(side=tk.LEFT, padx=6)
+        # withdrawした状態でupdate_idletasksを呼ぶとレイアウトが確定し
+        # winfo_width/height が正確なサイズを返す
         dlg.update_idletasks()
-        w = dlg.winfo_reqwidth()
-        h = dlg.winfo_reqheight()
+        w = dlg.winfo_width()
+        h = dlg.winfo_height()
         if parent_visible:
             x = self.winfo_x() + (self.winfo_width()  - w) // 2
             y = self.winfo_y() + (self.winfo_height() - h) // 2
@@ -3456,6 +3457,8 @@ class App(tk.Tk):
             x = (dlg.winfo_screenwidth()  - w) // 2
             y = (dlg.winfo_screenheight() - h) // 2
         dlg.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        dlg.deiconify()   # 正しい位置で表示
+        dlg.grab_set()
         dlg.lift(); dlg.focus_force()
         self.wait_window(dlg)
         return res["val"], res["remember"]
