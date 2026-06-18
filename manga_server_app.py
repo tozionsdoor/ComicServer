@@ -3025,21 +3025,24 @@ class App(tk.Tk):
         self._port_entry.insert(0, str(_config.get("port", 8765)))
         self._port_entry.grid(row=0, column=1, padx=(0, 8), pady=5, sticky="ew")
 
-        tk.Label(rf, text="※ LAN内はアプリの「LAN内を探す」で自動検出、外出先はUPnP＋Firebase経由",
-                 bg=BG, fg=FG_DIM, font=("Yu Gothic UI", 8),
-                 wraplength=400, justify="left").grid(
-            row=1, column=0, columnspan=2, sticky="w", padx=8, pady=(2, 0))
-
         # 外部からのIPv4自動接続（UPnPでルーターのポートを自動開放）
         self._upnp4_var = tk.BooleanVar(value=bool(_config.get("upnp_ipv4_open", True)))
         tk.Checkbutton(
-            rf, text="外部からのIPv4自動接続を許可（UPnP）",
+            rf, text="外出先からのIPv4自動接続を許可（UPnP）",
             variable=self._upnp4_var, bg=BG, fg=FG_DIM, selectcolor=PANEL,
             activebackground=BG, activeforeground=FG, font=("Yu Gothic UI", 8),
-            anchor="w").grid(row=2, column=0, columnspan=2, sticky="w", padx=6, pady=(4, 0))
+            anchor="w").grid(row=1, column=0, columnspan=2, sticky="w", padx=6, pady=(6, 0))
+
+        tk.Label(rf,
+                 text="【接続方法】 同じWi-Fi内ならアプリの「LAN内を探す」でサーバーを自動検出。"
+                      "タップすると認証要求が届くので「端末管理」から承認してください。"
+                      "外出先からはUPnPとFirebaseで自動接続します。",
+                 bg=BG, fg=FG_DIM, font=("Yu Gothic UI", 8),
+                 wraplength=340, justify="left").grid(
+            row=2, column=0, columnspan=2, sticky="w", padx=8, pady=(6, 0))
 
         btn_rf = tk.Frame(rf, bg=BG)
-        btn_rf.grid(row=3, column=0, columnspan=2, sticky="e", padx=8, pady=(8, 4))
+        btn_rf.grid(row=3, column=0, columnspan=2, sticky="e", padx=8, pady=(8, 6))
         tk.Button(btn_rf, text="端末管理...", bg="#1a2a3a", fg=ACCENT, relief="flat",
                   font=("Yu Gothic UI", 9), padx=8,
                   command=self._manage_devices).pack(side=tk.LEFT, padx=(0, 4))
