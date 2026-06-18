@@ -3447,12 +3447,14 @@ class App(tk.Tk):
                   relief="flat", font=("Yu Gothic UI", 9), pady=4,
                   command=dlg.destroy).pack(side=tk.LEFT, padx=6)
         dlg.update_idletasks()
+        w = dlg.winfo_reqwidth()
+        h = dlg.winfo_reqheight()
         if parent_visible:
-            x = self.winfo_x() + (self.winfo_width()  - dlg.winfo_width())  // 2
-            y = self.winfo_y() + (self.winfo_height() - dlg.winfo_height()) // 2
+            x = self.winfo_x() + (self.winfo_width()  - w) // 2
+            y = self.winfo_y() + (self.winfo_height() - h) // 2
         else:
-            x = (dlg.winfo_screenwidth()  - dlg.winfo_width())  // 2
-            y = (dlg.winfo_screenheight() - dlg.winfo_height()) // 2
+            x = (dlg.winfo_screenwidth()  - w) // 2
+            y = (dlg.winfo_screenheight() - h) // 2
         dlg.geometry(f"+{max(x, 0)}+{max(y, 0)}")
         dlg.lift(); dlg.focus_force()
         self.wait_window(dlg)
