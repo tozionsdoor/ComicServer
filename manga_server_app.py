@@ -2938,7 +2938,9 @@ class App(tk.Tk):
         except Exception:
             pass
         self._tray = None
+        self._handling_minimize = False
         self.protocol("WM_DELETE_WINDOW", self._on_close_window)
+        self.bind("<Unmap>", self._on_unmap)
 
         global _config
         _config = load_config()
@@ -3089,11 +3091,6 @@ class App(tk.Tk):
             state=tk.DISABLED, command=self._open_browser)
         self._browser_btn.pack(side=tk.LEFT, padx=4)
 
-        tk.Button(
-            f, text="—  最小化", width=10,
-            bg="#2a2a4a", fg=FG_DIM, relief="flat",
-            font=("Yu Gothic UI", 10), pady=6,
-            command=self._minimize_action).pack(side=tk.LEFT, padx=4)
 
     # ── フォルダ操作 ───────────────────────────────────────────────────────────
     def _add_dir(self):
@@ -3488,6 +3485,20 @@ class App(tk.Tk):
             self._hide_to_tray()
         else:
             self.iconify()
+
+    def _on_unmap(self, event):
+        """タイトルバーの最小化ボタン押下を検知してダイアログを出す。
+        withdraw() 等でも発火するため、_handling_minimize フラグで二重起動を防ぐ。"""
+        if event.widget is not self or self._handling_minimize:
+            return
+        self._handling_minimize = True
+        self.after(0, self._check_minimized)
+
+    def _check_minimized(self):
+        if self.state() == "iconic":
+            self.deiconify()
+            self._minimize_action()
+        self._handling_minimize = False
 
     def _hide_to_tray(self):
         """ウィンドウを隠してシステムトレイに常駐させる。"""
