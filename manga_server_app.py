@@ -110,8 +110,8 @@ DEFAULT_CONFIG: dict = {
     "port":         8765,
     "host":         "0.0.0.0",
     "upnp_ipv4_open": True,  # UPnPでルーターのIPv4ポートを自動開放（PPPoE等でグローバルIPv4を持つ回線向け）
-    "on_close":     "ask",   # ウィンドウ×ボタン押下時: "ask"(毎回確認)/"exit"/"tray"
-    "on_minimize":  "ask",   # 最小化ボタン押下時:     "ask"(毎回確認)/"minimize"/"tray"
+    "on_close":     "exit",  # ウィンドウ×ボタン押下時: "exit"/"tray"
+    "on_minimize":  "minimize",  # 最小化ボタン押下時: "minimize"/"tray"
     "firebase":     {},   # 空＝DEFAULT_FIREBASEを使う。値を入れればそれで上書き
     "stun_servers": ["stun:stun.l.google.com:19302"],
     "turn": {               # 任意: STUNで繋がらない環境用。空のままでもOK
@@ -194,6 +194,9 @@ def load_config() -> dict:
         cfg["turn"] = DEFAULT_CONFIG["turn"].copy()
     if "stun_servers" not in cfg:
         cfg["stun_servers"] = DEFAULT_CONFIG["stun_servers"].copy()
+    # "ask" は廃止。旧設定値をデフォルト実値にマイグレーション
+    if cfg.get("on_close")    == "ask": cfg["on_close"]    = "exit"
+    if cfg.get("on_minimize") == "ask": cfg["on_minimize"] = "minimize"
 
     # トークン未設定（新規インストール or 旧版からの移行）なら生成して保存
     changed = False
@@ -3045,6 +3048,47 @@ class App(tk.Tk):
                   command=self._manage_devices).grid(
             row=4, column=0, columnspan=2, pady=(0, 4))
 
+        # ウィンドウ操作
+        _MINIMIZE_LABELS = {"minimize": "タスクバーに最小化", "tray": "システムトレイに格納"}
+        _CLOSE_LABELS    = {"exit":     "サーバーの終了",     "tray": "システムトレイに格納"}
+        wf = tk.LabelFrame(main, text=" ウィンドウ操作 ", bg=BG, fg=FG,
+                           font=("Yu Gothic UI", 9), pady=6)
+        wf.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+
+        def _om(parent, var, options, cmd):
+            m = tk.OptionMenu(parent, var, *options, command=cmd)
+            m.config(bg=PANEL, fg=FG, activebackground=ACCENT, activeforeground=BG,
+                     relief="flat", font=("Yu Gothic UI", 9), anchor="w",
+                     highlightthickness=0, bd=0)
+            m["menu"].config(bg=PANEL, fg=FG, activebackground=ACCENT,
+                             activeforeground=BG, font=("Yu Gothic UI", 9))
+            return m
+
+        # 最小化ボタン
+        tk.Label(wf, text="最小化ボタン:", bg=BG, fg=FG_DIM,
+                 font=("Yu Gothic UI", 9)).grid(row=0, column=0, padx=(12, 4), pady=4, sticky="w")
+        self._min_var = tk.StringVar(
+            value=_MINIMIZE_LABELS.get(_config.get("on_minimize", "minimize"), "タスクバーに最小化"))
+        def _on_min_change(label, _ml=_MINIMIZE_LABELS):
+            _config["on_minimize"] = {v: k for k, v in _ml.items()}[label]
+            save_config(_config)
+        _om(wf, self._min_var, list(_MINIMIZE_LABELS.values()), _on_min_change
+            ).grid(row=0, column=1, padx=(0, 24), pady=4, sticky="ew")
+
+        # 閉じるボタン
+        tk.Label(wf, text="閉じるボタン:", bg=BG, fg=FG_DIM,
+                 font=("Yu Gothic UI", 9)).grid(row=0, column=2, padx=(0, 4), pady=4, sticky="w")
+        self._close_var = tk.StringVar(
+            value=_CLOSE_LABELS.get(_config.get("on_close", "exit"), "サーバーの終了"))
+        def _on_close_change(label, _cl=_CLOSE_LABELS):
+            _config["on_close"] = {v: k for k, v in _cl.items()}[label]
+            save_config(_config)
+        _om(wf, self._close_var, list(_CLOSE_LABELS.values()), _on_close_change
+            ).grid(row=0, column=3, padx=(0, 12), pady=4, sticky="ew")
+
+        wf.columnconfigure(1, weight=1)
+        wf.columnconfigure(3, weight=1)
+
     def _build_log(self):
         f = tk.Frame(self, bg=BG)
         f.grid(row=2, column=0, sticky="nsew", padx=10, pady=6)
@@ -3415,90 +3459,14 @@ class App(tk.Tk):
             d.rectangle([30, 20, 46, 23], fill=(24, 24, 37))      # 帯
             return img
 
-    def _ask_action(self, title, prompt, o1_label, o1_val, o2_label, o2_val):
-        """2択（+「次回も記憶」）ダイアログ。戻り値 (選択値 or None, 記憶するか)。"""
-        parent_visible = self.state() not in ("withdrawn", "iconic")
-        dlg = tk.Toplevel(self)
-        dlg.withdraw()   # 位置確定まで非表示にする（表示位置ちらつき防止）
-        dlg.title(title)
-        dlg.configure(bg=BG)
-        try: dlg.iconbitmap(str(ICON_PATH))
-        except Exception: pass
-        if parent_visible:
-            dlg.transient(self)
-        dlg.resizable(False, False)
-        res = {"val": None, "remember": False}
-        tk.Label(dlg, text=prompt, bg=BG, fg=FG, font=("Yu Gothic UI", 10),
-                 wraplength=340, justify="left").pack(padx=22, pady=(18, 10))
-        remember = tk.BooleanVar(value=False)
-        tk.Checkbutton(dlg, text="次回もこの動作にする（設定ファイルで変更可）",
-                       variable=remember, bg=BG, fg=FG_DIM, selectcolor=PANEL,
-                       activebackground=BG, activeforeground=FG,
-                       font=("Yu Gothic UI", 9)).pack(pady=(0, 10))
-        bf = tk.Frame(dlg, bg=BG); bf.pack(pady=(0, 16))
-        def choose(v):
-            res["val"] = v; res["remember"] = remember.get(); dlg.destroy()
-        tk.Button(bf, text=o1_label, width=12, bg="#1a472a", fg=FG_GREEN,
-                  relief="flat", font=("Yu Gothic UI", 9), pady=4,
-                  command=lambda: choose(o1_val)).pack(side=tk.LEFT, padx=6)
-        tk.Button(bf, text=o2_label, width=12, bg="#2a2a4a", fg=ACCENT,
-                  relief="flat", font=("Yu Gothic UI", 9), pady=4,
-                  command=lambda: choose(o2_val)).pack(side=tk.LEFT, padx=6)
-        tk.Button(bf, text="キャンセル", width=8, bg="#3a0a0a", fg=FG_RED,
-                  relief="flat", font=("Yu Gothic UI", 9), pady=4,
-                  command=dlg.destroy).pack(side=tk.LEFT, padx=6)
-        # withdrawした状態でupdate_idletasksを呼ぶとレイアウトが確定し
-        # winfo_width/height が正確なサイズを返す
-        dlg.update_idletasks()
-        w = dlg.winfo_width()
-        h = dlg.winfo_height()
-        if parent_visible:
-            x = self.winfo_x() + (self.winfo_width()  - w) // 2
-            y = self.winfo_y() + (self.winfo_height() - h) // 2
-        else:
-            x = (dlg.winfo_screenwidth()  - w) // 2
-            y = (dlg.winfo_screenheight() - h) // 2
-        dlg.geometry(f"+{max(x, 0)}+{max(y, 0)}")
-        dlg.deiconify()   # 正しい位置で表示
-        dlg.grab_set()
-        dlg.lift(); dlg.focus_force()
-        self.wait_window(dlg)
-        return res["val"], res["remember"]
-
     def _on_close_window(self):
-        """× ボタン: 設定に従い「終了」か「トレイ格納」。"ask" なら毎回確認。"""
-        action = _config.get("on_close", "ask")
-        if action == "ask":
-            val, remember = self._ask_action(
-                "ウィンドウを閉じる",
-                "MangaServer を終了しますか？\n"
-                "「トレイに格納」を選ぶと、サーバーを動かしたまま常駐します。",
-                "終了", "exit", "トレイに格納", "tray")
-            if val is None:
-                return
-            if remember:
-                _config["on_close"] = val; save_config(_config)
-            action = val
-        if action == "tray":
+        if _config.get("on_close", "exit") == "tray":
             self._hide_to_tray()
         else:
             self._quit_app()
 
     def _minimize_action(self):
-        """最小化ボタン: 設定に従い「最小化」か「トレイ格納」。"ask" なら毎回確認。"""
-        action = _config.get("on_minimize", "ask")
-        if action == "ask":
-            val, remember = self._ask_action(
-                "最小化",
-                "ウィンドウを最小化しますか？\n"
-                "「トレイに格納」を選ぶと、タスクバーから消えて常駐します。",
-                "最小化", "minimize", "トレイに格納", "tray")
-            if val is None:
-                return
-            if remember:
-                _config["on_minimize"] = val; save_config(_config)
-            action = val
-        if action == "tray":
+        if _config.get("on_minimize", "minimize") == "tray":
             self._hide_to_tray()
         else:
             self.iconify()
@@ -3513,13 +3481,8 @@ class App(tk.Tk):
         try:
             if self.state() != "iconic":
                 return
-            # deiconify()だとウィンドウが一瞬見えてしまう。
-            # iconic→withdrawn は画面に何も出ずに消えるためフラッシュが起きない。
             self.withdraw()
             self._minimize_action()
-            # キャンセル時: withdrawしたままtrayも設定されていなければ元に戻す
-            if self.state() == "withdrawn" and self._tray is None:
-                self.deiconify()
         finally:
             self._handling_minimize = False
 
