@@ -3036,7 +3036,7 @@ class App(tk.Tk):
         tk.Label(rf,
                  text="【接続方法】 同じWi-Fi内ならアプリの「LAN内を探す」でサーバーを自動検出。"
                       "タップすると認証要求が届くので「端末管理」から承認してください。"
-                      "外出先からはUPnPとFirebaseで自動接続します。",
+                      "一度認証が終われば、外出先では自動で接続方法を切り替えて接続されます。",
                  bg=BG, fg=FG_DIM, font=("Yu Gothic UI", 8),
                  wraplength=340, justify="left").grid(
             row=2, column=0, columnspan=2, sticky="w", padx=8, pady=(6, 0))
