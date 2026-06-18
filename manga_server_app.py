@@ -23,6 +23,8 @@ import subprocess
 import threading
 import time
 import webbrowser
+import ctypes
+import ctypes.wintypes as _wt
 import zipfile
 from pathlib import Path
 
@@ -2938,9 +2940,8 @@ class App(tk.Tk):
         except Exception:
             pass
         self._tray = None
-        self._handling_minimize = False
         self.protocol("WM_DELETE_WINDOW", self._on_close_window)
-        self.bind("<Unmap>", self._on_unmap)
+        self.after_idle(self._setup_minimize_intercept)
 
         global _config
         _config = load_config()
@@ -3486,19 +3487,28 @@ class App(tk.Tk):
         else:
             self.iconify()
 
-    def _on_unmap(self, event):
-        """タイトルバーの最小化ボタン押下を検知してダイアログを出す。
-        withdraw() 等でも発火するため、_handling_minimize フラグで二重起動を防ぐ。"""
-        if event.widget is not self or self._handling_minimize:
-            return
-        self._handling_minimize = True
-        self.after(0, self._check_minimized)
+    def _setup_minimize_intercept(self):
+        """Win32ウィンドウプロシージャを乗っ取り、タイトルバーの最小化ボタンを
+        SC_MINIMIZEレベルで横取りする。ウィンドウが実際に動く前にキャンセルするため
+        チラつきが出ない。"""
+        try:
+            WNDPROCTYPE = ctypes.WINFUNCTYPE(
+                ctypes.c_ssize_t, _wt.HWND, _wt.UINT, _wt.WPARAM, _wt.LPARAM)
+            _CallWndProc = ctypes.windll.user32.CallWindowProcW
+            _CallWndProc.restype = ctypes.c_ssize_t
+            hwnd = self.winfo_id()
 
-    def _check_minimized(self):
-        if self.state() == "iconic":
-            self.deiconify()
-            self._minimize_action()
-        self._handling_minimize = False
+            def _wndproc(hwnd, msg, wparam, lparam):
+                if msg == 0x0112 and (wparam & 0xFFF0) == 0xF020:  # WM_SYSCOMMAND / SC_MINIMIZE
+                    self.after(0, self._minimize_action)
+                    return 0
+                return _CallWndProc(self._orig_wndproc, hwnd, msg, wparam, lparam)
+
+            self._new_wndproc = WNDPROCTYPE(_wndproc)
+            self._orig_wndproc = ctypes.windll.user32.SetWindowLongPtrW(
+                hwnd, -4, self._new_wndproc)  # GWLP_WNDPROC = -4
+        except Exception:
+            pass  # 失敗しても他の機能に影響なし
 
     def _hide_to_tray(self):
         """ウィンドウを隠してシステムトレイに常駐させる。"""
