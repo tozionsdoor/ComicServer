@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang='ja'>
+<head>
+<meta charset='UTF-8'>
+<meta name='viewport' content='width=device-width, initial-scale=1'>
+<title>ArcHive Server ヘルプ</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:"Yu Gothic UI","Meiryo",sans-serif;font-size:15px;line-height:1.85;color:#222;background:#f8f9fb;padding:0 20px 80px;max-width:880px;margin:0 auto}
+h1{font-size:1.75em;color:#1a2a4a;border-bottom:3px solid #3a6ea5;padding:28px 0 10px;margin-bottom:6px}
+h1 small{font-size:0.5em;color:#888;font-weight:normal;margin-left:12px}
+h2{font-size:1.2em;color:#1a2a4a;border-left:4px solid #3a6ea5;padding:6px 0 6px 14px;margin:36px 0 12px;background:#f0f5fc}
+h3{font-size:1.0em;color:#2a3a5a;margin:22px 0 8px;padding-left:4px;border-bottom:1px dotted #ccd}
+p{margin:8px 0}
+ul,ol{padding-left:1.8em;margin:8px 0}
+li{margin:5px 0}
+a{color:#3a6ea5}
+code{font-family:Consolas,"Courier New",monospace;font-size:0.87em;background:#e8ecf2;padding:2px 6px;border-radius:3px}
+pre{background:#1a2335;color:#c8d8e8;padding:14px 18px;border-radius:6px;margin:12px 0;overflow-x:auto;font-family:Consolas,monospace;font-size:0.85em;line-height:1.65}
+pre .ok{color:#6ddd7a}
+pre .warn{color:#ffd080}
+pre .err{color:#ff8080}
+pre .dim{color:#6888a8}
+.box{border-radius:6px;padding:14px 20px;margin:14px 0;font-size:0.95em}
+.box-info{background:#e6f0fa;border-left:4px solid #3a6ea5}
+.box-warn{background:#fff8e0;border-left:4px solid #e0a020}
+.box-ok{background:#e6f6ec;border-left:4px solid #28a060}
+.toc{background:#f0f4f8;border:1px solid #cdd8e8;border-radius:8px;padding:18px 28px;display:inline-block;margin:20px 0;min-width:300px}
+.toc p{font-weight:bold;margin-bottom:10px;color:#333}
+.toc ol{margin:0;padding-left:1.5em}
+.toc li{margin:5px 0}
+.toc a{text-decoration:none}
+.toc a:hover{text-decoration:underline}
+.toc ul{padding-left:1.3em;margin:4px 0}
+.toc ul li{margin:3px 0;font-size:0.95em}
+table{width:100%;border-collapse:collapse;margin:14px 0;font-size:0.93em}
+th{background:#2a3a6a;color:#fff;padding:9px 14px;text-align:left}
+td{padding:9px 14px;border-bottom:1px solid #dde}
+tr:nth-child(even) td{background:#f4f6fa}
+.ok-chip{display:inline-block;padding:2px 9px;border-radius:10px;font-size:0.8em;font-weight:bold;background:#d4edda;color:#155724}
+.warn-chip{display:inline-block;padding:2px 9px;border-radius:10px;font-size:0.8em;font-weight:bold;background:#fff3cd;color:#856404}
+.ng-chip{display:inline-block;padding:2px 9px;border-radius:10px;font-size:0.8em;font-weight:bold;background:#f8d7da;color:#721c24}
+hr{margin:40px 0 20px;border:none;border-top:1px solid #dde}
+</style>
+</head>
+<body>
+
+<h1>ArcHive Server ヘルプ <small>困ったときはここを確認</small></h1>
+<p style='color:#666;margin-bottom:4px'>サーバーの接続の仕組み・ログの読み方・つながらないときの対処法を説明します。</p>
+
+<div class='toc'>
+<p>目次</p>
+<ol>
+  <li><a href='#s1'>接続の仕組み</a></li>
+  <li><a href='#s2'>はじめての使い方</a></li>
+  <li><a href='#s3'>サーバーログの読み方</a></li>
+  <li><a href='#s4'>つながらないときのチェックリスト</a>
+    <ul>
+      <li><a href='#s4a'>ブラウザで本棚が開けない</a></li>
+      <li><a href='#s4b'>アプリからLAN接続できない</a></li>
+      <li><a href='#s4c'>外出先から接続できない</a></li>
+      <li><a href='#s4d'>画像が遅い・途切れる</a></li>
+    </ul>
+  </li>
+  <li><a href='#s5'>接続しにくい環境について</a></li>
+  <li><a href='#s6'>よくある質問</a></li>
+</ol>
+</div>
+
+<!-- ============================================================ -->
+<h2 id='s1'>1. 接続の仕組み</h2>
+<p>ArcHive は接続状況に応じて、以下の優先順位で自動的に最適な方法を選びます。</p>
+
+<table>
+  <tr><th>接続方法</th><th>使われる場面</th><th>速度</th></tr>
+  <tr>
+    <td><strong>LAN直結</strong></td>
+    <td>スマホとサーバーPCが同じWi-Fiにある</td>
+    <td><span class='ok-chip'>高速</span></td>
+  </tr>
+  <tr>
+    <td><strong>IPv4外部接続</strong></td>
+    <td>外出先 ＋ ルーターのポート開放が成功している</td>
+    <td><span class='ok-chip'>高速</span></td>
+  </tr>
+  <tr>
+    <td><strong>IPv6直結</strong></td>
+    <td>外出先 ＋ サーバー側にIPv6グローバルアドレスがある</td>
+    <td><span class='ok-chip'>高速</span></td>
+  </tr>
+  <tr>
+    <td><strong>WebRTC（P2P）</strong></td>
+    <td>上記がすべて使えない場合の最終手段</td>
+    <td><span class='warn-chip'>やや遅い</span></td>
+  </tr>
+</table>
+
+<div class='box box-info'>
+<strong>ポート自動開放について：</strong>「接続設定」の「外出先からのIPv4自動接続を許可（UPnP）」にチェックが入っていると、サーバー起動時にルーターのポートを自動で開放します。ログに <code>UPnP: 外部ポート XXXXX→8765 を自動開放しました</code> と出れば成功です。
+</div>
+
+<!-- ============================================================ -->
+<h2 id='s2'>2. はじめての使い方</h2>
+<ol>
+  <li>サーバー画面の「本棚登録」でマンガが入っているフォルダを追加し「設定を保存」を押す。</li>
+  <li>「▶ サーバー起動」ボタンを押す。ステータスが「起動中」になることを確認。</li>
+  <li>スマホアプリを起動し、<strong>「LAN内を探す」</strong>をタップする。</li>
+  <li>一覧にサーバー名が表示されたらタップ → サーバー側で「<strong>端末管理</strong>」を開いて承認する。</li>
+  <li>以降は外出先でも自動で接続方法を切り替えて接続されます。</li>
+</ol>
+
+<div class='box box-warn'>
+<strong>注意：</strong>初回接続は必ず同じWi-Fi（自宅内）で行ってください。スマホがモバイルデータ通信中は「LAN内を探す」でサーバーが見つかりません。
+</div>
+
+<!-- ============================================================ -->
+<h2 id='s3'>3. サーバーログの読み方</h2>
+<p>サーバー画面のログ欄に表示されるメッセージの意味を解説します。</p>
+
+<h3>接続ログ（アプリがつながるたびに表示）</h3>
+<pre><span class='ok'>[HTTP] 接続: 192.168.1.10 (LAN)</span>            ← 同じWi-Fi内からHTTP直結。最適な状態。
+<span class='ok'>[HTTP] 接続: 49.105.103.1 (IPv4外部)</span>       ← 外出先からIPv4で直結。良好な状態。
+<span class='ok'>[HTTP] 接続: 2400:4050::1 (IPv6直結)</span>      ← 外出先からIPv6で直結。良好な状態。
+<span class='warn'>[WebRTC] DC接続: Android</span>                  ← WebRTC経由。動くが速度が落ちる場合あり。</pre>
+
+<h3>ポート開放ログ（サーバー起動時に表示）</h3>
+<pre><span class='ok'>[IPv4] UPnP: 外部ポート 52736→内部 8765 を自動開放しました</span>  ← 外出先接続の準備OK
+<span class='err'>[IPv4] UPnP: 失敗（ルーター非対応またはUPnP無効）</span>            ← 外出先HTTP不可 → WebRTCへ切替</pre>
+
+<h3>接続情報更新ログ（外出先からの接続に使われる情報）</h3>
+<pre><span class='ok'>[Firebase] host を更新しました (ipv4=49.x.x.x:52736)</span>     ← 外出先アプリへ接続先を通知
+<span class='dim'>[Firebase] host は変更なし、更新スキップ</span>                   ← 正常。変化がないため省略。</pre>
+
+<div class='box box-ok'>
+<strong>良好な状態の目安：</strong>起動後に <code>UPnP: 外部ポート XXXXX→8765 を自動開放しました</code> が出て、接続時のログに <code>(LAN)</code> または <code>(IPv4外部)</code> が表示されていれば最適な状態です。
+</div>
+
+<!-- ============================================================ -->
+<h2 id='s4'>4. つながらないときのチェックリスト</h2>
+
+<h3 id='s4a'>▶ ブラウザで本棚が開けない</h3>
+<ol>
+  <li>サーバー画面のステータスが「起動中」になっているか確認する。</li>
+  <li>「ブラウザで開く」ボタンを押してブラウザが開くか確認する。</li>
+  <li>ブラウザに「プライバシーエラー」「証明書の警告」が出た場合 →「詳細設定」→「サイトへ進む（安全でない）」をクリック。<br>
+  <small style='color:#888'>（ArcHiveは自己署名証明書を使用しています。警告が出ますが安全なローカル接続です）</small></li>
+  <li>それでも開けない場合 → Windowsファイアウォールでポート <code>8765</code> が許可されているか確認する。</li>
+</ol>
+
+<h3 id='s4b'>▶ アプリからLAN接続できない</h3>
+<ol>
+  <li>スマホとサーバーPCが<strong>同じWi-Fi</strong>に接続していることを確認する。</li>
+  <li>サーバーが「起動中」になっているか確認する。</li>
+  <li>サーバーの「端末管理」を開いて「承認待ち」のスマホが届いていれば承認する。</li>
+  <li>上記で解決しない場合：
+    <ul>
+      <li>Windowsファイアウォールでポート <code>8765</code> がブロックされていないか確認する。</li>
+      <li>ウイルス対策ソフトが通信をブロックしていないか確認する。</li>
+      <li>PCが企業・学校ネットワークに接続している場合、ポートが制限されていることがある。</li>
+    </ul>
+  </li>
+</ol>
+
+<h3 id='s4c'>▶ 外出先から接続できない</h3>
+<p>まずサーバーのログを確認してください。</p>
+<table>
+  <tr><th>ログの内容</th><th>状態</th><th>対処</th></tr>
+  <tr>
+    <td><code>(IPv4外部)</code> の接続ログが出ている</td>
+    <td><span class='ok-chip'>正常</span></td>
+    <td>接続できているはずです。アプリを再起動してみてください。</td>
+  </tr>
+  <tr>
+    <td><code>UPnP: 外部ポート XXX を自動開放しました</code></td>
+    <td><span class='ok-chip'>準備OK</span></td>
+    <td>ポート開放成功。しばらく待つと外出先から接続できるはずです。</td>
+  </tr>
+  <tr>
+    <td><code>UPnP: 失敗</code> または表示なし</td>
+    <td><span class='warn-chip'>要確認</span></td>
+    <td>ルーターのUPnPが無効か非対応。→ <a href='#s5'>接続しにくい環境</a> を参照。</td>
+  </tr>
+  <tr>
+    <td>ログに <code>[WebRTC]</code> のみ表示</td>
+    <td><span class='warn-chip'>WebRTCのみ</span></td>
+    <td>HTTP直結できない状態。速度が落ちる場合あり。→ <a href='#s5'>接続しにくい環境</a> を参照。</td>
+  </tr>
+</table>
+
+<h3 id='s4d'>▶ 接続はできるが画像が遅い・途切れる</h3>
+<ul>
+  <li>ログに <code>[WebRTC]</code> のみ → ポート開放できていない可能性。<a href='#s5'>接続しにくい環境</a> を参照。</li>
+  <li>LAN内でも遅い → サーバーPCを有線LANに接続してみる。</li>
+  <li>ページをめくるたびに待つ → アプリのプリロード枚数を増やす（アプリ内設定）。</li>
+  <li>サーバーPC自体の負荷が高くないか確認する（他の重い処理が動いていないか）。</li>
+</ul>
+
+<!-- ============================================================ -->
+<h2 id='s5'>5. 接続しにくい環境について</h2>
+<p>インターネット接続の種類によっては、外出先からのHTTP直結ができない場合があります。</p>
+
+<table>
+  <tr><th>環境・回線の種類</th><th>HTTP直結</th><th>WebRTC</th><th>説明</th></tr>
+  <tr>
+    <td>一般的な光回線（PPPoE）</td>
+    <td><span class='ok-chip'>○</span></td>
+    <td><span class='ok-chip'>○</span></td>
+    <td>グローバルIPv4が割り当てられる。UPnPが有効なら最適な接続環境。</td>
+  </tr>
+  <tr>
+    <td>v6プラス / transix / MAP-E</td>
+    <td><span class='ok-chip'>○ ※</span></td>
+    <td><span class='ok-chip'>○</span></td>
+    <td>IPv4アドレスを複数世帯で共有するが、ArcHiveはこの環境に対応済み。使えるポートを自動検出して開放します。</td>
+  </tr>
+  <tr>
+    <td>IPv6オプション（IPoE）</td>
+    <td><span class='ok-chip'>○</span></td>
+    <td><span class='ok-chip'>○</span></td>
+    <td>グローバルIPv6が使える場合はIPv6直結も可能。</td>
+  </tr>
+  <tr>
+    <td>CGNAT（キャリアグレードNAT）</td>
+    <td><span class='ng-chip'>✕</span></td>
+    <td><span class='ok-chip'>○</span></td>
+    <td>プロバイダー側でNATされるためポート開放不可。WebRTCのみ使用可能。</td>
+  </tr>
+  <tr>
+    <td>モバイルWi-Fiルーター / テザリング</td>
+    <td><span class='ng-chip'>✕</span></td>
+    <td><span class='ok-chip'>○</span></td>
+    <td>モバイル回線はポート開放不可。外出先からはWebRTCのみ。</td>
+  </tr>
+  <tr>
+    <td>会社・学校のネットワーク</td>
+    <td><span class='ng-chip'>✕</span></td>
+    <td><span class='warn-chip'>△</span></td>
+    <td>セキュリティポリシーで多くのポートが制限されている。WebRTCも使えない場合あり。</td>
+  </tr>
+</table>
+
+<div class='box box-info'>
+<strong>v6プラス / transix / MAP-E をお使いの方へ：</strong><br>
+「v6プラス」「transix」「OCNバーチャルコネクト」「v6コネクト」などはIPv4アドレスを複数世帯で共有する方式です。使えるポート番号に制限がありますが、ArcHive Serverはこの環境に対応しており、利用可能なポートを自動的に探して接続します。ログに <code>MAP-E</code> と表示された場合もこれが正常動作です。
+</div>
+
+<div class='box box-warn'>
+<strong>WebRTCのみになってしまう場合：</strong><br>
+CGNAT・モバイル回線などのポート開放ができない環境では、インターネット経由のP2P接続（WebRTC）のみ使用されます。機能はしますが、画像の読み込みが若干遅くなる場合があります。この状態ではサーバーのログに <code>[WebRTC] DC接続</code> のみが表示されます。
+</div>
+
+<!-- ============================================================ -->
+<h2 id='s6'>6. よくある質問</h2>
+
+<h3>Q. 「端末管理」に承認待ちが何件もたまっている</h3>
+<p>同じスマホでもアプリを再インストールすると新しい端末として登録されます。古い「承認待ち」や使わなくなった端末は「端末管理」から削除して構いません。</p>
+
+<h3>Q. 外出先ではつながるのに自宅に戻るとつながらなくなった</h3>
+<p>アプリがまだ「外出先モード（WebRTC等）」で接続しようとしている可能性があります。アプリを一度終了して再起動するか、接続先をリセットしてから「LAN内を探す」でもう一度ペアリングしてください。</p>
+
+<h3>Q. Windowsのファイアウォール設定はどうすればいい？</h3>
+<p>初回起動時にWindowsから「ネットワークアクセスを許可しますか？」というダイアログが表示されたら「アクセスを許可する」を選択してください。ダイアログを見逃した場合は、Windowsの「セキュリティ」→「ファイアウォールとネットワーク保護」→「アプリをファイアウォール経由で許可する」から <code>ArcHiveServer</code>（またはPythonで実行中の場合は <code>Python</code>）を許可してください。</p>
+
+<h3>Q. サーバーを閉じると外出先から接続できなくなる</h3>
+<p>サーバーを終了すると接続できなくなります。「ウィンドウ操作」の「閉じるボタン」を「システムトレイに格納」に設定すると、ウィンドウを閉じてもサーバーはバックグラウンドで動き続けます。タスクバーのトレイアイコンから再表示できます。</p>
+
+<h3>Q. 「ブラウザで開く」ボタンが押せない（グレーになっている）</h3>
+<p>「▶ サーバー起動」を押してからサーバーが起動するまで数秒かかります。ステータスが「起動中」に変わってからボタンが有効になります。</p>
+
+<h3>Q. ログに「UPnP: 失敗」と出る</h3>
+<p>ルーターのUPnP機能が無効になっているか、UPnPに対応していない可能性があります。ルーターの管理画面でUPnPを有効にしてみてください。有効にできない場合でも、WebRTC経由で外出先から接続することは可能です。</p>
+
+<h3>Q. PCを再起動したらつながらなくなった</h3>
+<p>PCを再起動するとサーバーも停止します。サーバーを再度起動してください。Windowsのスタートアップにサーバーを登録しておくと、PC起動時に自動でサーバーが起動します。</p>
+
+<hr>
+<p style='color:#aaa;font-size:0.85em;text-align:center'>ArcHive Server ヘルプ</p>
+
+</body>
+</html>

@@ -2929,6 +2929,9 @@ FG_GREEN = "#a6e3a1"
 FG_RED   = "#f38ba8"
 ACCENT   = "#89b4fa"
 
+# ─── ヘルプHTML（help.htmlが見つからない場合のフォールバック） ────────────────────
+HELP_HTML = (Path(__file__).parent / "help.html").read_text(encoding="utf-8") if (Path(__file__).parent / "help.html").exists() else ""
+
 # ─── GUI アプリ ────────────────────────────────────────────────────────────────
 class App(tk.Tk):
     def __init__(self):
@@ -2979,6 +2982,11 @@ class App(tk.Tk):
         self._status_lbl = tk.Label(f, text="停止中", bg=PANEL, fg=FG_DIM,
                                      font=("Yu Gothic UI", 10))
         self._status_lbl.grid(row=0, column=2, sticky="w")
+
+        help_lbl = tk.Label(f, text="つながらない場合", bg=PANEL, fg=ACCENT,
+                            font=("Yu Gothic UI", 9, "underline"), cursor="hand2")
+        help_lbl.grid(row=0, column=3, padx=14, sticky="e")
+        help_lbl.bind("<Button-1>", lambda e: self._open_help())
 
     def _build_main(self):
         main = tk.Frame(self, bg=BG)
@@ -3507,6 +3515,17 @@ class App(tk.Tk):
                                       "MangaServer", menu)
             threading.Thread(target=self._tray.run, daemon=True).start()
         self._log("システムトレイに格納しました（トレイアイコンから復帰）")
+
+    def _open_help(self):
+        help_src = _app_dir() / "help.html"
+        if help_src.exists():
+            webbrowser.open(help_src.as_uri())
+            return
+        if HELP_HTML:
+            import tempfile
+            tmp = Path(tempfile.gettempdir()) / "archive_help.html"
+            tmp.write_text(HELP_HTML, encoding="utf-8")
+            webbrowser.open(tmp.as_uri())
 
     def _show_window(self):
         """トレイからウィンドウを復帰させる。"""
