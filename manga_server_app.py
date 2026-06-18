@@ -2983,8 +2983,8 @@ class App(tk.Tk):
                                      font=("Yu Gothic UI", 10))
         self._status_lbl.grid(row=0, column=2, sticky="w")
 
-        help_lbl = tk.Label(f, text="つながらない場合", bg=PANEL, fg=ACCENT,
-                            font=("Yu Gothic UI", 9, "underline"), cursor="hand2")
+        help_lbl = tk.Label(f, text=" ？ ", bg=ACCENT, fg=PANEL,
+                            font=("Yu Gothic UI", 10, "bold"), cursor="hand2")
         help_lbl.grid(row=0, column=3, padx=14, sticky="e")
         help_lbl.bind("<Button-1>", lambda e: self._open_help())
 
