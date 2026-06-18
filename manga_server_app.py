@@ -23,8 +23,6 @@ import subprocess
 import threading
 import time
 import webbrowser
-import ctypes
-import ctypes.wintypes as _wt
 import zipfile
 from pathlib import Path
 
@@ -2940,8 +2938,9 @@ class App(tk.Tk):
         except Exception:
             pass
         self._tray = None
+        self._handling_minimize = False
         self.protocol("WM_DELETE_WINDOW", self._on_close_window)
-        self.after_idle(self._setup_minimize_intercept)
+        self.bind("<Unmap>", self._on_unmap)
 
         global _config
         _config = load_config()
@@ -3487,31 +3486,25 @@ class App(tk.Tk):
         else:
             self.iconify()
 
-    def _setup_minimize_intercept(self):
-        """Win32ウィンドウプロシージャを乗っ取り、タイトルバーの最小化ボタンを
-        SC_MINIMIZEレベルで横取りする。ウィンドウが実際に動く前にキャンセルするため
-        チラつきが出ない。
-        wm_frame() でタイトルバーを持つ外側フレームのHWNDを取得する（winfo_id()は内側）。"""
+    def _on_unmap(self, event):
+        if event.widget is not self or self._handling_minimize:
+            return
+        self._handling_minimize = True
+        self.after(0, self._check_minimized)
+
+    def _check_minimized(self):
         try:
-            user32 = ctypes.windll.user32
-            WNDPROCTYPE = ctypes.WINFUNCTYPE(
-                ctypes.c_longlong, _wt.HWND, _wt.UINT, _wt.WPARAM, _wt.LPARAM)
-            user32.CallWindowProcW.restype  = ctypes.c_longlong
-            user32.SetWindowLongPtrW.argtypes = [_wt.HWND, ctypes.c_int, ctypes.c_void_p]
-            user32.SetWindowLongPtrW.restype  = ctypes.c_void_p
-
-            hwnd = _wt.HWND(int(self.wm_frame(), 16))  # タイトルバーのある外側フレーム
-
-            def _wndproc(hwnd, msg, wparam, lparam):
-                if msg == 0x0112 and (wparam & 0xFFF0) == 0xF020:  # WM_SYSCOMMAND / SC_MINIMIZE
-                    self.after(0, self._minimize_action)
-                    return 0
-                return user32.CallWindowProcW(self._orig_wndproc, hwnd, msg, wparam, lparam)
-
-            self._new_wndproc = WNDPROCTYPE(_wndproc)
-            self._orig_wndproc = user32.SetWindowLongPtrW(hwnd, -4, self._new_wndproc)
-        except Exception:
-            pass  # 失敗しても他の機能に影響なし
+            if self.state() != "iconic":
+                return
+            # deiconify()だとウィンドウが一瞬見えてしまう。
+            # iconic→withdrawn は画面に何も出ずに消えるためフラッシュが起きない。
+            self.withdraw()
+            self._minimize_action()
+            # キャンセル時: withdrawしたままtrayも設定されていなければ元に戻す
+            if self.state() == "withdrawn" and self._tray is None:
+                self.deiconify()
+        finally:
+            self._handling_minimize = False
 
     def _hide_to_tray(self):
         """ウィンドウを隠してシステムトレイに常駐させる。"""
