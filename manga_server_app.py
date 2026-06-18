@@ -3326,7 +3326,7 @@ class App(tk.Tk):
     def _start_server(self):
         if not _config.get("scan_dirs"):
             if not messagebox.askyesno(
-                    "確認", "スキャンフォルダが未設定です。\nこのまま起動しますか？"):
+                    "確認", "本棚フォルダが未設定です。\nこのまま起動しますか？"):
                 return
 
         port = _config.get("port", 8765)
