@@ -2205,8 +2205,7 @@ def _signaling_thread_main() -> None:
     try:
         import aiortc  # noqa: F401 — インストール確認
     except ImportError:
-        _log_queue.put("[WebRTC] aiortcがインストールされていません。"
-                       "pip install aiortc を実行してください。")
+        _log_queue.put("[WebRTC] aiortcがインストールされていません。pip install aiortc を実行してください。")
         _signaling_running = False
         return
 

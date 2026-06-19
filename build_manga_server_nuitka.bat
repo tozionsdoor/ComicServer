@@ -29,8 +29,12 @@ rem Clean old builds
 if exist dist\ArcHiveServer         rmdir /s /q dist\ArcHiveServer
 if exist dist\manga_server_app.dist rmdir /s /q dist\manga_server_app.dist
 
+echo Stripping av's Cython pure-mode .py sources so Nuitka can't pick them...
+"%NUITKA_PY%" nuitka_strip_av_cython.py strip
+
 "%NUITKA_PY%" -m nuitka ^
   --standalone ^
+  --no-prefer-source-code ^
   --assume-yes-for-downloads ^
   --windows-console-mode=disable ^
   --windows-icon-from-ico=assets\icon\app_icon.ico ^
@@ -60,7 +64,12 @@ if exist dist\manga_server_app.dist rmdir /s /q dist\manga_server_app.dist
   --include-package=anyio ^
   manga_server_app.py
 
-if errorlevel 1 ( echo. & echo === Nuitka Build FAILED === & pause & exit /b 1 )
+set BUILD_RESULT=%errorlevel%
+
+echo Restoring av's Cython pure-mode .py sources...
+"%NUITKA_PY%" nuitka_strip_av_cython.py restore
+
+if not "%BUILD_RESULT%"=="0" ( echo. & echo === Nuitka Build FAILED === & pause & exit /b 1 )
 
 echo.
 echo [3/3] Renaming output folder to ArcHiveServer...
