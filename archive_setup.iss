@@ -34,7 +34,7 @@ Name: "desktopicon"; Description: "デスクトップにショートカットを
 Name: "autostart"; Description: "Windows 起動時に自動起動する"; GroupDescription: "追加タスク:"
 
 [Files]
-Source: "dist\manga_server_app.dist\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "dist\ArcHiveServer\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{userprograms}\{#AppName}"; Filename: "{app}\{#AppExeName}"

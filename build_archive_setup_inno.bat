@@ -15,8 +15,8 @@ if not exist %ISCC% (
 set WORK_DIR=%~dp0
 cd /d "%WORK_DIR%"
 
-if not exist dist\manga_server_app.dist\ArcHiveServer.exe (
-    echo ERROR: dist\manga_server_app.dist\ArcHiveServer.exe not found.
+if not exist dist\ArcHiveServer\ArcHiveServer.exe (
+    echo ERROR: dist\ArcHiveServer\ArcHiveServer.exe not found.
     echo Run build_manga_server_nuitka.bat first.
     pause & exit /b 1
 )
