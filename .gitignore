@@ -52,3 +52,7 @@ desktop.ini
 
 # ── スクショ元データ（個人情報マスク前、非公開） ─────────────
 docs/images/_unmasked_originals/
+
+# ── ローカル開発ツールの設定・キャッシュ（環境依存） ─────────
+.claude/
+.firebase/
