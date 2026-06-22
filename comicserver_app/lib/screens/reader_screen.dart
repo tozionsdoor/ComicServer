@@ -223,10 +223,69 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
   int      _imgGen         = 0;     // ++ で全 _img / サムネを作り直す
   bool     _imgRecovering  = false; // reconnect の多重起動ガード
   DateTime _lastImgRecover = DateTime.fromMillisecondsSinceEpoch(0); // スロットル基点
+  int      _imgFailStreak  = 0;     // 連続失敗数。再読み込み間隔のバックオフに使う（成功で0）
+
+  // 画像読み込みウォッチドッグ:
+  // flutter_cache_manager がタイムアウト例外を握り潰す等で errorWidget も
+  // 成功コールバックも一切呼ばれずクルクルが無限に残るケースがある。
+  // placeholder表示時にタイマーを仕掛け、一定時間内に成否どちらも来なければ
+  // 強制的に _onImageError 相当の回復処理を起動する（ライブラリ内部のハング対策）。
+  // ただし回線が単に遅いだけのケースで永遠とやり直すと逆に終わらなくなるため、
+  // 一度発火したページは「次の試行」では無制限に待つ（タイマーを仕掛けない）。
+  // そのページの画像が実際に読み込めたら次回のためにフラグをリセットする。
+  // IPv6直結など低速回線では正常進行中の読み込みでも5秒を超えることがあり、
+  // 短すぎると進行中のダウンロードを誤って中断→やり直しのループになるため10秒に設定
+  // （_TimeoutFileServiceの10秒タイムアウトとも整合）。
+  final Map<String, Timer> _imgWatchdogs = {};
+  final Set<int>           _imgWatchdogFired = {}; // ページ番号単位。一度発火したら再武装しない
+
+  void _armImageWatchdog(int n, String genKey) {
+    if (_imgWatchdogFired.contains(n)) return;   // 既に一度発火済み→今回は無制限に待つ
+    if (_imgWatchdogs.containsKey(genKey)) return;
+    _imgWatchdogs[genKey] = Timer(const Duration(seconds: 10), () {
+      _imgWatchdogs.remove(genKey);
+      _imgWatchdogFired.add(n);
+      if (!mounted) return;
+      _onImageError();
+    });
+  }
+
+  void _onImageLoaded(int n, String genKey) {
+    _imgWatchdogs.remove(genKey)?.cancel();
+    _imgWatchdogFired.remove(n);   // 成功したので次回また監視を有効化
+    _imgFailStreak = 0;            // 1枚でも読めたら不調局面を解除（バックオフをリセット）
+  }
+
+  void _onImageFailed(int n, String genKey) {
+    _imgWatchdogs.remove(genKey)?.cancel();
+    _imgWatchdogFired.add(n);      // 即時エラーも「発火済み」扱いし次の再試行は待たせる
+    _onImageError();
+  }
+
+  void _cancelPendingImageTimers() {
+    for (final t in _imgWatchdogs.values) {
+      t.cancel();
+    }
+    _imgWatchdogs.clear();
+  }
+
+  void _clearAllImageWatchdogs() {
+    _cancelPendingImageTimers();
+    _imgWatchdogFired.clear();
+  }
 
   void _prefetchAround(int pvIdx) {
     final ctx = _ctx;
     if (ctx == null || !mounted || _units.isEmpty) return;
+
+    // 表示中のユニットへ戻って来たページは、ユーザーが再度見ようとした
+    // 「新しい試行」として扱い、発火済みフラグをリセットして監視を再有効化する
+    // （前回が読込み失敗のまま固まっていても、隣ページ往復で再度5秒監視が働く）。
+    if (pvIdx >= 0 && pvIdx < _units.length) {
+      final cur = _units[pvIdx];
+      _imgWatchdogFired.remove(cur.first);
+      if (cur.second != null) _imgWatchdogFired.remove(cur.second!);
+    }
 
     // 近い順（前方優先 → 後方）にページ番号を集める
     final pages = <int>[];
@@ -273,6 +332,7 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _connectivitySub?.cancel();
+    _clearAllImageWatchdogs();
     _pageCtrl.dispose();
     _filmCtrl.dispose();
     WakelockPlus.disable();
@@ -1074,8 +1134,9 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
         placeholder: (_, __) => Container(
           color: const Color(0xFF1e1e2e),
         ),
+        // サムネ1枚の失敗では経路回復を呼ばない（本編表示まで巻き込む不要な再読み込みを防ぐ）。
+        // フィルムストリップは非クリティカルで、本編側の回復で _imgGen が進めば一緒に作り直される。
         errorWidget: (_, __, ___) {
-          _onImageError();
           return const ColoredBox(
             color: Color(0xFF1e1e2e),
             child: Center(
@@ -1245,20 +1306,32 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
   }
 
   // ── 画像 ──────────────────────────────────────────────────────────────────
-  // 画像読み込み失敗時の自己回復。8秒スロットル＋多重起動ガードで reconnect を1回に
-  // 集約し、生きた経路を確保できたら _imgGen を進めて画像を作り直す（baseUrlが同じでも
-  // 新規接続で取り直すため、死んだkeep-alive接続も捨てられる）。本物の404等で恒久的に
-  // 失敗する場合もスロットルで暴走しない（reconnectは生存pingで即returnする）。
+  // 表示中ページの画像読み込み失敗時の自己回復。
+  // reconnect() は経路が生きていれば寛容なping（_pingResilient）で即trueを返すので、
+  // 一時的な不調なら同一経路のまま、IPが変わっていれば新経路で画像を取り直す。
+  // 不安定なモバイル回線で失敗が連発しても、WebRTC転落・Firebase読取はreconnect側で
+  // 抑制済み（ヒステリシス＋60秒スロットル）。ここでは「再読み込み（_imgGen++）」自体の
+  // 頻度をバックオフで抑える: 初回は即時、その後は連続失敗が続くほど 8→16→30秒と間隔を
+  // 延ばし、1枚でも読めれば _onImageLoaded がリセットする。これで「頻繁な再読み込み」を防ぐ。
   void _onImageError() {
     if (_imgRecovering) return;
     final now = DateTime.now();
-    if (now.difference(_lastImgRecover) < const Duration(seconds: 8)) return;
+    final waitS = _imgFailStreak <= 0 ? 0
+                : _imgFailStreak == 1 ? 8
+                : _imgFailStreak == 2 ? 16 : 30;
+    if (now.difference(_lastImgRecover) < Duration(seconds: waitS)) return;
     _imgRecovering  = true;
     _lastImgRecover = now;
+    _imgFailStreak++;
     () async {
       try {
-        final ok = await widget.api.reconnect();
-        if (!mounted || !ok) return;
+        await widget.api.reconnect();
+        if (!mounted) return;
+        // 成否に関わらず、reconnectが残した経路で画像を取り直す（同一経路なら死んだ
+        // keep-alive接続を捨てて再取得、経路が変わっていれば新baseUrlで取得）。
+        // 旧世代のタイマーだけ無効化（発火済みフラグは維持し、再試行が無制限に待てる
+        // ようにする＝短周期の無限やり直しループを防ぐ）。
+        _cancelPendingImageTimers();
         setState(() => _imgGen++);
         _prefetchAround(_pageToUnitIndex(_page));
       } finally {
@@ -1268,17 +1341,24 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
   }
 
   Widget _img(int n, BoxFit fit) {
+    final genKey = '${n}_$_imgGen';
     return CachedNetworkImage(
-      key:            ValueKey('img_${n}_$_imgGen'),
+      key:            ValueKey('img_$genKey'),
       imageUrl:       widget.api.pageUrl(widget.book.id, n),
       httpHeaders:    widget.api.headers,
       cacheManager:   widget.api.cacheManager,
-      fit:            fit,
       fadeInDuration: Duration.zero,
-      placeholder: (_, __) => const Center(
-          child: CircularProgressIndicator(color: Color(0xFF89b4fa), strokeWidth: 2)),
+      placeholder: (_, __) {
+        _armImageWatchdog(n, genKey);
+        return const Center(
+            child: CircularProgressIndicator(color: Color(0xFF89b4fa), strokeWidth: 2));
+      },
+      imageBuilder: (_, imageProvider) {
+        _onImageLoaded(n, genKey);
+        return Image(image: imageProvider, fit: fit);
+      },
       errorWidget: (_, __, ___) {
-        _onImageError();
+        _onImageFailed(n, genKey);
         return const Center(
             child: Icon(Icons.broken_image, color: Colors.white30, size: 40));
       },

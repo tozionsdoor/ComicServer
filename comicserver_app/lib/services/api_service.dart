@@ -48,6 +48,11 @@ class ApiService {
   StreamSubscription<Map<String, dynamic>>? _hostWatcher; // 直結アップグレード監視
   bool _upgrading = false;            // _onHostUpdate の多重実行防止
 
+  // 安定維持のための状態（不安定モバイル回線対策）。
+  DateTime _lastHostFetch =
+      DateTime.fromMillisecondsSinceEpoch(0); // Firebase host読取スロットルの基点
+  int _httpFailStreak = 0;            // 直結HTTPの連続全滅回数（WebRTC転落のヒステリシス）
+
   ApiService({
     required this.baseUrl,
     required this.token,
@@ -145,22 +150,65 @@ class ApiService {
   }
 
   Future<bool> _doReconnect() async {
-    // 現行経路が生きていれば張り直さない（resume時の無駄な再接続・バナー点滅を防ぐ）
-    if (!_transportDead && await _ping(baseUrl)) return true;
+    // 現行経路が生きていれば張り直さない（resume時の無駄な再接続・バナー点滅を防ぐ）。
+    // モバイル回線の一時的な輻輳で1回pingが落ちても経路は生きていることが多いので、
+    // 寛容な死活判定（数回試行）で「本当に死んだ」時だけ繋ぎ直しへ進む。
+    final wasDirect = !viaWebRtc;
+    if (!_transportDead && await _pingResilient(baseUrl)) {
+      _httpFailStreak = 0;           // 直結が生きていた → 転落カウンタをリセット
+      return true;
+    }
 
     status.value = '再接続中…';
     try {
       // 1) HTTP候補（LAN/IPv6）をレース。自宅Wi-Fiに戻った等で勝つ。
-      final working = await resolveBaseUrl(candidates, token);
+      // 画面復帰直後はOS（Samsung等のバッテリー最適化）がバックグラウンド通信を
+      // まだ解除し切っていない場合があるため、1回失敗しても即WebRTCに倒さず
+      // 少し待ってもう一度だけレースし直す（無駄なP2P切替・不安定化を防ぐ）。
+      var working = await resolveBaseUrl(candidates, token);
+      if (working == null) {
+        await Future.delayed(const Duration(seconds: 2));
+        working = await resolveBaseUrl(candidates, token);
+      }
+      // 2) 持っている候補が全滅 → Firebaseに問い合わせて最新IPv6/IPv4を取得し再レース。
+      // PCのIPv6は数時間おきにローテーションする(Windowsのプライバシー一時アドレス)ため、
+      // 接続中に変わっていると古い候補は本当に届かない。サーバーは60秒ごとに最新値を
+      // Firebaseへ書き込んでいるので、ここで読みに行けばWebRTC交渉なしに直結を保てる。
+      // ただしFirebase読み取りはダウンロード課金が発生するため、不安定回線で毎回の失敗ごとに
+      // 叩かないよう最短60秒間隔にスロットルする（IPローテーションは数時間周期なので十分）。
+      if (working == null && (roomId ?? '').isNotEmpty) {
+        final now = DateTime.now();
+        if (now.difference(_lastHostFetch) > const Duration(seconds: 60)) {
+          _lastHostFetch = now;
+          final host = await FirebaseSignaling.readServerHost(roomId!);
+          if (host != null) {
+            final freshCands = _candidatesFromHost(host);
+            for (final c in freshCands) {
+              if (!candidates.contains(c)) candidates.add(c);
+            }
+            if (freshCands.isNotEmpty) {
+              working = await resolveBaseUrl(freshCands, token);
+            }
+          }
+        }
+      }
       if (working != null) {
         if (viaWebRtc) await WebRtcService.instance.dispose();  // 古いP2Pを片付け
         baseUrl = working;
         viaWebRtc = false;
+        _httpFailStreak = 0;
         _stopHostWatcher();
         return true;
       }
-      // 2) WebRTC P2P を張り直す（loopbackポートは変わるのでbaseUrlを差し替え）
-      if ((roomId ?? '').isNotEmpty) {
+
+      // 3) HTTP直結が取れなかった。WebRTCへ倒すのはヒステリシス付き。
+      // 直結中の一時的な不調で即WebRTCに落ちると体感が不安定になるため、
+      // 直結からの転落は「連続3回失敗」して初めて許可する（それまでは現状の直結URLを
+      // 据え置き、回線が戻れば次回の_pingResilientで復帰＝WebRTC交渉もFirebaseも使わない）。
+      // 既にWebRTC上で死んでいた場合（wasDirect=false）は猶予なく即再確立する。
+      _httpFailStreak++;
+      final allowWebRtc = !wasDirect || _httpFailStreak >= 3;
+      if (allowWebRtc && (roomId ?? '').isNotEmpty) {
         status.value = 'P2Pで再接続中…';
         final localUrl = await WebRtcService.instance.connect(
           roomId: roomId!,
@@ -172,6 +220,7 @@ class ApiService {
         if (localUrl != null) {
           baseUrl = localUrl;
           viaWebRtc = true;
+          _httpFailStreak = 0;
           _startHostWatcher(); // IPv4/IPv6が復活したら自動で直結に切り替える
           return true;
         }
@@ -180,6 +229,16 @@ class ApiService {
     } finally {
       status.value = null;   // バナーを消す（失敗時は呼び出し側がエラー表示を出す）
     }
+  }
+
+  /// モバイル回線の一時的な輻輳で1回のpingが落ちても経路自体は生きていることが多い。
+  /// 短い間隔で数回試し、全滅した時だけ「経路が死んだ」と判定する（誤った再接続を防ぐ）。
+  Future<bool> _pingResilient(String base) async {
+    for (int i = 0; i < 3; i++) {
+      if (await _ping(base)) return true;
+      if (i < 2) await Future.delayed(const Duration(milliseconds: 600));
+    }
+    return false;
   }
 
   // ── 直結アップグレード監視 ──────────────────────────────────────────────────
@@ -200,20 +259,30 @@ class ApiService {
     _upgrading = false;
   }
 
+  /// Firebaseのhostレコード({ipv6, ipv4, ipv4_port})からHTTP候補URLを組み立てる。
+  List<String> _candidatesFromHost(Map<String, dynamic> host) {
+    final ipv6 = (host['ipv6'] ?? '').toString();
+    final ipv4 = (host['ipv4'] ?? '').toString();
+    final p4   = (host['ipv4_port'] as num?)?.toInt() ?? 0;
+    final port = _portFromCandidates();
+    return <String>[
+      if (ipv6.isNotEmpty) 'https://[$ipv6]:$port',
+      if (ipv4.isNotEmpty && p4 > 0) 'https://$ipv4:$p4',
+    ];
+  }
+
   Future<void> _onHostUpdate(Map<String, dynamic> host) async {
     if (!viaWebRtc) { _stopHostWatcher(); return; }
     if (_upgrading) return;
     _upgrading = true;
     try {
-      final ipv6 = (host['ipv6'] ?? '').toString();
-      final ipv4 = (host['ipv4'] ?? '').toString();
-      final p4   = (host['ipv4_port'] as num?)?.toInt() ?? 0;
-      final port = _portFromCandidates();
-
-      final newCands = <String>[
-        if (ipv6.isNotEmpty) 'https://[$ipv6]:$port',
-        if (ipv4.isNotEmpty && p4 > 0) 'https://$ipv4:$p4',
-      ];
+      final newCands = _candidatesFromHost(host);
+      // 元のLAN/直結候補も一緒にレースする。これが無いと、画面ON直後の一時的な
+      // 通信制限などで一度WebRTCに落ちた後、同じLANに戻ってもFirebaseのhost更新
+      // （IPv6/IPv4グローバルのみ）でしか直結に戻れず、LANへは永久に戻れなくなる。
+      for (final c in candidates) {
+        if (!newCands.contains(c)) newCands.add(c);
+      }
       if (newCands.isEmpty) return;
 
       final working = await resolveBaseUrl(newCands, token);
