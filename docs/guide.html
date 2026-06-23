@@ -140,6 +140,14 @@
       表示されたら「詳細情報」をクリックすると「実行」ボタンが現れるので、それをクリックするとインストールを続行できます。
     </div>
 
+    <div class="note-box" style="background:#fffbef;border-color:#c8a000;">
+      ⚠️ <strong>インストール後、初めてサーバーを起動した直後に動かなくなることがあります。</strong><br>
+      一部のウイルス対策ソフト（特にKaspersky）が、署名のない個人配布アプリの初回起動時の動作を誤って「不審な動作」と判定し、
+      必要なファイルを隔離してしまうことがあるためです。もし起動しなくなった場合は、お使いのウイルス対策ソフトの「隔離」一覧を確認し、
+      隔離されたファイルがあれば復元するか、インストール先フォルダ（<code>%LOCALAPPDATA%\Programs\ArcHiveServer</code>）を
+      ウイルス対策ソフトの除外（信頼ゾーン）に追加してください。
+    </div>
+
     <div class="step">
       <div class="img-col">
         <img src="images/server.png" alt="ArcHiveサーバーのPC画面。本棚フォルダの一覧、接続設定、接続端末の管理画面。">
