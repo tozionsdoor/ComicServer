@@ -41,6 +41,10 @@ class ApiService {
   /// 再接続中に画面下部へ出すステータス文言。null=非表示。UIが購読する。
   final ValueNotifier<String?> status = ValueNotifier<String?>(null);
 
+  /// 接続方式(LAN/IPv6/IPv4/WebRTC)が切り替わるたびに通知する。UIの「接続状況」表示用。
+  final ValueNotifier<int> connectionVersion = ValueNotifier<int>(0);
+  void _bumpConnectionVersion() => connectionVersion.value++;
+
   late final http.Client _client;
   late final CacheManager cacheManager;
 
@@ -52,6 +56,23 @@ class ApiService {
   DateTime _lastHostFetch =
       DateTime.fromMillisecondsSinceEpoch(0); // Firebase host読取スロットルの基点
   int _httpFailStreak = 0;            // 直結HTTPの連続全滅回数（WebRTC転落のヒステリシス）
+
+  /// 現在の接続方式を画面表示用に判定する（設定画面の「接続状況」表示用）。
+  /// サーバー側の_conn_type()と違い、クライアントは自分のIPv6prefixしか知らないので
+  /// LAN(IPv6)とIPv6外部の区別はできない（簡易判定）。
+  String get connectionLabel {
+    if (viaWebRtc) return 'WebRTC（P2P経由）';
+    final host = Uri.tryParse(baseUrl)?.host ?? baseUrl;
+    if (host.contains(':')) return 'IPv6直結';
+    final parts = host.split('.').map(int.tryParse).toList();
+    if (parts.length == 4 && parts.every((p) => p != null)) {
+      final a = parts[0]!, b = parts[1]!;
+      if (a == 127 || a == 10 || (a == 172 && b >= 16 && b <= 31) || (a == 192 && b == 168)) {
+        return 'LAN直結（Wi-Fi）';
+      }
+    }
+    return 'IPv4直結（外部）';
+  }
 
   ApiService({
     required this.baseUrl,
@@ -198,6 +219,7 @@ class ApiService {
         viaWebRtc = false;
         _httpFailStreak = 0;
         _stopHostWatcher();
+        _bumpConnectionVersion();
         return true;
       }
 
@@ -222,6 +244,7 @@ class ApiService {
           viaWebRtc = true;
           _httpFailStreak = 0;
           _startHostWatcher(); // IPv4/IPv6が復活したら自動で直結に切り替える
+          _bumpConnectionVersion();
           return true;
         }
       }
@@ -295,6 +318,7 @@ class ApiService {
         if (!candidates.contains(c)) candidates.add(c);
       }
       _stopHostWatcher();
+      _bumpConnectionVersion();
       status.value = '直結接続に切り替えました';
       Future.delayed(const Duration(seconds: 3), () => status.value = null);
     } finally {

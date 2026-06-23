@@ -262,6 +262,29 @@ class _ShelfScreenState extends State<ShelfScreen> with WidgetsBindingObserver {
                     builder: (_) => HistoryScreen(api: widget.api, onOpenFolder: _navigateToFolder)));
               },
             ),
+            IconButton(
+              icon: const Icon(Icons.info_outline, color: Color(0xFF89b4fa)),
+              tooltip: '接続状況',
+              onPressed: () => showDialog(
+                context: context,
+                builder: (_) => AlertDialog(
+                  backgroundColor: const Color(0xFF1e1e2e),
+                  title: const Text('接続状況',
+                      style: TextStyle(color: Color(0xFFcdd6f4))),
+                  content: Text(
+                    '方式: ${widget.api.connectionLabel}\n'
+                    '接続先: ${Uri.tryParse(widget.api.baseUrl)?.host ?? widget.api.baseUrl}',
+                    style: const TextStyle(color: Color(0xFFcdd6f4)),
+                  ),
+                  actions: [
+                    TextButton(
+                      onPressed: () => Navigator.pop(context),
+                      child: const Text('閉じる'),
+                    ),
+                  ],
+                ),
+              ),
+            ),
           ],
           bottom: PreferredSize(
             preferredSize: const Size.fromHeight(44),

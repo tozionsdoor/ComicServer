@@ -946,19 +946,24 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
             colors: [Colors.black87, Colors.transparent])),
           padding: EdgeInsets.fromLTRB(
               4, MediaQuery.of(context).padding.top + 4, 4, 16),
-          child: Row(children: [
-            IconButton(
-              icon: const Icon(Icons.arrow_back, color: Colors.white),
-              onPressed: _close),
-            Expanded(
-              child: _MarqueeText(
-                text: widget.book.title,
-                style: const TextStyle(color: Colors.white, fontSize: 13),
+          child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+            Row(children: [
+              IconButton(
+                icon: const Icon(Icons.arrow_back, color: Colors.white),
+                onPressed: _close),
+              Expanded(
+                child: _MarqueeText(
+                  text: widget.book.title,
+                  style: const TextStyle(color: Colors.white, fontSize: 13),
+                ),
               ),
-            ),
-            _uiBtn(_rtl ? '右綴じ' : '左綴じ', _toggleRtl, active: _rtl),
-            _uiBtn(_spread ? '見開き' : '単ページ', _toggleSpread, active: _spread),
-            if (_spread) _uiBtn('1ページずらす', _shiftSpreadByOne),
+            ]),
+            Row(mainAxisAlignment: MainAxisAlignment.end, children: [
+              _uiBtn(_rtl ? '右綴じ' : '左綴じ', _toggleRtl, active: _rtl),
+              _uiBtn(_spread ? '見開き' : '単ページ', _toggleSpread, active: _spread),
+              if (_spread) _uiBtn('1ページずらす', _shiftSpreadByOne),
+              _connectionStatusButton(),
+            ]),
           ]),
         ),
       ),
@@ -1366,6 +1371,49 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
   }
 
   // ── UI ボタン ─────────────────────────────────────────────────────────────
+  /// 接続方式（LAN/IPv6/IPv4/WebRTC）を表示するボタン。接続切替時(connectionVersion)に
+  /// 自動で更新されるので、リーディング中に経路が変わったことをその場で確認できる。
+  Widget _connectionStatusButton() {
+    return ValueListenableBuilder<int>(
+      valueListenable: widget.api.connectionVersion,
+      builder: (_, __, ___) => GestureDetector(
+        onTap: () => showDialog(
+          context: context,
+          builder: (_) => AlertDialog(
+            backgroundColor: const Color(0xFF1e1e2e),
+            title: const Text('接続状況',
+                style: TextStyle(color: Color(0xFFcdd6f4))),
+            content: Text(
+              '方式: ${widget.api.connectionLabel}\n'
+              '接続先: ${Uri.tryParse(widget.api.baseUrl)?.host ?? widget.api.baseUrl}',
+              style: const TextStyle(color: Color(0xFFcdd6f4)),
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context),
+                child: const Text('閉じる'),
+              ),
+            ],
+          ),
+        ),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
+          margin: const EdgeInsets.symmetric(horizontal: 3),
+          decoration: BoxDecoration(
+            color: Colors.black54,
+            border: Border.all(color: Colors.white30),
+            borderRadius: BorderRadius.circular(6),
+          ),
+          child: Icon(
+            widget.api.viaWebRtc ? Icons.swap_horiz : Icons.wifi,
+            color: Colors.white70,
+            size: 16,
+          ),
+        ),
+      ),
+    );
+  }
+
   Widget _uiBtn(String label, VoidCallback onTap, {bool active = false}) {
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 3),
@@ -1373,13 +1421,15 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
         child: Container(
           padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
           decoration: BoxDecoration(
-            color: active ? const Color(0xFF89b4fa).withValues(alpha: 0.25)
-                          : Colors.black54,
+            // active時は不透明な塗り背景にする。半透明だと白いページの上で
+            // 文字(淡い青)が背景に溶けて見えなくなるため。
+            color: active ? const Color(0xFF89b4fa) : Colors.black54,
             border: Border.all(
                 color: active ? const Color(0xFF89b4fa) : Colors.white30),
             borderRadius: BorderRadius.circular(6)),
           child: Text(label, style: TextStyle(
-              color: active ? const Color(0xFF89b4fa) : Colors.white70,
+              color: active ? const Color(0xFF1e1e2e) : Colors.white70,
+              fontWeight: active ? FontWeight.bold : FontWeight.normal,
               fontSize: 12)),
         ),
       ),
@@ -1452,9 +1502,13 @@ class _MarqueeTextState extends State<_MarqueeText>
   }
 
   void _recalc(double maxWidth) {
+    // 実際に描画されるTextはOSの文字サイズ設定(textScaler)の影響を受けるため、
+    // ここでも同じスケールで測らないと「ぎりぎり収まる」と誤判定し、
+    // スクロールせずに末尾が見切れることがある。
     final painter = TextPainter(
       text: TextSpan(text: widget.text, style: widget.style),
       textDirection: TextDirection.ltr,
+      textScaler: MediaQuery.textScalerOf(context),
       maxLines: 1,
     )..layout(minWidth: 0, maxWidth: double.infinity);
 
