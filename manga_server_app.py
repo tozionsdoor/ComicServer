@@ -802,6 +802,8 @@ header{background:#181825;padding:10px 14px;display:flex;align-items:center;gap:
 #rfilm{display:flex;gap:4px;padding:6px 14px;align-items:flex-end;min-height:222px}
 .rft{flex:0 0 144px;cursor:pointer;border:2px solid transparent;border-radius:4px;overflow:hidden;background:#313244;transition:border-color .1s}
 .rft img{width:144px;height:198px;object-fit:cover;display:block}
+.rft.pair{flex:0 0 216px;display:flex;gap:1px}
+.rft.pair img{width:107px;height:198px;object-fit:cover;display:block}
 .rft.cur{border-color:#89b4fa}
 .rft:hover{border-color:#585b70}
 </style>
@@ -832,8 +834,9 @@ header{background:#181825;padding:10px 14px;display:flex;align-items:center;gap:
   <div id="rui-top">
     <button class="rbtn" onclick="rClose()">← 本棚</button>
     <span id="rtitle-d"></span>
-    <button class="rbtn on" id="rbtn-dir" onclick="rToggleDir()">RTL ←</button>
+    <button class="rbtn on" id="rbtn-dir" onclick="rToggleDir()">右綴じ</button>
     <button class="rbtn" id="rbtn-spr" onclick="rToggleSpread()">単ページ</button>
+    <button class="rbtn" id="rbtn-mag" onclick="rCycleMagSize()">🔍 小</button>
     <button class="rbtn" id="rbtn-fs" onclick="rToggleFS()">⛶ 全画面</button>
     <button class="rbtn" onclick="rHideUI()" style="margin-left:auto">✕</button>
   </div>
@@ -1119,11 +1122,12 @@ function rRightClick(){ rLoad(rPage+(rRtl?-rStep():+rStep())); }
 function rToggleDir(){
   rRtl=!rRtl;
   const b=document.getElementById('rbtn-dir');
-  b.textContent=rRtl?'RTL ←':'LTR →';
+  b.textContent=rRtl?'右綴じ':'左綴じ';
   b.classList.toggle('on',rRtl);
   rUpdateSlots();
   rApplyRtlLayout();
   rUpdateVolNav();
+  rBuildFilm();
   rFilmHL(rPage);
 }
 
@@ -1132,6 +1136,7 @@ function rToggleSpread(){
   const b=document.getElementById('rbtn-spr');
   b.textContent=rSpread?'見開き':'単ページ';
   b.classList.toggle('on',rSpread);
+  rBuildFilm();
   rLoad(rPage);
 }
 
@@ -1146,26 +1151,42 @@ function rApplyRtlLayout(){
   slider.dir = rRtl ? 'rtl' : 'ltr';
 }
 
-// フィルムストリップ
+// フィルムストリップ（見開き中はメイン表示と同じ2ページ単位でペア表示する）
 function rBuildFilm(){
   if(rObs){rObs.disconnect();rObs=null;}
   const film=document.getElementById('rfilm');
   film.innerHTML='';
   const wrap=document.getElementById('rfilm-wrap');
-  for(let i=0;i<rTotal;i++){
-    const d=document.createElement('div');
-    d.className='rft'; d.dataset.page=i;
-    const pg=i; d.onclick=()=>rLoad(pg);
+  const step=rStep();
+  const mkImg=n=>{
     const img=document.createElement('img');
-    img.alt=''; img.dataset.src='/api/books/'+rId+'/pages/'+i;
-    d.appendChild(img); film.appendChild(d);
+    img.alt=''; img.dataset.src='/api/books/'+rId+'/pages/'+n;
+    return img;
+  };
+  for(let i=0;i<rTotal;i+=step){
+    const hasPair=step===2&&i+1<rTotal;
+    const d=document.createElement('div');
+    d.className='rft'+(hasPair?' pair':'');
+    d.dataset.page=i;
+    if(hasPair) d.dataset.page2=i+1;
+    const pg=i; d.onclick=()=>rLoad(pg);
+    if(hasPair){
+      // 右綴じ: ページ番号が大きい方(後のページ)を左に置く（メイン表示の並びに合わせる）
+      const imgA=mkImg(i), imgB=mkImg(i+1);
+      if(rRtl){ d.appendChild(imgB); d.appendChild(imgA); }
+      else    { d.appendChild(imgA); d.appendChild(imgB); }
+    } else {
+      d.appendChild(mkImg(i));
+    }
+    film.appendChild(d);
   }
   rApplyRtlLayout();
   rObs=new IntersectionObserver(entries=>{
     entries.forEach(e=>{
       if(e.isIntersecting){
-        const img=e.target.querySelector('img');
-        if(img&&img.dataset.src){img.src=img.dataset.src;delete img.dataset.src;}
+        e.target.querySelectorAll('img').forEach(img=>{
+          if(img.dataset.src){img.src=img.dataset.src;delete img.dataset.src;}
+        });
       }
     });
   },{root:wrap,rootMargin:'0px 400px'});
@@ -1175,7 +1196,8 @@ function rBuildFilm(){
 function rFilmHL(n){
   const film=document.getElementById('rfilm');
   film.querySelectorAll('.rft.cur').forEach(d=>d.classList.remove('cur'));
-  const cur=film.querySelector('[data-page="'+n+'"]');
+  let cur=film.querySelector('[data-page="'+n+'"]');
+  if(!cur) cur=film.querySelector('[data-page2="'+n+'"]');
   if(cur){cur.classList.add('cur');cur.scrollIntoView({inline:'center',block:'nearest',behavior:'smooth'});}
 }
 
@@ -1213,9 +1235,23 @@ document.addEventListener('mousedown',e=>{
   if(e.button===1){e.preventDefault();rToggleSpread();}
 });
 
-// ── 虫眼鏡（長押しで×2拡大レンズ・指/カーソル追従・離すと消える） ──
+// ── 虫眼鏡（長押しで拡大レンズ・指/カーソル追従・離すと消える） ──
 let rMagOn=false, rMagTimer=null, rMagJustEnded=false;
-const RMAG_W=640, RMAG_H=480, RMAG_SCALE=2;   // レンズの幅/高さ(px)。本に合わせ横長
+// レンズの幅/高さ(px)・拡大率。本に合わせ横長。サイズはボタンで小/中/大を切替（localStorageに保持）。
+const RMAG_PRESETS=[
+  {w:640,  h:480,  scale:2},    // 小（従来サイズ）
+  {w:880,  h:660,  scale:2.5},  // 中
+  {w:1120, h:840,  scale:3},    // 大
+];
+const RMAG_LABELS=['🔍 小','🔍 中','🔍 大'];
+let rMagSizeIdx=parseInt(localStorage.getItem('ms_magsize')||'0',10);
+if(isNaN(rMagSizeIdx)||rMagSizeIdx<0||rMagSizeIdx>=RMAG_PRESETS.length) rMagSizeIdx=0;
+document.getElementById('rbtn-mag').textContent=RMAG_LABELS[rMagSizeIdx];   // 保存済みサイズをボタンに反映
+function rCycleMagSize(){
+  rMagSizeIdx=(rMagSizeIdx+1)%RMAG_PRESETS.length;
+  try{localStorage.setItem('ms_magsize',rMagSizeIdx);}catch(e){}
+  document.getElementById('rbtn-mag').textContent=RMAG_LABELS[rMagSizeIdx];
+}
 function rMagAt(cx,cy){
   const mag=document.getElementById('rmag');
   mag.style.display='none';                         // 自分を除外して直下の画像を取得
@@ -1224,6 +1260,7 @@ function rMagAt(cx,cy){
   const el=document.elementsFromPoint(cx,cy).find(
     n=>n.tagName==='IMG'&&n.classList.contains('rp')&&n.src);
   if(!el) return;  // 画像外なら出さない
+  const {w:RMAG_W,h:RMAG_H,scale:RMAG_SCALE}=RMAG_PRESETS[rMagSizeIdx];
   const rect=el.getBoundingClientRect();
   const ix=cx-rect.left, iy=cy-rect.top;            // 画像内のポインタ座標
   mag.style.backgroundImage='url("'+el.src+'")';
