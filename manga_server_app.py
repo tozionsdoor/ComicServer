@@ -802,7 +802,9 @@ header{background:#181825;padding:10px 14px;display:flex;align-items:center;gap:
 #rfilm{display:flex;gap:4px;padding:6px 14px;align-items:flex-end;min-height:222px}
 .rft{flex:0 0 144px;cursor:pointer;border:2px solid transparent;border-radius:4px;overflow:hidden;background:#313244;transition:border-color .1s}
 .rft img{width:144px;height:198px;object-fit:cover;display:block}
-.rft.pair{flex:0 0 216px;display:flex;gap:1px}
+/* ペア内部はLTR固定。ストリップ外側のdir=rtl継承で左右が二重反転しないようにする
+   （左右ページの並びはJS側のappend順でメイン表示に合わせている） */
+.rft.pair{flex:0 0 216px;display:flex;gap:1px;direction:ltr}
 .rft.pair img{width:107px;height:198px;object-fit:cover;display:block}
 .rft.cur{border-color:#89b4fa}
 .rft:hover{border-color:#585b70}
@@ -985,6 +987,7 @@ function showHistory(){
 // ── リーダー ────────────────────────────────────────────
 let rId='', rPage=0, rTotal=0, rTitle='';
 let rRtl=true, rSpread=false, rUiOn=false, rIsOpen=false;
+let _filmParity=0;  // フィルムストリップのペア区切りの偶奇（現在ページに追従）
 let _skipPush=false; // popstate 経由のナビゲーション中は履歴を積まない
 let rThumbTimer=null, rObs=null;
 let rSiblings=[], rSiblingIdx=-1;  // 巻ナビ用: 同フォルダの本リストと現在位置
@@ -1107,6 +1110,9 @@ function rLoad(n){
   n=Math.max(0,Math.min(n,rTotal-1));
   rPage=n;
   rUpdateSlots();
+  // 見開きで現在ページの偶奇が変わったら、フィルムのペア区切りを組み直して一致させる
+  // （スライダー等で逆偶奇のページへ飛んだ時だけ。通常の±2送りでは発生しない）
+  if(rSpread && (rPage%2)!==_filmParity) rBuildFilm();
   const label=(n+1)+(rSpread&&n+1<rTotal?'-'+(n+2):'')+' / '+rTotal;
   document.getElementById('rslider').value=n;
   document.getElementById('rpager-d').textContent=label;
@@ -1151,7 +1157,7 @@ function rApplyRtlLayout(){
   slider.dir = rRtl ? 'rtl' : 'ltr';
 }
 
-// フィルムストリップ（見開き中はメイン表示と同じ2ページ単位でペア表示する）
+// フィルムストリップ（見開き中はメイン表示と同じペアで区切る）
 function rBuildFilm(){
   if(rObs){rObs.disconnect();rObs=null;}
   const film=document.getElementById('rfilm');
@@ -1163,22 +1169,31 @@ function rBuildFilm(){
     img.alt=''; img.dataset.src='/api/books/'+rId+'/pages/'+n;
     return img;
   };
-  for(let i=0;i<rTotal;i+=step){
-    const hasPair=step===2&&i+1<rTotal;
+  const mkTile=(a,b)=>{   // a=主ページ, b=ペア相手(なければnull)
+    const hasPair=b!==null;
     const d=document.createElement('div');
     d.className='rft'+(hasPair?' pair':'');
-    d.dataset.page=i;
-    if(hasPair) d.dataset.page2=i+1;
-    const pg=i; d.onclick=()=>rLoad(pg);
+    d.dataset.page=a;
+    if(hasPair) d.dataset.page2=b;
+    d.onclick=()=>rLoad(a);
     if(hasPair){
       // 右綴じ: ページ番号が大きい方(後のページ)を左に置く（メイン表示の並びに合わせる）
-      const imgA=mkImg(i), imgB=mkImg(i+1);
+      const imgA=mkImg(a), imgB=mkImg(b);
       if(rRtl){ d.appendChild(imgB); d.appendChild(imgA); }
       else    { d.appendChild(imgA); d.appendChild(imgB); }
     } else {
-      d.appendChild(mkImg(i));
+      d.appendChild(mkImg(a));
     }
     film.appendChild(d);
+  };
+  // メイン表示は常に (rPage, rPage+1) をペアにするので、フィルムも「現在ページと
+  // 同じ偶奇」でペアを区切る。偶奇が奇数側なら先頭1枚を単独表示して帳尻を合わせる。
+  _filmParity = step===2 ? (rPage%2) : 0;
+  let i=0;
+  if(_filmParity===1 && rTotal>0){ mkTile(0,null); i=1; }
+  for(; i<rTotal; i+=step){
+    const hasPair=step===2&&i+1<rTotal;
+    mkTile(i, hasPair?i+1:null);
   }
   rApplyRtlLayout();
   rObs=new IntersectionObserver(entries=>{
@@ -1193,12 +1208,12 @@ function rBuildFilm(){
   film.querySelectorAll('.rft').forEach(d=>rObs.observe(d));
 }
 
-function rFilmHL(n){
+function rFilmHL(n,behavior){
   const film=document.getElementById('rfilm');
   film.querySelectorAll('.rft.cur').forEach(d=>d.classList.remove('cur'));
   let cur=film.querySelector('[data-page="'+n+'"]');
   if(!cur) cur=film.querySelector('[data-page2="'+n+'"]');
-  if(cur){cur.classList.add('cur');cur.scrollIntoView({inline:'center',block:'nearest',behavior:'smooth'});}
+  if(cur){cur.classList.add('cur');cur.scrollIntoView({inline:'center',block:'nearest',behavior:behavior||'smooth'});}
 }
 
 // UI 表示/非表示（中央クリックのみ、自動消去なし）
@@ -1206,6 +1221,9 @@ function rShowUI(){
   rUiOn=true;
   document.getElementById('rui-top').style.display='flex';
   document.getElementById('rui-bot').style.display='flex';
+  // フィルムは非表示中(display:none)だとscrollIntoViewが効かず先頭のまま残るため、
+  // 表示にした直後に現在ページへ即スクロールしてメインと位置を合わせる。
+  requestAnimationFrame(()=>rFilmHL(rPage,'auto'));
 }
 function rHideUI(){
   rUiOn=false;
@@ -1237,13 +1255,17 @@ document.addEventListener('mousedown',e=>{
 
 // ── 虫眼鏡（長押しで拡大レンズ・指/カーソル追従・離すと消える） ──
 let rMagOn=false, rMagTimer=null, rMagJustEnded=false;
-// レンズの幅/高さ(px)・拡大率。本に合わせ横長。サイズはボタンで小/中/大を切替（localStorageに保持）。
+// レンズの幅/高さ(px)。本に合わせ横長。サイズはボタンで小/中/大を切替（localStorageに保持）。
+// 拡大率は一律 RMAG_SCALE（窓の大きさだけ変え、拡大倍率は小と同じにする）。
+// 画面より大きいサイズを選んでも、rMagAt内で縦横比を保ち画面に収まる最大へ自動縮小する。
+const RMAG_SCALE=2;
 const RMAG_PRESETS=[
-  {w:640,  h:480,  scale:2},    // 小（従来サイズ）
-  {w:880,  h:660,  scale:2.5},  // 中
-  {w:1120, h:840,  scale:3},    // 大
+  {w:640,  h:480 },    // 小（従来サイズ）
+  {w:880,  h:660 },    // 中（窓だけ拡大）
+  {w:1120, h:840 },    // 大
+  {w:2400, h:1800},    // 特大（大型モニタ向け。画面に収まらなければ自動縮小）
 ];
-const RMAG_LABELS=['🔍 小','🔍 中','🔍 大'];
+const RMAG_LABELS=['🔍 小','🔍 中','🔍 大','🔍 特大'];
 let rMagSizeIdx=parseInt(localStorage.getItem('ms_magsize')||'0',10);
 if(isNaN(rMagSizeIdx)||rMagSizeIdx<0||rMagSizeIdx>=RMAG_PRESETS.length) rMagSizeIdx=0;
 document.getElementById('rbtn-mag').textContent=RMAG_LABELS[rMagSizeIdx];   // 保存済みサイズをボタンに反映
@@ -1260,14 +1282,26 @@ function rMagAt(cx,cy){
   const el=document.elementsFromPoint(cx,cy).find(
     n=>n.tagName==='IMG'&&n.classList.contains('rp')&&n.src);
   if(!el) return;  // 画像外なら出さない
-  const {w:RMAG_W,h:RMAG_H,scale:RMAG_SCALE}=RMAG_PRESETS[rMagSizeIdx];
+  // 選択サイズ。枠線(2px)も含め画面内に収める。大きすぎる場合は縦横比を保って収まる最大へ縮小（縮小のみ）。
+  const preset=RMAG_PRESETS[rMagSizeIdx];
+  const BORDER=2;                                   // #rmag の枠線。左右/上下とも枠ごとはみ出さないよう差し引く
+  const maxW=window.innerWidth -BORDER*2, maxH=window.innerHeight-BORDER*2;
+  const fit=Math.min(1, maxW/preset.w, maxH/preset.h);
+  const RMAG_W=Math.round(preset.w*fit), RMAG_H=Math.round(preset.h*fit);
   const rect=el.getBoundingClientRect();
   const ix=cx-rect.left, iy=cy-rect.top;            // 画像内のポインタ座標
+  // レンズ枠はカーソル中心が基準だが、画面(ビューポート)からはみ出さないようクランプ。
+  // 枠が端で止まっても、枠内のカーソル位置(curX,curY)に合わせて拡大像をずらすので
+  // 「枠は画面内に留まり、カーソル位置で見える部分が変わる」挙動になる。
+  let lx=cx-RMAG_W/2, ly=cy-RMAG_H/2;
+  lx=Math.max(0, Math.min(lx, maxW-RMAG_W));
+  ly=Math.max(0, Math.min(ly, maxH-RMAG_H));
+  const curX=cx-lx, curY=cy-ly;                     // レンズ枠内でのカーソル位置
   mag.style.backgroundImage='url("'+el.src+'")';
   mag.style.backgroundSize=(rect.width*RMAG_SCALE)+'px '+(rect.height*RMAG_SCALE)+'px';
-  mag.style.backgroundPosition=(RMAG_W/2-ix*RMAG_SCALE)+'px '+(RMAG_H/2-iy*RMAG_SCALE)+'px';
+  mag.style.backgroundPosition=(curX-ix*RMAG_SCALE)+'px '+(curY-iy*RMAG_SCALE)+'px';
   mag.style.width=RMAG_W+'px'; mag.style.height=RMAG_H+'px';
-  mag.style.left=(cx-RMAG_W/2)+'px'; mag.style.top=(cy-RMAG_H/2)+'px';
+  mag.style.left=lx+'px'; mag.style.top=ly+'px';
   mag.style.display='block';
 }
 function rMagStart(cx,cy){ rMagOn=true; rMagAt(cx,cy); }
