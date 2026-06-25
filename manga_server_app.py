@@ -173,6 +173,28 @@ _preloading: bool       = False # キャッシュ生成スレッドが走って�
 _config: dict           = {}
 _log_queue: queue.Queue = queue.Queue()
 
+# ─── 読書を最優先にするバックグラウンド一時停止（初回キャッシュが読書を邪魔しない） ──
+# 背景のキャッシュ生成（表紙プリロード・本文先読み）が、フォアグラウンドのページ取得と
+# 同じディスク／CPU／(RARの)サブプロセスを奪い合うと、初回の大量キャッシュ中は読書が
+# 極端に遅くなる。そこで「直近にユーザー操作があった間はバックグラウンドを止め、手が
+# 止まった隙にだけ生成を進める」協調方式にして、読書を常に最優先にする。
+BG_QUIET_SECONDS    = 2.0       # 直近のユーザー操作からこの秒数はバックグラウンドを休ませる
+_last_user_activity = 0.0       # 最後にフォアグラウンド要求が来た時刻（time.monotonic）
+
+def _note_user_activity() -> None:
+    """ユーザーの閲覧要求（ページ・表紙・一覧など）が来たことを記録する。
+    バックグラウンド側はこれを見て一時停止し、読書を優先させる。
+    （モジュール変数への代入はCPythonでアトミックなのでロック不要）"""
+    global _last_user_activity
+    _last_user_activity = time.monotonic()
+
+def _bg_wait_while_active() -> None:
+    """バックグラウンド処理を、直近のユーザー操作が収まるまで待たせる。
+    読書中（先読みリクエストが続く間）は生成を完全に止め、ユーザーが手を
+    止めた隙にだけ1件ずつ進める。これにより初回でも読書はほぼ妨げられない。"""
+    while (time.monotonic() - _last_user_activity) < BG_QUIET_SECONDS:
+        time.sleep(0.2)
+
 # 端末登録ノンス（メモリのみ・サーバー再起動でリセット）
 _reg_nonces:    dict[str, float]               = {}  # nonce -> expiry (time.time())
 _recent_nonces: dict[str, tuple[str, float]]   = {}  # client_ip -> (nonce, expiry)
@@ -359,6 +381,7 @@ def _preload_covers_bg(book_ids: list[str]) -> None:
     done = skipped
     try:
         for bid in uncached:
+            _bg_wait_while_active()   # 読書中は表紙生成を止めて読書を優先する
             info = _books.get(bid)
             if not info:
                 done += 1
@@ -464,6 +487,7 @@ def _warm_book_cache(bid: str) -> None:
                 cp = _page_cache_path(bid, n)
                 if cp.exists():
                     continue   # オンデマンドや前回温めで既に生成済み
+                _bg_wait_while_active()   # 読書中は先読みを止めて、要求中のページを優先する
                 try:
                     if is_fitz:
                         pix = doc[int(page_id)].get_pixmap(matrix=pymupdf.Matrix(2, 2))
@@ -1557,6 +1581,7 @@ def status(request: Request, _: str = Depends(_check_auth)):
 @api.get("/api/books")
 def list_books(_: str = Depends(_check_auth)):
     """本棚一覧（相対パス付き）。Android の書棚画面・全文検索で使う。"""
+    _note_user_activity()
     return [
         {"id": bid, "title": info["title"], "rel": info.get("rel", ".")}
         for bid, info in _books.items()
@@ -1568,6 +1593,7 @@ def list_folders(path: str = "", _: str = Depends(_check_auth)):
     指定パス直下のサブフォルダ一覧と直置き本を返す。
     path="" → ルート, path="ジャンル1" → その直下
     """
+    _note_user_activity()
     subfolders: dict[str, dict] = {}
     direct_books: list[dict]    = []
 
@@ -1606,6 +1632,7 @@ def list_folders(path: str = "", _: str = Depends(_check_auth)):
 @api.get("/api/books/{bid}/info")
 def book_info(bid: str, _: str = Depends(_check_auth)):
     """ページ数など詳細情報。初回アクセス時にページ一覧をキャッシュする。"""
+    _note_user_activity()   # 本を開いた直後の先頭ページ取得を、先読みより優先させる
     info = _books.get(bid)
     if not info:
         raise HTTPException(404, "Book not found")
@@ -1622,6 +1649,7 @@ def api_connection_info(_: str = Depends(_check_auth)):
 @api.get("/api/books/{bid}/cover")
 def book_cover(bid: str, _: str = Depends(_check_auth)):
     """表紙サムネイル JPEG を返す。失敗時はグレー画像を返す（500は出さない）。"""
+    _note_user_activity()   # 書棚の閲覧中も背景の表紙プリロードを止めて、表示中の表紙を優先する
     cached = _cover_get(bid)
     if cached:
         return Response(cached, media_type="image/jpeg")
@@ -1651,6 +1679,7 @@ def book_cover(bid: str, _: str = Depends(_check_auth)):
 @api.get("/api/books/{bid}/pages/{n}")
 def get_page(bid: str, n: int, _: str = Depends(_check_auth)):
     """n ページ目の画像 JPEG を返す（スマホ向けにリサイズ済み・ディスクキャッシュ付き）。"""
+    _note_user_activity()   # 読書中はバックグラウンドのキャッシュ生成を止めて応答を優先する
     info = _books.get(bid)
     if not info:
         raise HTTPException(404, "Book not found")
