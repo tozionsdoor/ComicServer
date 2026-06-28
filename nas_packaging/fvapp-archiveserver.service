@@ -1,0 +1,17 @@
+[Unit]
+Description=ArcHive Book Server
+After=network.target
+
+[Service]
+EnvironmentFile=/apps/archiveserver/archive_environment
+ExecStartPre=/bin/sh -c 'test -d "${ARCHIVE_APP_DIR}" || mkdir -p "${ARCHIVE_APP_DIR}"'
+ExecStartPre=/bin/sh -c 'test -d "${ARCHIVE_CACHE_DIR}" || mkdir -p "${ARCHIVE_CACHE_DIR}"'
+ExecStart=/bin/sh -c 'cd /apps/archiveserver && python3 server/manga_server_nas.py'
+Type=simple
+Restart=on-failure
+RestartSec=5
+StartLimitInterval=30s
+StartLimitBurst=3
+
+[Install]
+WantedBy=multi-user.target

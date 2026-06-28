@@ -1,0 +1,10 @@
+#!/bin/sh
+set -e
+
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl stop    fvapp-archiveserver.service 2>/dev/null || true
+    systemctl disable fvapp-archiveserver.service 2>/dev/null || true
+fi
+
+echo "[ArcHive] サービスを停止しました"
+echo "[ArcHive] 設定・キャッシュは /apps/archiveserver/ に残っています（手動削除が必要な場合: rm -rf /apps/archiveserver）"

@@ -1,0 +1,9 @@
+# ArcHive Server 環境変数設定
+# サービス起動前に変更可能（変更後は systemctl restart fvapp-archiveserver が必要）
+
+# アプリデータディレクトリ（設定・証明書・ログ保存先）
+ARCHIVE_APP_DIR=/apps/archiveserver
+
+# キャッシュディレクトリ（表紙サムネイル・ページキャッシュ）
+# 大量の書庫がある場合は容量のある別ドライブを指定することを推奨
+ARCHIVE_CACHE_DIR=/apps/archiveserver/cache
