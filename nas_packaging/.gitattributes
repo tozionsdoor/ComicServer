@@ -1,0 +1,7 @@
+# NAS向けファイルはLinux改行(LF)を維持する
+*.sh        text eol=lf
+*.py        text eol=lf
+*.service   text eol=lf
+DEBIAN/*    text eol=lf
+archive_environment text eol=lf
+config.xml  text eol=lf
