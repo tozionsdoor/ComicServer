@@ -56,3 +56,6 @@ docs/images/_unmasked_originals/
 # ── ローカル開発ツールの設定・キャッシュ（環境依存） ─────────
 .claude/
 .firebase/
+
+# ── NAS パッケージング（環境固有・公開不要） ─────────────────
+nas_packaging/
