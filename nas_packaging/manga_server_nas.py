@@ -1,4 +1,5 @@
 # coding: utf-8
+from __future__ import annotations
 """
 manga_server_nas.py - ArcHive NAS ヘッドレスサーバー
 manga_server_app.py から tkinter/pystray/WebRTC を除いた Linux NAS 向け版。
@@ -31,18 +32,21 @@ import zipfile
 from pathlib import Path
 
 import rarfile
-import pymupdf
+try:
+    import pymupdf
+    PYMUPDF_AVAILABLE = True
+except ImportError:
+    PYMUPDF_AVAILABLE = False
 from PIL import Image
+import warnings
+warnings.filterwarnings('error', category=Image.DecompressionBombWarning)
+Image.MAX_IMAGE_PIXELS = 50_000_000  # 50MP超はOOMリスクがあるため弾く（armelはRAM 512MB）
 
 from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.responses import Response, HTMLResponse
 import uvicorn
 
-from cryptography import x509
-from cryptography.x509.oid import NameOID
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import ec
-from cryptography.x509 import load_pem_x509_certificate
+import hashlib
 
 # ─── ロギング設定（systemd journal / stdout に流れる） ─────────────────────────
 logging.basicConfig(
@@ -86,8 +90,8 @@ for _candidate in [
 
 # ─── 定数 ────────────────────────────────────────────────────────────────────
 IMAGE_EXT    = {'.jpg', '.jpeg', '.png', '.webp', '.bmp', '.gif'}
-FITZ_EXT     = {'.pdf', '.epub'}
-ARCHIVE_EXT  = {'.zip', '.rar', '.cbz', '.cbr', '.pdf', '.epub'}
+FITZ_EXT     = {'.pdf', '.epub'} if PYMUPDF_AVAILABLE else set()
+ARCHIVE_EXT  = {'.zip', '.rar', '.cbz', '.cbr'} | FITZ_EXT
 MIN_FOLDER_IMAGES = 3
 COVER_W, COVER_H  = 200, 280
 PAGE_MAX          = 1800
@@ -137,42 +141,40 @@ def _new_token() -> str:
 def _new_room_id() -> str:
     return secrets.token_urlsafe(24)
 
+def _pem_to_der(pem_bytes: bytes) -> bytes:
+    """PEM → DER（base64デコード）。フィンガープリント計算はDERで行う必要がある。"""
+    import base64 as _b64
+    b64 = ''.join(
+        l for l in pem_bytes.decode('ascii').splitlines()
+        if not l.startswith('-----')
+    )
+    return _b64.b64decode(b64)
+
 def ensure_tls_cert() -> str:
     global _cert_fingerprint
     if CERT_PATH.exists() and KEY_PATH.exists():
+        fp = hashlib.sha256(_pem_to_der(CERT_PATH.read_bytes())).hexdigest()
+        _cert_fingerprint = fp
+        return fp
+    APP_DIR.mkdir(parents=True, exist_ok=True)
+    for openssl_bin in ["/usr/local/ssl/bin/openssl", "/usr/bin/openssl", "openssl"]:
         try:
-            cert = load_pem_x509_certificate(CERT_PATH.read_bytes())
-            fp = cert.fingerprint(hashes.SHA256()).hex()
+            import subprocess
+            subprocess.run([
+                openssl_bin, "req", "-newkey", "rsa:2048", "-nodes",
+                "-keyout", str(KEY_PATH),
+                "-x509", "-days", "3650",
+                "-out", str(CERT_PATH),
+                "-subj", "/CN=ArcHiveServer",
+            ], check=True, capture_output=True)
+            fp = hashlib.sha256(_pem_to_der(CERT_PATH.read_bytes())).hexdigest()
             _cert_fingerprint = fp
             return fp
-        except Exception:
-            pass
-    key = ec.generate_private_key(ec.SECP256R1())
-    subject = issuer = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "ArcHiveServer")])
-    cert = (
-        x509.CertificateBuilder()
-        .subject_name(subject)
-        .issuer_name(issuer)
-        .public_key(key.public_key())
-        .serial_number(x509.random_serial_number())
-        .not_valid_before(datetime.datetime.now(datetime.timezone.utc))
-        .not_valid_after(
-            datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=3650)
-        )
-        .sign(key, hashes.SHA256())
-    )
-    APP_DIR.mkdir(parents=True, exist_ok=True)
-    CERT_PATH.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
-    KEY_PATH.write_bytes(
-        key.private_bytes(
-            serialization.Encoding.PEM,
-            serialization.PrivateFormat.TraditionalOpenSSL,
-            serialization.NoEncryption(),
-        )
-    )
-    fp = cert.fingerprint(hashes.SHA256()).hex()
-    _cert_fingerprint = fp
-    return fp
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            continue
+    _logger.warning("TLS証明書の生成に失敗しました")
+    _cert_fingerprint = ""
+    return ""
 
 def load_config() -> dict:
     if CONFIG_PATH.exists():
@@ -1735,14 +1737,41 @@ def main() -> None:
     _logger.info(f"管理ページ: {admin_url}")
     _logger.info(f"本棚（ブラウザ）: {browser_url}")
 
-    uvicorn.run(
-        api,
-        host=host,
-        port=port,
-        ssl_certfile=str(CERT_PATH),
-        ssl_keyfile=str(KEY_PATH),
-        log_config=None,
-    )
+    # IPv4(LAN) と IPv6(外部) を同時に受け付けるデュアルスタックソケットを試みる。
+    # Python asyncio は IPv6 ソケットに IPV6_V6ONLY=1 を強制するため、
+    # socket.create_server(dualstack_ipv6=True) で明示的に 0 にする必要がある。
+    _sock = None
+    if host in ("::", "0.0.0.0"):
+        try:
+            import socket as _sock_mod
+            _sock = _sock_mod.create_server(
+                ('::', port),
+                family=_sock_mod.AF_INET6,
+                dualstack_ipv6=True,
+                reuse_port=False,
+            )
+            _logger.info(f"デュアルスタック(IPv4+IPv6) ソケット起動: port {port}")
+        except Exception as _e:
+            _logger.warning(f"デュアルスタック失敗、{host} にフォールバック: {_e}")
+            _sock = None
+
+    if _sock is not None:
+        uvicorn.run(
+            api,
+            fd=_sock.fileno(),
+            ssl_certfile=str(CERT_PATH),
+            ssl_keyfile=str(KEY_PATH),
+            log_config=None,
+        )
+    else:
+        uvicorn.run(
+            api,
+            host=host,
+            port=port,
+            ssl_certfile=str(CERT_PATH),
+            ssl_keyfile=str(KEY_PATH),
+            log_config=None,
+        )
 
 if __name__ == "__main__":
     main()

@@ -7,9 +7,9 @@
   <Name>ArcHive Server</Name>
   <Author>ArcHive</Author>
   <RequireReboot>0</RequireReboot>
-  <LaunchURL>http://localhost:8765/admin</LaunchURL>
+  <LaunchURL>https://localhost:8765/admin</LaunchURL>
   <InfoURL lang="en-us">https://tozionsdoor.github.io/ComicServer/</InfoURL>
-  <ConfigURL/>
+  <ConfigURL>https://localhost:8765/admin</ConfigURL>
   <DebianPackage>archiveserver</DebianPackage>
   <ServiceName>fvapp-archiveserver.service</ServiceName>
   <Description lang="ja">自炊マンガ・PDF を自宅 NAS から Android アプリで読める書籍サーバー。</Description>
