@@ -1,6 +1,5 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:io' show HandshakeException;
 import 'package:firebase_database/firebase_database.dart';
 import 'package:flutter/foundation.dart';   // ValueNotifier
 import 'package:flutter_cache_manager/flutter_cache_manager.dart';
@@ -46,8 +45,8 @@ class ApiService {
   final ValueNotifier<int> connectionVersion = ValueNotifier<int>(0);
   void _bumpConnectionVersion() => connectionVersion.value++;
 
-  late http.Client _client;
-  late CacheManager cacheManager;
+  late final http.Client _client;
+  late final CacheManager cacheManager;
 
   Future<bool>? _reconnectInFlight;   // 同時多発の繋ぎ直しを1本に集約
   StreamSubscription<Map<String, dynamic>>? _hostWatcher; // 直結アップグレード監視
@@ -99,20 +98,6 @@ class ApiService {
   }
 
   void dispose() => _stopHostWatcher();
-
-  /// 証明書フィンガープリントが一致しなくなったとき（サーバー再生成等）に
-  /// _client と cacheManager を TOFU モード（任意の証明書を受け入れ）に切り替える。
-  /// 次回 LAN 発見で正しいフィンガープリントに再ペアリングされる。
-  void _switchToTofu() {
-    _client = makePinnedClient('');
-    cacheManager = CacheManager(Config(
-      'comicPageCache',
-      stalePeriod: const Duration(days: 90),
-      maxNrOfCacheObjects: 2000,
-      fileService: _TimeoutFileService(
-          HttpFileService(httpClient: makePinnedClient(''))),
-    ));
-  }
 
   String get _auth => 'Bearer $token';
 
@@ -374,12 +359,6 @@ class ApiService {
             .timeout(const Duration(seconds: 8));
       }
       return res;
-    } on HandshakeException {
-      // 証明書フィンガープリント不一致（サーバー再生成 or 旧ペアリング値）。
-      // TOFU モードに切り替えて即リトライ。次回 LAN 発見で再ペアリングされる。
-      _switchToTofu();
-      return _client.get(u(), headers: headers)
-          .timeout(const Duration(seconds: 8));
     } catch (_) {
       if (await reconnect()) {
         return _client.get(u(), headers: headers)
@@ -401,10 +380,6 @@ class ApiService {
             .timeout(const Duration(seconds: 8));
       }
       return res;
-    } on HandshakeException {
-      _switchToTofu();
-      return _client.post(u(), headers: headers)
-          .timeout(const Duration(seconds: 8));
     } catch (_) {
       if (await reconnect()) {
         return _client.post(u(), headers: headers)
