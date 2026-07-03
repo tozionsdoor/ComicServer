@@ -40,9 +40,9 @@ ArcHive は、ユーザー自身の自宅PCに無料のサーバーソフトを�
 
 1. アプリを起動するとログイン画面が表示されます。
 2. 「サーバーURL」欄に次を入力してください：
-   {{DEMO_URL}}
+   https://permit-oaks-prev-favorite.trycloudflare.com
 3. 「認証トークン」欄に次を入力してください：
-   {{DEMO_TOKEN}}
+   C088jArltd2CZYcz1ZACA-k8G_fB9kHqTzd1POCVta4
    ※ 入力ミスを防ぐため、コピー＆ペーストを推奨します。
 4. 「接続」ボタンを押してください。本棚画面に進みます。
 
@@ -79,9 +79,9 @@ Please connect using the steps below (you do NOT need to be on any specific Wi-F
 
 1. Launch the app to see the login screen.
 2. In the "サーバーURL" (Server URL) field, enter:
-   {{DEMO_URL}}
+   https://permit-oaks-prev-favorite.trycloudflare.com
 3. In the "認証トークン" (Auth token) field, enter:
-   {{DEMO_TOKEN}}
+   C088jArltd2CZYcz1ZACA-k8G_fB9kHqTzd1POCVta4
    (Copy & paste is recommended to avoid typos.)
 4. Tap the "接続" (Connect) button. You will be taken to the bookshelf screen.
 
@@ -101,10 +101,12 @@ to.zionsdoor@gmail.com. The demo server will be kept running during the review p
 
 ---
 
-## 3. 確定前のTODO（URL・トークンが決まったら差し替え）
+## 3. 確定済みの値（2026-06-24セットアップ）
 
-- [ ] cloudflared named tunnel を立て、固定HTTPSホスト名を取得 → `{{DEMO_URL}}` に反映
-- [ ] `manga_server_config.json` の `devices` に審査専用エントリ追加（status=approved）→ `{{DEMO_TOKEN}}` に反映
-- [ ] デモサーバーはサンプル本のみのフォルダを指すよう設定（個人の本棚・市販書籍を含めない）
-- [ ] 審査期間中はデモサーバー＋トンネルを起動したままにする
+- [x] cloudflared quick tunnel 起動済み → `https://permit-oaks-prev-favorite.trycloudflare.com`（2026-07-03 再発行。サーバー再起動でトンネルも落ちてURLが変わったため再取得）
+  （※ quick tunnelはプロセスを落とすとURLが変わる。再起動した場合はこのファイルとPlay Consoleの両方を更新すること）
+- [x] `manga_server_config.json` の `devices` に `google-review` エントリ追加済み（status=approved）→ トークン `C088jArltd2CZYcz1ZACA-k8G_fB9kHqTzd1POCVta4`
+- [x] デモサーバーの `scan_dirs` を `Z:/Taka_Documents/APP/ComicServer/sample` のみに設定済み（個人の本棚は含まない）
+- [ ] 審査期間中はデモサーバー（ArcHiveServer.exe）＋cloudflaredトンネルを起動したままにする
 - [ ] 公開後の更新でも再審査が走るため、当面はデモ環境を残す
+- [ ] **審査完了後**: `manga_server_config_PERSONAL_BACKUP.json` から個人設定を復元し、cloudflaredを終了すること
