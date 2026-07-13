@@ -40,9 +40,9 @@ ArcHive は、ユーザー自身の自宅PCに無料のサーバーソフトを�
 
 1. アプリを起動するとログイン画面が表示されます。
 2. 「サーバーURL」欄に次を入力してください：
-   https://permit-oaks-prev-favorite.trycloudflare.com
+   https://archive-demo.uk
 3. 「認証トークン」欄に次を入力してください：
-   C088jArltd2CZYcz1ZACA-k8G_fB9kHqTzd1POCVta4
+   3-0Nt1zH2uHb87LFNjTKH72j4v-mRwAUmUZ3zYHQCmA
    ※ 入力ミスを防ぐため、コピー＆ペーストを推奨します。
 4. 「接続」ボタンを押してください。本棚画面に進みます。
 
@@ -79,9 +79,9 @@ Please connect using the steps below (you do NOT need to be on any specific Wi-F
 
 1. Launch the app to see the login screen.
 2. In the "サーバーURL" (Server URL) field, enter:
-   https://permit-oaks-prev-favorite.trycloudflare.com
+   https://archive-demo.uk
 3. In the "認証トークン" (Auth token) field, enter:
-   C088jArltd2CZYcz1ZACA-k8G_fB9kHqTzd1POCVta4
+   3-0Nt1zH2uHb87LFNjTKH72j4v-mRwAUmUZ3zYHQCmA
    (Copy & paste is recommended to avoid typos.)
 4. Tap the "接続" (Connect) button. You will be taken to the bookshelf screen.
 
@@ -101,12 +101,12 @@ to.zionsdoor@gmail.com. The demo server will be kept running during the review p
 
 ---
 
-## 3. 確定済みの値（2026-06-24セットアップ）
+## 3. 確定済みの値（2026-07-13更新: named tunnel + 独立運用構成に移行）
 
-- [x] cloudflared quick tunnel 起動済み → `https://permit-oaks-prev-favorite.trycloudflare.com`（2026-07-03 再発行。サーバー再起動でトンネルも落ちてURLが変わったため再取得）
-  （※ quick tunnelはプロセスを落とすとURLが変わる。再起動した場合はこのファイルとPlay Consoleの両方を更新すること）
-- [x] `manga_server_config.json` の `devices` に `google-review` エントリ追加済み（status=approved）→ トークン `C088jArltd2CZYcz1ZACA-k8G_fB9kHqTzd1POCVta4`
+- [x] cloudflared **named tunnel**（固定URL）→ `https://archive-demo.uk`（[[22_cloudflare_named_tunnel.md]]）。以後プロセス再起動してもURLは変わらない。
+- [x] 審査用デモサーバーは個人サーバーと**同一PC上で完全独立運用**（[[23_review_server_standalone.md]]）。設定は`Z:\Taka_Documents\ComicServer\review_server\manga_server_config.json`、`devices.google-review`のトークンは `3-0Nt1zH2uHb87LFNjTKH72j4v-mRwAUmUZ3zYHQCmA`。
 - [x] デモサーバーの `scan_dirs` を `Z:/Taka_Documents/APP/ComicServer/sample` のみに設定済み（個人の本棚は含まない）
-- [ ] 審査期間中はデモサーバー（ArcHiveServer.exe）＋cloudflaredトンネルを起動したままにする
+- [x] Windowsスタートアップフォルダのショートカット2件（`ArcHiveServer_Review.lnk`/`CloudflaredTunnel_Review.lnk`）でPC再起動後も自動復帰
+- [ ] 審査期間中はreview_server＋named tunnelを起動したままにする（個人サーバーとは独立なので、個人サーバー側は自由に使ってよい）
 - [ ] 公開後の更新でも再審査が走るため、当面はデモ環境を残す
-- [ ] **審査完了後**: `manga_server_config_PERSONAL_BACKUP.json` から個人設定を復元し、cloudflaredを終了すること
+- [ ] **本アップデートの審査提出前に、Play Consoleの「アプリへのアクセス権」欄を上記の新URL/新トークンに更新すること**（旧quick tunnel情報のままだと審査員が接続できない）
