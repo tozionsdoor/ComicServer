@@ -119,7 +119,6 @@ DEFAULT_CONFIG: dict = {
     "host":         "0.0.0.0",
     "upnp_ipv4_open": True,  # UPnPでルーターのIPv4ポートを自動開放（PPPoE等でグローバルIPv4を持つ回線向け）
     "report_ipv6": True,  # IPv6直結をアプリに広告する（OFFでWebRTCフォールバックのテストがしやすい）
-    "test_block_direct": False,  # ON中はLAN外からの直結APIアクセスを拒否しWebRTCへ強制フォールバックさせる（テスト用）
     "on_close":     "exit",  # ウィンドウ×ボタン押下時: "exit"/"tray"
     "on_minimize":  "minimize",  # 最小化ボタン押下時: "minimize"/"tray"
     "firebase":     {},   # 空＝DEFAULT_FIREBASEを使う。値を入れればそれで上書き
@@ -758,10 +757,6 @@ def _check_auth(request: Request) -> str:
       （未提示=未ログインの通常アクセスは失敗カウントしない）。
     """
     ip = _client_ip(request)
-    if _config.get("test_block_direct", False) and _conn_type(ip) in ("IPv6直結", "IPv4外部"):
-        # テスト用トグル: 正規トークンでも外部からの直結APIアクセスを拒否し、
-        # アプリ側のHTTP失敗検知→WebRTCフォールバックを強制的に発火させる。
-        raise HTTPException(status_code=503, detail="Direct access temporarily disabled (test mode)")
     supplied = (
         _extract_token(request.headers.get("authorization"))
         or request.query_params.get("token", "")
@@ -3111,8 +3106,9 @@ class App(tk.Tk):
         if not UNRAR_AVAILABLE:
             self._log(f"[警告] WinRAR が見つかりません（RAR/CBR は使用不可）: {UNRAR_PATH}")
 
-        if os.environ.get("ARCHIVE_AUTOSTART") == "1":
-            # 無人運用インスタンス向け: 起動後に自動でサーバー起動→トレイに格納
+        if os.environ.get("ARCHIVE_AUTOSTART") == "1" or "--autostart" in sys.argv[1:]:
+            # 無人運用インスタンス(ARCHIVE_AUTOSTART=1)、または
+            # Windows起動時のRunキー経由(--autostart引数)での起動: 起動後に自動でサーバー起動→トレイに格納
             self.after(500, self._start_server)
             self.after(1500, self._hide_to_tray)
 
@@ -3208,24 +3204,16 @@ class App(tk.Tk):
             activebackground=BG, activeforeground=FG, font=("Yu Gothic UI", 8),
             anchor="w").grid(row=2, column=0, columnspan=2, sticky="w", padx=6, pady=(2, 0))
 
-        # テスト用: 外部からの直結HTTPアクセスを拒否してWebRTCフォールバックを強制発火させる
-        self._block_direct_var = tk.BooleanVar(value=bool(_config.get("test_block_direct", False)))
-        tk.Checkbutton(
-            rf, text="外部からの直結を一時的に拒否（WebRTCフォールバックのテスト用）",
-            variable=self._block_direct_var, bg=BG, fg=FG_DIM, selectcolor=PANEL,
-            activebackground=BG, activeforeground=FG, font=("Yu Gothic UI", 8),
-            anchor="w").grid(row=3, column=0, columnspan=2, sticky="w", padx=6, pady=(2, 0))
-
         tk.Label(rf,
                  text="【接続方法】 同じWi-Fi内ならアプリの「LAN内を探す」でサーバーを自動検出。"
                       "タップすると認証要求が届くので「端末管理」から承認してください。"
                       "一度認証が終われば、外出先では自動で接続方法を切り替えて接続されます。",
                  bg=BG, fg=FG_DIM, font=("Yu Gothic UI", 8),
                  wraplength=340, justify="left").grid(
-            row=4, column=0, columnspan=2, sticky="w", padx=8, pady=(6, 0))
+            row=3, column=0, columnspan=2, sticky="w", padx=8, pady=(6, 0))
 
         btn_rf = tk.Frame(rf, bg=BG)
-        btn_rf.grid(row=5, column=0, columnspan=2, sticky="e", padx=8, pady=(8, 6))
+        btn_rf.grid(row=4, column=0, columnspan=2, sticky="e", padx=8, pady=(8, 6))
         tk.Button(btn_rf, text="端末管理...", bg="#1a2a3a", fg=ACCENT, relief="flat",
                   font=("Yu Gothic UI", 9), padx=8,
                   command=self._manage_devices).pack(side=tk.LEFT, padx=(0, 4))
@@ -3358,9 +3346,8 @@ class App(tk.Tk):
             return
         _config["upnp_ipv4_open"] = bool(self._upnp4_var.get())
         _config["report_ipv6"] = bool(self._ipv6_var.get())
-        _config["test_block_direct"] = bool(self._block_direct_var.get())
         save_config(_config)
-        self._log("設定を保存しました（IPv4/IPv6の変更は60秒以内に反映、直結拒否は即時反映）")
+        self._log("設定を保存しました（IPv4/IPv6の変更は60秒以内に反映）")
 
     # ── 端末管理 ─────────────────────────────────────────────────────────────────
     def _manage_devices(self):

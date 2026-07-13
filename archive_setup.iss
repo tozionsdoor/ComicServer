@@ -3,7 +3,7 @@
 ; Build:  build_archive_setup_inno.bat  ->  dist\ArcHive_Setup.exe
 
 #define AppName "ArcHive Server"
-#define AppVersion "1.0.0"
+#define AppVersion "1.1.0"
 #define AppPublisher "ArcHive"
 #define AppExeName "ArcHiveServer.exe"
 
@@ -41,7 +41,8 @@ Name: "{userprograms}\{#AppName}"; Filename: "{app}\{#AppExeName}"
 Name: "{userdesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; Tasks: desktopicon
 
 [Registry]
-Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "ArcHiveServer"; ValueData: """{app}\{#AppExeName}"""; Flags: uninsdeletevalue; Tasks: autostart
+; --autostart: 起動後に自動でサーバー起動→トレイ格納（手動起動時は付けずGUIから明示的に起動してもらう）
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "ArcHiveServer"; ValueData: """{app}\{#AppExeName}"" --autostart"; Flags: uninsdeletevalue; Tasks: autostart
 
 [Run]
 Filename: "{app}\{#AppExeName}"; Description: "ArcHive Server を起動する"; Flags: nowait postinstall skipifsilent
