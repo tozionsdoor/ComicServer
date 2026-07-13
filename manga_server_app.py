@@ -54,7 +54,14 @@ from cryptography.x509 import load_pem_x509_certificate
 # ─── 実行パス解決（PyInstaller化したexeでも正しく動くようにする） ─────────────
 def _app_dir() -> Path:
     """exe本体（またはスクリプト）が置かれているディレクトリ。
-    設定ファイル・TLS証明書など書き込み/永続化が必要なものはここに置く。"""
+    設定ファイル・TLS証明書など書き込み/永続化が必要なものはここに置く。
+    ARCHIVE_APP_DIR環境変数が設定されていればそちらを優先する
+    （同一PC上で複数インスタンスを別設定で並行運用するため）。"""
+    override = os.environ.get("ARCHIVE_APP_DIR")
+    if override:
+        p = Path(override)
+        p.mkdir(parents=True, exist_ok=True)
+        return p
     if getattr(sys, "frozen", False):
         return Path(sys.executable).parent
     return Path(__file__).parent
@@ -86,7 +93,7 @@ PAGE_MAX     = 1800   # 長辺の最大ピクセル（スマホ向けリサイ�
 CONFIG_PATH = _app_dir() / "manga_server_config.json"
 ICON_PATH   = _resource_path("assets", "icon", "app_icon.ico")
 TRAY_ICON_PATH = _resource_path("assets", "icon", "tray_icon.png")
-_SINGLE_INSTANCE_PORT = 18765   # localhost専用IPC（二重起動防止）
+_SINGLE_INSTANCE_PORT = int(os.environ.get("ARCHIVE_IPC_PORT", 18765))   # localhost専用IPC（二重起動防止）。ARCHIVE_IPC_PORTで複数インスタンス運用可
 _TLS_DIR    = _app_dir()          # 証明書はexeと同じフォルダに置く（永続化のため）
 CERT_PATH   = _TLS_DIR / "server.crt"
 KEY_PATH    = _TLS_DIR / "server.key"
@@ -3103,6 +3110,11 @@ class App(tk.Tk):
         self._log(f"MangaServer 起動 | Python {sys.version.split()[0]}")
         if not UNRAR_AVAILABLE:
             self._log(f"[警告] WinRAR が見つかりません（RAR/CBR は使用不可）: {UNRAR_PATH}")
+
+        if os.environ.get("ARCHIVE_AUTOSTART") == "1":
+            # 無人運用インスタンス向け: 起動後に自動でサーバー起動→トレイに格納
+            self.after(500, self._start_server)
+            self.after(1500, self._hide_to_tray)
 
     # ── UI 構築 ────────────────────────────────────────────────────────────────
     def _build(self):
