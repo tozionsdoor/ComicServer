@@ -111,6 +111,8 @@ DEFAULT_CONFIG: dict = {
     "port":         8765,
     "host":         "0.0.0.0",
     "upnp_ipv4_open": True,  # UPnPでルーターのIPv4ポートを自動開放（PPPoE等でグローバルIPv4を持つ回線向け）
+    "report_ipv6": True,  # IPv6直結をアプリに広告する（OFFでWebRTCフォールバックのテストがしやすい）
+    "test_block_direct": False,  # ON中はLAN外からの直結APIアクセスを拒否しWebRTCへ強制フォールバックさせる（テスト用）
     "on_close":     "exit",  # ウィンドウ×ボタン押下時: "exit"/"tray"
     "on_minimize":  "minimize",  # 最小化ボタン押下時: "minimize"/"tray"
     "firebase":     {},   # 空＝DEFAULT_FIREBASEを使う。値を入れればそれで上書き
@@ -526,7 +528,16 @@ DISCOVERY_PROBE    = b"COMICSERVER_DISCOVER"
 _discovery_started = False
 
 def get_global_ipv6() -> str:
-    """インターネットへ出る際のグローバルIPv6を返す（無ければ空文字）。
+    """アプリへ広告するグローバルIPv6を返す（設定でOFFなら常に空文字）。
+    実アドレスの検出自体は _detect_global_ipv6() が行う。LAN/外部の判定
+    （_conn_type）はこの広告トグルの影響を受けてはいけないので、そちらは
+    _detect_global_ipv6() を直接呼ぶこと。"""
+    if not _config.get("report_ipv6", True):
+        return ""
+    return _detect_global_ipv6()
+
+def _detect_global_ipv6() -> str:
+    """インターネットへ出る際のグローバルIPv6を実際に検出する（無ければ空文字）。
     getsockname()はOSのプライバシー拡張で一時アドレス(数時間で失効・ローテーション)を
     返すことが多いため、同じNIC・同じ/64内にPublic(安定)アドレスがあればそちらを優先する
     （PCにWi-Fi/有線など複数NICがあり、それぞれが別アドレスを持つ場合があるため、
@@ -740,6 +751,10 @@ def _check_auth(request: Request) -> str:
       （未提示=未ログインの通常アクセスは失敗カウントしない）。
     """
     ip = _client_ip(request)
+    if _config.get("test_block_direct", False) and _conn_type(ip) in ("IPv6直結", "IPv4外部"):
+        # テスト用トグル: 正規トークンでも外部からの直結APIアクセスを拒否し、
+        # アプリ側のHTTP失敗検知→WebRTCフォールバックを強制的に発火させる。
+        raise HTTPException(status_code=503, detail="Direct access temporarily disabled (test mode)")
     supplied = (
         _extract_token(request.headers.get("authorization"))
         or request.query_params.get("token", "")
@@ -1556,7 +1571,7 @@ def _conn_type(ip: str) -> str:
     except Exception:
         pass
     if ":" in ip:
-        own_v6 = get_global_ipv6()
+        own_v6 = _detect_global_ipv6()  # LAN判定は広告OFFトグルの影響を受けない
         if own_v6 and ip.split(":")[:4] == own_v6.split(":")[:4]:
             return "LAN(IPv6)"
         return "IPv6直結"
@@ -1979,6 +1994,22 @@ def _dc_response(req_id: int, status: int, content_type: str, body: bytes) -> by
     return struct.pack(">I", len(header)) + header + body
 
 
+# aiortcのSCTP capabilityが maxMessageSize=65536(64KB) 固定のため、
+# それを下回るサイズに分割して送る。831KB級の表紙画像などが単発送信で壊れる問題への対策。
+_DC_CHUNK_SIZE = 49152  # 48KB: 64KB上限に対し8Bフレームヘッダ＋マージンを確保
+
+
+def _dc_send_chunked(channel, resp: bytes) -> None:
+    """_dc_response()の出力を[4B req_id][2B seq][2B total][chunk]の封筒で分割送信する。"""
+    header_len = struct.unpack(">I", resp[:4])[0]
+    header = json.loads(resp[4:4 + header_len])
+    req_id = header["id"]
+    total = max(1, (len(resp) + _DC_CHUNK_SIZE - 1) // _DC_CHUNK_SIZE)
+    for seq in range(total):
+        chunk = resp[seq * _DC_CHUNK_SIZE: (seq + 1) * _DC_CHUNK_SIZE]
+        channel.send(struct.pack(">IHH", req_id, seq, total) + chunk)
+
+
 def _device_label_for_message(message: bytes | str) -> str:
     """DCリクエストのtokenから端末を逆引きし、接続元ログ用のラベルを返す。"""
     try:
@@ -2174,7 +2205,7 @@ async def _run_peer_async(session_id: str, offer_sdp: str,
                     nonlocal device_logged
                     try:
                         resp = await loop.run_in_executor(None, _handle_dc_request, message)
-                        channel.send(resp)
+                        _dc_send_chunked(channel, resp)
                     except Exception as e:
                         _log_queue.put(f"[WebRTC] DCエラー: {e}")
                         return
@@ -2655,6 +2686,8 @@ def _upnp_open_ipv4(internal_ip: str, port: int) -> str:
     毎回呼ぶことでポートマッピングのリースも更新される。失敗してもサーバーは動き続ける。"""
     global _external_ipv4, _external_ipv4_port
     if not _config.get("upnp_ipv4_open", True):
+        _external_ipv4 = ""
+        _external_ipv4_port = 0
         return ""
     try:
         if not _upnp_v4["url"]:
@@ -2914,7 +2947,13 @@ def _ipv6_monitor_thread() -> None:
     while _ipv6_monitor_running:
         changed = False
         ipv6 = get_global_ipv6()
-        if ipv6 and ipv6 != last_ipv6:
+        if not _config.get("report_ipv6", True):
+            # 設定でOFFにされた場合は即座に空へ倒す（テスト用トグルなので、通常の
+            # 一時的な取得失敗と違い「静かに保持」せず確実にFirebaseへ反映する）。
+            if last_ipv6:
+                last_ipv6 = ""
+                changed = True
+        elif ipv6 and ipv6 != last_ipv6:
             _upnp_open_ipv6(ipv6, port)       # IPv6 FWはアドレス変化時に開く
             last_ipv6 = ipv6
             changed = True
@@ -3149,16 +3188,32 @@ class App(tk.Tk):
             activebackground=BG, activeforeground=FG, font=("Yu Gothic UI", 8),
             anchor="w").grid(row=1, column=0, columnspan=2, sticky="w", padx=6, pady=(6, 0))
 
+        # 外出先からのIPv6直結を許可（テスト用にOFFにするとWebRTCフォールバックを検証しやすい）
+        self._ipv6_var = tk.BooleanVar(value=bool(_config.get("report_ipv6", True)))
+        tk.Checkbutton(
+            rf, text="外出先からのIPv6直結を許可（テスト用にOFF可）",
+            variable=self._ipv6_var, bg=BG, fg=FG_DIM, selectcolor=PANEL,
+            activebackground=BG, activeforeground=FG, font=("Yu Gothic UI", 8),
+            anchor="w").grid(row=2, column=0, columnspan=2, sticky="w", padx=6, pady=(2, 0))
+
+        # テスト用: 外部からの直結HTTPアクセスを拒否してWebRTCフォールバックを強制発火させる
+        self._block_direct_var = tk.BooleanVar(value=bool(_config.get("test_block_direct", False)))
+        tk.Checkbutton(
+            rf, text="外部からの直結を一時的に拒否（WebRTCフォールバックのテスト用）",
+            variable=self._block_direct_var, bg=BG, fg=FG_DIM, selectcolor=PANEL,
+            activebackground=BG, activeforeground=FG, font=("Yu Gothic UI", 8),
+            anchor="w").grid(row=3, column=0, columnspan=2, sticky="w", padx=6, pady=(2, 0))
+
         tk.Label(rf,
                  text="【接続方法】 同じWi-Fi内ならアプリの「LAN内を探す」でサーバーを自動検出。"
                       "タップすると認証要求が届くので「端末管理」から承認してください。"
                       "一度認証が終われば、外出先では自動で接続方法を切り替えて接続されます。",
                  bg=BG, fg=FG_DIM, font=("Yu Gothic UI", 8),
                  wraplength=340, justify="left").grid(
-            row=2, column=0, columnspan=2, sticky="w", padx=8, pady=(6, 0))
+            row=4, column=0, columnspan=2, sticky="w", padx=8, pady=(6, 0))
 
         btn_rf = tk.Frame(rf, bg=BG)
-        btn_rf.grid(row=3, column=0, columnspan=2, sticky="e", padx=8, pady=(8, 6))
+        btn_rf.grid(row=5, column=0, columnspan=2, sticky="e", padx=8, pady=(8, 6))
         tk.Button(btn_rf, text="端末管理...", bg="#1a2a3a", fg=ACCENT, relief="flat",
                   font=("Yu Gothic UI", 9), padx=8,
                   command=self._manage_devices).pack(side=tk.LEFT, padx=(0, 4))
@@ -3290,8 +3345,10 @@ class App(tk.Tk):
             messagebox.showerror("エラー", "ポート番号は整数で入力してください")
             return
         _config["upnp_ipv4_open"] = bool(self._upnp4_var.get())
+        _config["report_ipv6"] = bool(self._ipv6_var.get())
+        _config["test_block_direct"] = bool(self._block_direct_var.get())
         save_config(_config)
-        self._log("設定を保存しました（IPv4自動開放の変更は60秒以内に反映）")
+        self._log("設定を保存しました（IPv4/IPv6の変更は60秒以内に反映、直結拒否は即時反映）")
 
     # ── 端末管理 ─────────────────────────────────────────────────────────────────
     def _manage_devices(self):

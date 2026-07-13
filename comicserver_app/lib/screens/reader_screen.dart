@@ -72,6 +72,17 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
   bool _filmNeedsSync = false;
   int? _pendingFilmIndex;
   double _filmViewportW = 0;
+  DateTime? _lastFilmScrollTime;
+
+  void _onFilmScrollTick() {
+    _lastFilmScrollTime = DateTime.now();
+  }
+
+  // フリック直後(慣性スクロール中)かどうか。この間はタップをスクロール停止専用にし、
+  // メニュー開閉やページジャンプを誤発火させない。
+  bool get _filmRecentlyMoving =>
+      _lastFilmScrollTime != null &&
+      DateTime.now().difference(_lastFilmScrollTime!) < const Duration(milliseconds: 150);
 
   // 各見開きの状態にアクセスするキー（戻る時に末尾へジャンプするため）
   final Map<int, GlobalKey<_ScrollUnitState>> _unitKeys = {};
@@ -94,6 +105,11 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
   // 虫眼鏡
   Offset? _magnifierPos;
   static const double _magnifierScale = 2.0;
+  static const List<Size> _magSizePresets = [
+    Size(220, 170), Size(300, 230), Size(390, 300), Size(520, 400),
+  ];
+  static const List<String> _magSizeLabels = ['🔍 小', '🔍 中', '🔍 大', '🔍 特大'];
+  int _magSizeIdx = 2; // デフォルトは従来相当(390x300)
 
   StreamSubscription<List<ConnectivityResult>>? _connectivitySub;
 
@@ -108,6 +124,7 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
       }
     });
     _filmCtrl = ScrollController();
+    _filmCtrl.addListener(_onFilmScrollTick);
     _loadPrefs();
     _loadInfo();
     WakelockPlus.enable();
@@ -140,6 +157,7 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
       _spread = p.getBool('spread') ?? false;
       _spreadPairStart = (p.getInt('spread_pair_offset') ?? 1).clamp(0, 1);
       _heightFrac = p.getDouble('height_frac') ?? 0;
+      _magSizeIdx = (p.getInt('mag_size_idx') ?? 2).clamp(0, _magSizePresets.length - 1);
     });
     _rebuildUnits();
   }
@@ -150,6 +168,14 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
     await p.setBool('spread', _spread);
     await p.setInt('spread_pair_offset', _spreadPairStart.clamp(0, 1));
     await p.setDouble('height_frac', _heightFrac);
+    await p.setInt('mag_size_idx', _magSizeIdx);
+  }
+
+  void _cycleMagSize() {
+    setState(() {
+      _magSizeIdx = (_magSizeIdx + 1) % _magSizePresets.length;
+    });
+    _savePrefs();
   }
 
   Future<void> _loadInfo() async {
@@ -334,6 +360,7 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
     _connectivitySub?.cancel();
     _clearAllImageWatchdogs();
     _pageCtrl.dispose();
+    _filmCtrl.removeListener(_onFilmScrollTick);
     _filmCtrl.dispose();
     WakelockPlus.disable();
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
@@ -475,7 +502,9 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
 
   void _resetFilmController() {
     final old = _filmCtrl;
+    old.removeListener(_onFilmScrollTick);
     _filmCtrl = ScrollController();
+    _filmCtrl.addListener(_onFilmScrollTick);
     _filmViewportW = 0;
     WidgetsBinding.instance.addPostFrameCallback((_) {
       old.dispose();
@@ -962,6 +991,7 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
               _uiBtn(_rtl ? '右綴じ' : '左綴じ', _toggleRtl, active: _rtl),
               _uiBtn(_spread ? '見開き' : '単ページ', _toggleSpread, active: _spread),
               if (_spread) _uiBtn('1ページずらす', _shiftSpreadByOne),
+              _uiBtn(_magSizeLabels[_magSizeIdx], _cycleMagSize),
               _connectionStatusButton(),
             ]),
           ]),
@@ -1044,71 +1074,83 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
 
   Widget _bottomOverlay(BuildContext context) {
     return Positioned(bottom: 0, left: 0, right: 0,
-      child: GestureDetector(onTap: _toggleUI,
-        child: Container(
-          decoration: const BoxDecoration(gradient: LinearGradient(
-            begin: Alignment.bottomCenter, end: Alignment.topCenter,
-            colors: [Colors.black87, Colors.transparent])),
-          padding: EdgeInsets.fromLTRB(
-              8, 16, 8, MediaQuery.of(context).padding.bottom + 8),
-          child: Column(mainAxisSize: MainAxisSize.min, children: [
-            Text('${_page + 1} / $_total',
-                style: const TextStyle(color: Colors.white70, fontSize: 13)),
-            const SizedBox(height: 4),
-            _buildFilmStripV2(),
-            const SizedBox(height: 8),
-            SliderTheme(
-              data: SliderTheme.of(context).copyWith(
-                activeTrackColor:   const Color(0xFF89b4fa),
-                thumbColor:         const Color(0xFF89b4fa),
-                inactiveTrackColor: Colors.white24,
-                overlayColor:       Colors.transparent,
-                trackHeight: 3),
-              child: Slider(
-                value: (_rtl ? (_total - 1 - _page) : _page)
-                    .toDouble().clamp(0, (_total - 1).toDouble()),
-                min: 0, max: (_total - 1).toDouble(),
-                divisions: _total > 1 ? _total - 1 : 1,
-                onChanged: (v) {
-                  final raw = v.round();
-                  _jumpToMangaPage(_rtl ? (_total - 1 - raw) : raw);
-                },
+      child: Container(
+        decoration: const BoxDecoration(gradient: LinearGradient(
+          begin: Alignment.bottomCenter, end: Alignment.topCenter,
+          colors: [Colors.black87, Colors.transparent])),
+        padding: EdgeInsets.fromLTRB(
+            8, 16, 8, MediaQuery.of(context).padding.bottom + 8),
+        // フィルムストリップはメニュー開閉タップ判定の外に置く。フリング停止のための
+        // タップがメニューを閉じてしまわないよう、開閉タップ域と構造的に分離する。
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          GestureDetector(
+            behavior: HitTestBehavior.opaque,
+            onTap: _toggleUI,
+            child: Column(mainAxisSize: MainAxisSize.min, children: [
+              Text('${_page + 1} / $_total',
+                  style: const TextStyle(color: Colors.white70, fontSize: 13)),
+              const SizedBox(height: 4),
+            ]),
+          ),
+          _buildFilmStripV2(),
+          GestureDetector(
+            behavior: HitTestBehavior.opaque,
+            onTap: _toggleUI,
+            child: Column(mainAxisSize: MainAxisSize.min, children: [
+              const SizedBox(height: 8),
+              SliderTheme(
+                data: SliderTheme.of(context).copyWith(
+                  activeTrackColor:   const Color(0xFF89b4fa),
+                  thumbColor:         const Color(0xFF89b4fa),
+                  inactiveTrackColor: Colors.white24,
+                  overlayColor:       Colors.transparent,
+                  trackHeight: 3),
+                child: Slider(
+                  value: (_rtl ? (_total - 1 - _page) : _page)
+                      .toDouble().clamp(0, (_total - 1).toDouble()),
+                  min: 0, max: (_total - 1).toDouble(),
+                  divisions: _total > 1 ? _total - 1 : 1,
+                  onChanged: (v) {
+                    final raw = v.round();
+                    _jumpToMangaPage(_rtl ? (_total - 1 - raw) : raw);
+                  },
+                ),
               ),
-            ),
-            if (widget.siblings.length > 1)
-              Row(children: [
-                // 右綴じは下部ナビの左右を反転: 左=次の巻 / 右=前の巻
-                // 左綴じは従来通り: 左=前の巻 / 右=次の巻
-                Expanded(
-                  child: !_rtl
-                      ? _volumeNavButton(
-                          show: widget.bookIndex > 0,
-                          prev: true,
-                          alignRight: false,
-                        )
-                      : _volumeNavButton(
-                          show: widget.bookIndex < widget.siblings.length - 1,
-                          prev: false,
-                          alignRight: false,
-                        ),
-                ),
-                const SizedBox(width: 6),
-                Expanded(
-                  child: !_rtl
-                      ? _volumeNavButton(
-                          show: widget.bookIndex < widget.siblings.length - 1,
-                          prev: false,
-                          alignRight: true,
-                        )
-                      : _volumeNavButton(
-                          show: widget.bookIndex > 0,
-                          prev: true,
-                          alignRight: true,
-                        ),
-                ),
-              ]),
-          ]),
-        ),
+              if (widget.siblings.length > 1)
+                Row(children: [
+                  // 右綴じは下部ナビの左右を反転: 左=次の巻 / 右=前の巻
+                  // 左綴じは従来通り: 左=前の巻 / 右=次の巻
+                  Expanded(
+                    child: !_rtl
+                        ? _volumeNavButton(
+                            show: widget.bookIndex > 0,
+                            prev: true,
+                            alignRight: false,
+                          )
+                        : _volumeNavButton(
+                            show: widget.bookIndex < widget.siblings.length - 1,
+                            prev: false,
+                            alignRight: false,
+                          ),
+                  ),
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: !_rtl
+                        ? _volumeNavButton(
+                            show: widget.bookIndex < widget.siblings.length - 1,
+                            prev: false,
+                            alignRight: true,
+                          )
+                        : _volumeNavButton(
+                            show: widget.bookIndex > 0,
+                            prev: true,
+                            alignRight: true,
+                          ),
+                  ),
+                ]),
+            ]),
+          ),
+        ]),
       ),
     );
   }
@@ -1202,15 +1244,19 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
                         item.first == _page || item.second == _page;
                     return SizedBox(
                       width: slotW,
-                      child: Center(
-                        child: GestureDetector(
-                          onTap: () {
-                            _filmUserScrolling = false;
-                            _filmNeedsSync = false;
-                            _jumpToMangaPage(page);
-                            _prefetchAround(_pageToUnitIndex(page));
-                            _syncFilmToIndex(filmIndex, animate: true);
-                          },
+                      child: GestureDetector(
+                        behavior: HitTestBehavior.opaque,
+                        onTap: () {
+                          // 慣性スクロール中のタップは「止めるだけ」。誤ってページジャンプ
+                          // させない（Scrollable自体がタップで既に減速を止めている）。
+                          if (_filmRecentlyMoving) return;
+                          _filmUserScrolling = false;
+                          _filmNeedsSync = false;
+                          _jumpToMangaPage(page);
+                          _prefetchAround(_pageToUnitIndex(page));
+                          _syncFilmToIndex(filmIndex, animate: true);
+                        },
+                        child: Center(
                           child: AnimatedContainer(
                             duration: const Duration(milliseconds: 120),
                             curve: Curves.easeOut,
@@ -1260,8 +1306,9 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
     final contentRect = _currentContentRect();
     if (contentRect == null) return const SizedBox();
 
-    final magW  = min(390.0, screenSize.width);
-    final magH  = min(300.0, screenSize.height);
+    final preset = _magSizePresets[_magSizeIdx];
+    final magW  = min(preset.width,  screenSize.width);
+    final magH  = min(preset.height, screenSize.height);
     const scale = _magnifierScale;
 
     final ix = (fingerPos.dx - contentRect.left).clamp(0.0, contentRect.width);

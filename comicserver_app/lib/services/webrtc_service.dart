@@ -22,6 +22,7 @@ class WebRtcService {
   HttpServer? _localServer;
 
   final _pending = <int, Completer<_DcResponse>>{};
+  final _chunkBuffers = <int, List<Uint8List?>>{};
   int _nextId = 1;
   bool _connected = false;
 
@@ -151,15 +152,27 @@ class WebRtcService {
     if (!message.isBinary) return;
     try {
       final data = message.binary;
+      // チャンク封筒: [4B req_id][2B seq][2B total][chunk]
+      final envelope = ByteData.sublistView(data, 0, 8);
+      final reqId = envelope.getUint32(0, Endian.big);
+      final seq = envelope.getUint16(4, Endian.big);
+      final total = envelope.getUint16(6, Endian.big);
+      final chunk = data.sublist(8);
+
+      final buf = _chunkBuffers.putIfAbsent(reqId, () => List<Uint8List?>.filled(total, null));
+      buf[seq] = chunk;
+      if (buf.any((c) => c == null)) return; // まだ全チャンク揃っていない
+      _chunkBuffers.remove(reqId);
+
+      final full = Uint8List.fromList(buf.expand((c) => c!).toList());
       // ByteData.sublistView で安全にオフセット解決
-      final headerLen = ByteData.sublistView(data, 0, 4).getUint32(0, Endian.big);
-      final headerJson = utf8.decode(data.sublist(4, 4 + headerLen));
+      final headerLen = ByteData.sublistView(full, 0, 4).getUint32(0, Endian.big);
+      final headerJson = utf8.decode(full.sublist(4, 4 + headerLen));
       final header = jsonDecode(headerJson) as Map<String, dynamic>;
-      final reqId = (header['id'] as num).toInt();
       final status = (header['status'] as num).toInt();
       final contentType =
           header['content_type']?.toString() ?? 'application/octet-stream';
-      final body = data.sublist(4 + headerLen);
+      final body = full.sublist(4 + headerLen);
 
       final completer = _pending.remove(reqId);
       completer?.complete(_DcResponse(status, contentType, body));
@@ -249,6 +262,7 @@ class WebRtcService {
       c.completeError(StateError('WebRTC disconnected'));
     }
     _pending.clear();
+    _chunkBuffers.clear();
   }
 
   Future<void> dispose() => _cleanup();
