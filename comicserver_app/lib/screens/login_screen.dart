@@ -6,6 +6,7 @@ import '../services/api_service.dart';
 import '../services/device_service.dart';
 import '../services/discovery_service.dart';
 import '../services/http_pinned_client.dart';
+import '../services/saved_connections.dart';
 import '../services/webrtc_service.dart';
 import 'shelf_screen.dart';
 
@@ -27,6 +28,7 @@ class _LoginScreenState extends State<LoginScreen> {
   bool _obscure       = true;
   bool _showTurn      = false;
   String _error       = '';
+  List<SavedConnection> _savedConnections = [];
 
   // 端末登録・承認待ちフロー
   bool   _waitingApproval  = false;
@@ -55,12 +57,15 @@ class _LoginScreenState extends State<LoginScreen> {
   Future<void> _loadSaved() async {
     final prefs = await SharedPreferences.getInstance();
     _certFingerprint = prefs.getString('cert_fingerprint') ?? '';
+    final savedConns = await SavedConnectionsStore.load();
+    if (!mounted) return;
     setState(() {
-      final saved = prefs.getString('url') ?? _urlCtrl.text;
+      _savedConnections = savedConns;
+      final savedUrl = prefs.getString('url') ?? _urlCtrl.text;
       // http:// → https:// に正規化（サーバーTLS化後の既存保存値を修正）
-      _urlCtrl.text       = saved.startsWith('http://')
-          ? saved.replaceFirst('http://', 'https://')
-          : saved;
+      _urlCtrl.text       = savedUrl.startsWith('http://')
+          ? savedUrl.replaceFirst('http://', 'https://')
+          : savedUrl;
       _tokenCtrl.text     = prefs.getString('token') ?? '';
       _turnUrlCtrl.text   = prefs.getString('turn_url')        ?? '';
       _turnUserCtrl.text  = prefs.getString('turn_username')   ?? '';
@@ -249,6 +254,7 @@ class _LoginScreenState extends State<LoginScreen> {
         primaryUrl: baseUrl, ipv6: ipv6, ipv4Global: ipv4Global, ipv4Port: ipv4Port);
     await prefs.setString('url',   baseUrl);
     await prefs.setString('token', token);
+    await SavedConnectionsStore.upsert(baseUrl, token);
     final working = await ApiService.resolveBaseUrl(candidates, token,
         certFingerprint: certFingerprint);
     if (!mounted) return;
@@ -305,6 +311,7 @@ class _LoginScreenState extends State<LoginScreen> {
     if (working != null) {
       await prefs.setString('url',   url);
       await prefs.setString('token', token);
+      await SavedConnectionsStore.upsert(url, token);
       if (!mounted) return;
       final api = ApiService(
           baseUrl: working, token: token, candidates: candidates,
@@ -334,6 +341,7 @@ class _LoginScreenState extends State<LoginScreen> {
       if (localUrl != null) {
         await prefs.setString('url',   url);
         await prefs.setString('token', token);
+        await SavedConnectionsStore.upsert(url, token);
         if (!mounted) return;
         final api = ApiService(
             baseUrl: localUrl, token: token, candidates: candidates,
@@ -428,7 +436,7 @@ class _LoginScreenState extends State<LoginScreen> {
                 fontWeight: FontWeight.bold,
                 color: Color(0xFF89b4fa))),
         const SizedBox(height: 40),
-        _field(_urlCtrl,  'サーバーURL',  Icons.dns,  false),
+        _urlField(),
         const SizedBox(height: 6),
         Align(
           alignment: Alignment.centerRight,
@@ -512,6 +520,49 @@ class _LoginScreenState extends State<LoginScreen> {
               style: TextStyle(color: Color(0xFF585b70), fontSize: 11)),
         ],
       ],
+    );
+  }
+
+  /// サーバーURL入力欄。過去に接続成功した接続先はコンボボックスから選べて、
+  /// 選ぶと紐づく認証トークンが自動入力される。手入力も従来通り可能。
+  Widget _urlField() {
+    final inputTheme = InputDecorationTheme(
+      labelStyle: const TextStyle(color: Color(0xFFa6adc8)),
+      filled: true,
+      fillColor: const Color(0xFF181825),
+      border: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(10), borderSide: BorderSide.none),
+    );
+    return DropdownMenu<String>(
+      controller: _urlCtrl,
+      expandedInsets: EdgeInsets.zero,
+      enableFilter: true,
+      requestFocusOnTap: true,
+      label: const Text('サーバーURL'),
+      leadingIcon: const Icon(Icons.dns, color: Color(0xFF585b70)),
+      textStyle: const TextStyle(color: Color(0xFFcdd6f4)),
+      inputDecorationTheme: inputTheme,
+      menuStyle: const MenuStyle(
+        backgroundColor: WidgetStatePropertyAll(Color(0xFF181825)),
+      ),
+      dropdownMenuEntries: [
+        for (final c in _savedConnections)
+          DropdownMenuEntry(
+            value: c.url,
+            label: c.url,
+            style: MenuItemButton.styleFrom(foregroundColor: const Color(0xFFcdd6f4)),
+          ),
+      ],
+      onSelected: (value) {
+        if (value == null) return;
+        final match = _savedConnections.firstWhere(
+          (c) => c.url == value,
+          orElse: () => const SavedConnection(url: '', token: ''),
+        );
+        if (match.token.isNotEmpty) {
+          setState(() => _tokenCtrl.text = match.token);
+        }
+      },
     );
   }
 
