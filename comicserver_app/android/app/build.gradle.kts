@@ -35,7 +35,7 @@ android {
         // You can update the following values to match your application needs.
         // For more information, see: https://flutter.dev/to/review-gradle-config.
         minSdk = 23   // Firebase Auth が minSdk 23 を要求するため引き上げ（旧: flutter.minSdkVersion=21）
-        targetSdk = flutter.targetSdkVersion
+        targetSdk = 36   // Google Play対象APIレベル要件(2026/08/31まで)。Flutter 3.32.2のデフォルト(35)を明示的に引き上げ
         versionCode = flutter.versionCode
         versionName = flutter.versionName
     }

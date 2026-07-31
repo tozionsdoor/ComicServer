@@ -112,6 +112,9 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
   int _magSizeIdx = 2; // デフォルトは従来相当(390x300)
 
   StreamSubscription<List<ConnectivityResult>>? _connectivitySub;
+  // 巻送り(pushReplacement)による破棄かどうか。巻送り中は次画面が既に全画面化
+  // 済みなので、旧画面のdispose()でシステムバーを再表示させない（bring-backを防ぐ）。
+  bool _replacingVolume = false;
 
   @override
   void initState() {
@@ -363,7 +366,9 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
     _filmCtrl.removeListener(_onFilmScrollTick);
     _filmCtrl.dispose();
     WakelockPlus.disable();
-    SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+    if (!_replacingVolume) {
+      SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+    }
     super.dispose();
   }
 
@@ -622,6 +627,7 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
     _dialogShowing = false;
     if (ok == true && mounted) {
       AdsService.recordVolumeRead();
+      _replacingVolume = true;
       Navigator.pushReplacement(context, MaterialPageRoute(
         builder: (_) => ReaderScreen(
           api: widget.api, book: target,
@@ -1160,6 +1166,23 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
     return _unitKeys[pv]?.currentState?.contentRect();
   }
 
+  // フィルムストリップのサムネ下端に重ねるページ番号ラベル。
+  Widget _filmPageLabel(int displayPage) {
+    return Positioned(
+      left: 0, right: 0, bottom: 0,
+      child: Container(
+        color: Colors.black54,
+        alignment: Alignment.center,
+        padding: const EdgeInsets.symmetric(vertical: 1),
+        child: Text(
+          '$displayPage',
+          style: const TextStyle(
+              color: Colors.white, fontSize: 9, height: 1.2),
+        ),
+      ),
+    );
+  }
+
   Widget _buildFilmStripV2() {
     if (_total <= 0) return const SizedBox.shrink();
     final filmItems = _spread
@@ -1276,20 +1299,40 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
                                 ? Row(
                                     children: [
                                       Expanded(
-                                        child: thumbImage(
-                                          _rtl ? item.second! : item.first,
-                                          memWidth: 160,
+                                        child: Stack(
+                                          fit: StackFit.expand,
+                                          children: [
+                                            thumbImage(
+                                              _rtl ? item.second! : item.first,
+                                              memWidth: 160,
+                                            ),
+                                            _filmPageLabel(
+                                                (_rtl ? item.second! : item.first) + 1),
+                                          ],
                                         ),
                                       ),
                                       Expanded(
-                                        child: thumbImage(
-                                          _rtl ? item.first : item.second!,
-                                          memWidth: 160,
+                                        child: Stack(
+                                          fit: StackFit.expand,
+                                          children: [
+                                            thumbImage(
+                                              _rtl ? item.first : item.second!,
+                                              memWidth: 160,
+                                            ),
+                                            _filmPageLabel(
+                                                (_rtl ? item.first : item.second!) + 1),
+                                          ],
                                         ),
                                       ),
                                     ],
                                   )
-                                : thumbImage(page),
+                                : Stack(
+                                    fit: StackFit.expand,
+                                    children: [
+                                      thumbImage(page),
+                                      _filmPageLabel(page + 1),
+                                    ],
+                                  ),
                           ),
                         ),
                       ),
