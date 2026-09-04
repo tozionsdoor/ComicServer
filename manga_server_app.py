@@ -331,6 +331,25 @@ def resize_jpeg(data: bytes, max_side: int = PAGE_MAX, quality: int = 85) -> byt
     img.save(buf, "JPEG", quality=quality)
     return buf.getvalue()
 
+def thumb_jpeg(data: bytes, max_w: int, quality: int = 78) -> bytes:
+    """幅を基準に縮小した小さいJPEGを返す（アプリのフィルムストリップ用）。
+
+    ページ本体と違い「横幅」を揃えたいので max_side ではなく幅で合わせる。
+    JPEG は draft() で 1/2〜1/8 デコードできるため、原寸を完全に展開せずに済む。
+    """
+    img = Image.open(io.BytesIO(data))
+    try:
+        img.draft("RGB", (max_w, max_w))   # JPEG以外では何もしない
+    except Exception:
+        pass
+    img = img.convert("RGB")
+    w, h = img.size
+    if w > max_w:
+        img = img.resize((max_w, max(1, round(h * max_w / w))), Image.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, "JPEG", quality=quality)
+    return buf.getvalue()
+
 def scan_books(dirs: list[str]) -> int:
     global _books
     _books = {}
@@ -435,9 +454,37 @@ def _cover_put(bid: str, data: bytes) -> None:
     _cover_path(bid).write_bytes(data)
 
 # ─── 本文ページのディスクキャッシュ ───────────────────────────────────────────
-def _page_cache_path(bid: str, n: int) -> Path:
+THUMB_W_MAX = 480   # ?w= で要求できる最大幅。これを超える指定は通常ページとして扱う
+
+def _page_cache_path(bid: str, n: int, w: int = 0) -> Path:
     # PAGE_MAX を含めることでリサイズ設定を変えた時に古いキャッシュと混ざらない
+    if w > 0:
+        return PAGE_CACHE_DIR / f"{bid}_{n}_w{w}.jpg"
     return PAGE_CACHE_DIR / f"{bid}_{n}_{PAGE_MAX}.jpg"
+
+def _page_thumb_bytes(bid: str, info: dict, n: int, w: int) -> bytes:
+    """幅 w のサムネイルを返す（ディスクキャッシュ付き）。
+
+    通常サイズのキャッシュが既にあればそれを元に縮小する（書庫を開かずに済む）。
+    """
+    tp = _page_cache_path(bid, n, w)
+    if tp.exists():
+        try:
+            return tp.read_bytes()
+        except OSError:
+            pass
+    src = _page_cache_path(bid, n)
+    data = None
+    if src.exists():
+        try:
+            data = src.read_bytes()
+        except OSError:
+            data = None
+    if data is None:
+        data = read_raw_image(info["path"], info["pages"][n])
+    jpeg = thumb_jpeg(data, w)
+    _page_cache_put(tp, jpeg)
+    return jpeg
 
 _page_cache_writes = 0  # 数百回に1回だけ掃除するためのカウンタ
 
@@ -1694,8 +1741,12 @@ def book_cover(bid: str, _: str = Depends(_check_auth)):
         return Response(_placeholder_jpeg(), media_type="image/jpeg")
 
 @api.get("/api/books/{bid}/pages/{n}")
-def get_page(bid: str, n: int, _: str = Depends(_check_auth)):
-    """n ページ目の画像 JPEG を返す（スマホ向けにリサイズ済み・ディスクキャッシュ付き）。"""
+def get_page(bid: str, n: int, w: int = 0, _: str = Depends(_check_auth)):
+    """n ページ目の画像 JPEG を返す（スマホ向けにリサイズ済み・ディスクキャッシュ付き）。
+
+    `?w=` を付けるとその幅のサムネイルを返す（アプリのフィルムストリップ用）。
+    付けない従来のリクエストは今まで通り通常サイズを返す。
+    """
     _note_user_activity()   # 読書中はバックグラウンドのキャッシュ生成を止めて応答を優先する
     info = _books.get(bid)
     if not info:
@@ -1704,6 +1755,13 @@ def get_page(bid: str, n: int, _: str = Depends(_check_auth)):
         info["pages"] = get_page_list(info["path"])
     if n < 0 or n >= len(info["pages"]):
         raise HTTPException(404, f"Page {n} out of range (0-{len(info['pages'])-1})")
+
+    # ── サムネイル要求 ──
+    if 0 < w <= THUMB_W_MAX:
+        try:
+            return Response(_page_thumb_bytes(bid, info, n, w), media_type="image/jpeg")
+        except Exception as e:
+            raise HTTPException(500, str(e))
 
     # ── キャッシュ命中: アーカイブを開かず・リサイズせずディスクから即返す ──
     cache_path = _page_cache_path(bid, n)
@@ -2034,6 +2092,7 @@ def _handle_dc_request(message: bytes | str) -> bytes:
         req_type = req.get("type", "")
         bid      = req.get("bid", "")
         n        = int(req.get("n", 0))
+        w        = int(req.get("w", 0))   # >0 ならサムネイル要求
         path     = req.get("path", "")
         supplied = str(req.get("token", ""))
     except Exception as e:
@@ -2135,6 +2194,9 @@ def _handle_dc_request(message: bytes | str) -> bytes:
             if n < 0 or n >= len(pages):
                 return _dc_response(req_id, 404, "application/json",
                                     json.dumps({"error": f"page {n} out of range"}).encode())
+            if 0 < w <= THUMB_W_MAX:     # フィルムストリップ用サムネイル
+                return _dc_response(req_id, 200, "image/jpeg",
+                                    _page_thumb_bytes(bid, info, n, w))
             cache_path = _page_cache_path(bid, n)
             if cache_path.exists():
                 try:

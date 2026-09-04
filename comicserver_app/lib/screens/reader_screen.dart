@@ -87,6 +87,7 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
   // 各見開きの状態にアクセスするキー（戻る時に末尾へジャンプするため）
   final Map<int, GlobalKey<_ScrollUnitState>> _unitKeys = {};
   bool _didRetreat = false;   // 直前の操作が「前へ戻る」だったか
+  int? _retreatTargetPv;      // 戻り先ユニット（構築時に末尾スタートさせる対象、遷移完了まで有効）
 
   GlobalKey<_ScrollUnitState> _keyFor(int pv) =>
       _unitKeys.putIfAbsent(pv, () => GlobalKey<_ScrollUnitState>());
@@ -236,12 +237,27 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
   static const int _kPrefetchAhead       = 8;
   static const int _kPrefetchBehind      = 1;
   static const int _kPrefetchConcurrency = 3;
+  // 比率先読み（見開きペア判定の競合防止）は_kPrefetchConcurrencyの制限を
+  // 経由しない別経路のため、画像先読みと同じ8ページ分まで広げるとサーバーへの
+  // 同時リクエストが跳ね上がる。タップの到達より少し早ければ十分なので狭く絞る。
+  static const int _kRatioLookahead      = 2;
   static const double _kFilmSlotW = 88.0;
   static const double _kFilmThumbW = 78.0;
   static const double _kFilmThumbH = 118.0;
 
   final List<int> _prefetchQueue   = [];
   int             _prefetchInFlight = 0;
+
+  // 先読み開始のデバウンス。
+  // スライダーを大きく動かすと onPageChanged が1ページ刻みで何十回も発火し、
+  // 「通り過ぎるだけのページ」の取得要求が次々と走って回線を占有する。
+  // その結果、指を離して着地したページ自身の取得が後回しになり、
+  // 巻頭まで一気に戻したときに表示が何秒も待たされていた。
+  // 位置が落ち着いてから実際の取得を始めることで、着地ページを最優先にする。
+  // 通常のページ送りでは次ユニットが既に取得済みなので体感差は出ない。
+  static const Duration _kPrefetchDebounce = Duration(milliseconds: 250);
+  Timer? _prefetchTimer;
+  bool   _sliderDragging = false;  // スライダー操作中は先読み・サムネ取得を止める
 
   // 画像の自己回復:
   // ページ画像(CachedNetworkImage)はAPI経路(_getWithRecovery)を通らないため、
@@ -324,18 +340,49 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
       if (unit.first < _total) pages.add(unit.first);
       if (unit.second != null && unit.second! < _total) pages.add(unit.second!);
     }
-    for (int d = 1; d <= _kPrefetchAhead; d++) {
-      addUnit(pvIdx + d);
+    // アスペクト比を先読み（画像そのものの先読みとは別）。
+    // 未検出ページは_rebuildUnitsで「横長でない」＝ペア可能と仮定されるため、
+    // 全ページが横長気味の本（中途半端な幅の画像が並ぶ本など）では、
+    // ユーザーがタップで到達した直後に比率検出→再ペア化が走り、見開きが
+    // 意図せず切り替わってしまう（右→左ページ送りのはずが次ユニットへ飛ぶ）。
+    // 到達前に検出を済ませておくことでこの競合を防ぐ。
+    void detectAheadRatios(int idx) {
+      if (idx < 0 || idx >= _units.length) return;
+      final unit = _units[idx];
+      _detectRatio(unit.first);
+      if (unit.second != null) _detectRatio(unit.second!);
     }
+    // 順序は「次ユニット → 前ユニット → 以降の先読み」。
+    // 前ユニットを最後尾に回すと、8ユニット先までの取得が終わるまで手当てされず、
+    // 先読み実行中にタップで戻った時にキャッシュから追い出されたままになりやすい
+    // （＝戻った瞬間にプレースホルダのクルクルが一瞬出る＝チラつき）。
+    // 戻りは常に1ユニット分だけなので、2番目に優先しても前進の体感は変わらない。
+    addUnit(pvIdx + 1);
+    detectAheadRatios(pvIdx + 1);
     for (int d = 1; d <= _kPrefetchBehind; d++) {
       addUnit(pvIdx - d);
+      if (d <= _kRatioLookahead) detectAheadRatios(pvIdx - d);
+    }
+    for (int d = 2; d <= _kPrefetchAhead; d++) {
+      addUnit(pvIdx + d);
+      if (d <= _kRatioLookahead) detectAheadRatios(pvIdx + d);
     }
 
     // 現在地が変わったらキューを作り直す（追い越された古い要求は捨てる）
     _prefetchQueue
       ..clear()
       ..addAll(pages.where((n) => n >= 0));
-    _pumpPrefetch(ctx);
+
+    // 実際の取得開始は少し待つ（連続ジャンプ中は最後の1回だけ走らせる）。
+    _prefetchTimer?.cancel();
+    _prefetchTimer = null;
+    if (_sliderDragging) return;   // ドラッグ中は開始しない（指を離した時に再開する）
+    _prefetchTimer = Timer(_kPrefetchDebounce, () {
+      _prefetchTimer = null;
+      final c = _ctx;
+      if (!mounted || c == null) return;
+      _pumpPrefetch(c);
+    });
   }
 
   void _pumpPrefetch(BuildContext ctx) {
@@ -361,6 +408,7 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _connectivitySub?.cancel();
+    _prefetchTimer?.cancel();
     _clearAllImageWatchdogs();
     _pageCtrl.dispose();
     _filmCtrl.removeListener(_onFilmScrollTick);
@@ -450,9 +498,23 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
     final target = mangaPage.clamp(0, _total > 0 ? _total - 1 : 0);
     final pvIdx = _pageToUnitIndex(target);
     final displayPage = _spread ? _pvToManga(pvIdx) : target;
+    // 直前に「前へ戻る」操作をしていた場合の残り状態を捨てる。
+    // ジャンプ先は常に先頭（右綴じなら右端）から見せる。
+    _didRetreat = false;
+    _retreatTargetPv = null;
     if (_pageCtrl.hasClients) _pageCtrl.jumpToPage(pvIdx);
     setState(() => _page = displayPage);
     _saveProgress();
+  }
+
+  /// 巻頭(先頭ページ)／巻末(最終ページ)へ一気に移動する。
+  void _jumpToVolumeEdge({required bool toStart}) {
+    if (_total <= 0) return;
+    _filmUserScrolling = false;
+    _filmNeedsSync = false;
+    _jumpToMangaPage(toStart ? 0 : _total - 1);
+    _prefetchAround(_currentPvIndex());
+    _scheduleFilmSyncToIndex(_currentPvIndex(), animate: false);
   }
 
   void _syncFilmToIndex(int filmIndex, {bool animate = true}) {
@@ -477,7 +539,11 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
       _pendingFilmIndex = null;
       return;
     }
-    if (animate) {
+    // 遠くへ飛ぶときにアニメーションさせると、通過する全スロットのサムネイルが
+    // 順番に生成され、その一枚一枚が画像取得を始めてしまう（巻頭ジャンプなら
+    // 数百枚）。1画面分を超える移動は一気に飛ばし、生成を着地点の数枚に抑える。
+    final farJump = (_filmCtrl.offset - offset).abs() > _filmViewportW;
+    if (animate && !farJump) {
       _filmCtrl.animateTo(
         offset,
         duration: const Duration(milliseconds: 120),
@@ -658,18 +724,21 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
     //   左ページへ進め、次タップで次ユニットへ（=2タップで1見開き=ページ単位送り）
     if (_spread) {
       final pvIdx = _currentPvIndex();
-      if (pvIdx < _units.length && _units[pvIdx].isPair) {
+      if (pvIdx < _units.length) {
         final unit = _units[pvIdx];
         final state = _unitKeys[pvIdx]?.currentState;
         if (state != null) {
+          // ペアかどうかに関わらず、画面より広い(=拡大表示中)ユニットは
+          // 端に達するまでスクロールを優先する。単独の横長画像でも同様に
+          // 扱わないと、タップ1回で次ユニットへ飛んでしまう。
           if (state.hasScrollRoom()) {
             if (!state.isAtEnd()) {
               state.animateToEnd();
-              setState(() => _page = unit.second!);
+              if (unit.isPair) setState(() => _page = unit.second!);
               _saveProgress();
               return;
             }
-          } else if (_page == unit.first) {
+          } else if (unit.isPair && _page == unit.first) {
             setState(() => _page = unit.second!);
             _saveProgress();
             return;
@@ -693,18 +762,18 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
     // ・画面に収まる見開き＝左ページ表示中は_pageだけ右ページへ戻し、次タップで前ユニットへ
     if (_spread) {
       final pvIdx = _currentPvIndex();
-      if (pvIdx < _units.length && _units[pvIdx].isPair) {
+      if (pvIdx < _units.length) {
         final unit = _units[pvIdx];
         final state = _unitKeys[pvIdx]?.currentState;
         if (state != null) {
           if (state.hasScrollRoom()) {
             if (!state.isAtStart()) {
               state.animateToStart();
-              setState(() => _page = unit.first);
+              if (unit.isPair) setState(() => _page = unit.first);
               _saveProgress();
               return;
             }
-          } else if (_page == unit.second) {
+          } else if (unit.isPair && _page == unit.second) {
             setState(() => _page = unit.first);
             _saveProgress();
             return;
@@ -715,6 +784,7 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
     final pv = _pageCtrl.page?.round() ?? 0;
     if (pv > 0) {
       _didRetreat = true;    // 前へ: 戻った見開きは末尾(読み終わり側=左ページ)から
+      _retreatTargetPv = pv - 1;
       _pageCtrl.previousPage(
           duration: const Duration(milliseconds: 220), curve: Curves.easeOut);
     } else {
@@ -866,6 +936,7 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
             onPageChanged: (pv) {
               final retreating = _didRetreat;
               _didRetreat = false;
+              _retreatTargetPv = null;
               // 前へ戻った場合、見開きペアなら左ページ(second)から始める
               final newPage = retreating && _spread && pv < _units.length && _units[pv].isPair
                   ? _units[pv].second!
@@ -936,6 +1007,7 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
       screenW:      size.width,
       screenH:      size.height,
       rtl:          _rtl,
+      startAtEnd:   pvIdx == _retreatTargetPv,
       onAdvance:    _advance,
       onRetreat:    _retreat,
       content:      _unitContent(unit),
@@ -1078,6 +1150,37 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
     );
   }
 
+  /// 巻頭／巻末へ一気に移動するボタン。巻ナビと同じ見た目・並びに合わせる。
+  /// 位置は綴じ方向に合わせる（右綴じ＝右が巻頭、左綴じ＝左が巻頭）。
+  Widget _pageJumpButton({required bool toStart, required bool alignRight}) {
+    const style = TextStyle(color: Color(0xFF89b4fa), fontSize: 11);
+    final icon = alignRight ? Icons.last_page : Icons.first_page;
+    final label = toStart ? '巻頭へ移動' : '巻末へ移動';
+    return TextButton(
+      onPressed: () => _jumpToVolumeEdge(toStart: toStart),
+      style: TextButton.styleFrom(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+        minimumSize: const Size(0, 32),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.max,
+        children: alignRight
+            ? [
+                Expanded(
+                  child: Text(label, style: style, textAlign: TextAlign.right),
+                ),
+                const SizedBox(width: 6),
+                Icon(icon, color: const Color(0xFF89b4fa), size: 16),
+              ]
+            : [
+                Icon(icon, color: const Color(0xFF89b4fa), size: 16),
+                const SizedBox(width: 6),
+                Expanded(child: Text(label, style: style)),
+              ],
+      ),
+    );
+  }
+
   Widget _bottomOverlay(BuildContext context) {
     return Positioned(bottom: 0, left: 0, right: 0,
       child: Container(
@@ -1116,12 +1219,30 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
                       .toDouble().clamp(0, (_total - 1).toDouble()),
                   min: 0, max: (_total - 1).toDouble(),
                   divisions: _total > 1 ? _total - 1 : 1,
+                  // ドラッグ中は通過するページの取得を一切始めない。
+                  // 離した時点で「そこ」から先読みとサムネ取得をやり直す。
+                  onChangeStart: (_) => setState(() => _sliderDragging = true),
                   onChanged: (v) {
                     final raw = v.round();
                     _jumpToMangaPage(_rtl ? (_total - 1 - raw) : raw);
                   },
+                  onChangeEnd: (_) {
+                    setState(() => _sliderDragging = false);
+                    _prefetchAround(_currentPvIndex());
+                  },
                 ),
               ),
+              if (_total > 1)
+                Row(children: [
+                  // 右綴じ: 左=巻末 / 右=巻頭    左綴じ: 左=巻頭 / 右=巻末
+                  Expanded(
+                    child: _pageJumpButton(toStart: !_rtl, alignRight: false),
+                  ),
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: _pageJumpButton(toStart: _rtl, alignRight: true),
+                  ),
+                ]),
               if (widget.siblings.length > 1)
                 Row(children: [
                   // 右綴じは下部ナビの左右を反転: 左=次の巻 / 右=前の巻
@@ -1192,9 +1313,19 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
     if (filmCount <= 0) return const SizedBox.shrink();
 
     Widget thumbImage(int page, {int memWidth = 220}) {
+      // スライダー操作中はサムネイルの取得を始めない。
+      // ドラッグ中は通過するスロットが次々に生成されるため、そのたびに
+      // 画像を取りに行くと数十〜数百枚分の通信が走り、着地したページ本体の
+      // 表示まで遅らせてしまう（指を離した時点でまとめて読み込む）。
+      if (_sliderDragging) {
+        return Container(color: const Color(0xFF1e1e2e));
+      }
       return CachedNetworkImage(
         key: ValueKey('thumb_${page}_$_imgGen'),
-        imageUrl: widget.api.pageUrl(widget.book.id, page),
+        // サムネはサーバー側で縮小したものを貰う（対応サーバーなら通信量が激減）。
+        // maxWidthDiskCache だけでは「原寸をダウンロードしてから縮小」になり、
+        // フィルムストリップを開くたびに本文と同じ大きさの画像を何枚も取っていた。
+        imageUrl: widget.api.pageThumbUrl(widget.book.id, page, memWidth),
         httpHeaders: widget.api.headers,
         cacheManager: widget.api.cacheManager,
         memCacheWidth: memWidth,
@@ -1696,6 +1827,7 @@ class _ScrollUnit extends StatefulWidget {
   final double screenW;
   final double screenH;
   final bool   rtl;
+  final bool   startAtEnd; // trueなら初回フレームから末尾(読み終わり側)スクロール位置で表示
   final VoidCallback onAdvance;
   final VoidCallback onRetreat;
 
@@ -1707,6 +1839,7 @@ class _ScrollUnit extends StatefulWidget {
     required this.screenW,
     required this.screenH,
     required this.rtl,
+    this.startAtEnd = false,
     required this.onAdvance,
     required this.onRetreat,
   });
@@ -1716,12 +1849,43 @@ class _ScrollUnit extends StatefulWidget {
 }
 
 class _ScrollUnitState extends State<_ScrollUnit> {
-  final ScrollController _c = ScrollController();
+  // 「戻り表示(startAtEnd)」は描画後に末尾へジャンプさせると、必ず1フレームは
+  // 先頭位置(右ページ)で描画されてしまう（レイアウト完了までmaxScrollExtentが
+  // 分からないため）。それを隠すために透明化すると今度は1フレーム真っ黒になる。
+  // どちらもチラつきの原因なので、末尾位置を自前で計算して初期値として与え、
+  // 最初のフレームから正しい位置で描画する（ジャンプも透明化も不要になる）。
+  //   ビューポート幅 = screenW、スクロールする子の幅 = max(contentWidth, screenW)
+  //   → maxScrollExtent = max(0, contentWidth - screenW)
+  late final ScrollController _c =
+      ScrollController(initialScrollOffset: widget.startAtEnd ? _endOffset : 0);
+
   double _acc = 0;       // オーバースクロール累積
   bool   _fired = false; // 1ジェスチャーで1回だけ発火
   static const _thresh = 70.0;
 
   final GlobalKey _contentKey = GlobalKey();
+
+  double get _endOffset => max(0.0, widget.contentWidth - widget.screenW);
+
+  @override
+  void initState() {
+    super.initState();
+    // 初期値がズレた場合（比率未検出でcontentWidthが暫定値だった等）の保険。
+    // 一致していればjumpToEndは何もしない（jumpToは同値なら通知しない）。
+    if (widget.startAtEnd) {
+      WidgetsBinding.instance.addPostFrameCallback((_) => jumpToEnd());
+    }
+  }
+
+  @override
+  void didUpdateWidget(covariant _ScrollUnit old) {
+    super.didUpdateWidget(old);
+    // GlobalKeyでStateが再利用された(既に構築済みのユニットへ戻った)場合は
+    // initStateが呼ばれず初期値も効かないため、フラグの立ち上がりをここで拾う。
+    if (widget.startAtEnd && !old.startAtEnd) {
+      WidgetsBinding.instance.addPostFrameCallback((_) => jumpToEnd());
+    }
+  }
 
   @override
   void dispose() { _c.dispose(); super.dispose(); }

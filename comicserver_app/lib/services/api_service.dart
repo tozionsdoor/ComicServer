@@ -107,6 +107,12 @@ class ApiService {
   String pageUrl(String bookId, int page) =>
       '$baseUrl/api/books/$bookId/pages/$page';
 
+  /// フィルムストリップ用の小さいページ画像。
+  /// `?w=` を解釈しない旧サーバーは通常サイズを返すだけなので、そのまま動く
+  /// （表示はどちらでも同じ・通信量が減るのは対応サーバーのときだけ）。
+  String pageThumbUrl(String bookId, int page, int width) =>
+      '$baseUrl/api/books/$bookId/pages/$page?w=$width';
+
   Future<bool> testConnection() async {
     try {
       final res = await _client

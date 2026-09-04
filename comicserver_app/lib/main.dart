@@ -11,6 +11,13 @@ import 'services/webrtc_service.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  // 画像キャッシュ上限の引き上げ（既定100MiB）。
+  // デコード後のページ画像はピクセル数×4バイトを占め、4K相当(3840x2160)の
+  // スキャンでは1枚で約32MiB。既定値では3枚しか保持できず、見開き(2枚)＋
+  // 先読みが回るだけで直前のページが追い出され、前ページへ戻った瞬間に
+  // 再デコード待ちのプレースホルダが一瞬見える（チラつき）原因になっていた。
+  // 現在・前・次の見開きを確実に保持できる余裕を持たせる。
+  PaintingBinding.instance.imageCache.maximumSizeBytes = 256 << 20; // 256MiB
   try {
     await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
   } catch (_) {

@@ -224,10 +224,11 @@ class WebRtcService {
       dcReq = {'id': _newId(), 'type': 'cover', 'bid': bid};
     } else if (path.contains('/pages/')) {
       final parts = path.split('/');
-      // /api/books/{bid}/pages/{n}
+      // /api/books/{bid}/pages/{n}[?w=サムネ幅]
       final bid = parts[3];
       final n = int.tryParse(parts[5]) ?? 0;
-      dcReq = {'id': _newId(), 'type': 'page', 'bid': bid, 'n': n};
+      final w = int.tryParse(q['w'] ?? '') ?? 0;
+      dcReq = {'id': _newId(), 'type': 'page', 'bid': bid, 'n': n, 'w': w};
     }
 
     if (dcReq == null || !_connected) {
