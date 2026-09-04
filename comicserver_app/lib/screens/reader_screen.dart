@@ -259,6 +259,68 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
   Timer? _prefetchTimer;
   bool   _sliderDragging = false;  // スライダー操作中は先読み・サムネ取得を止める
 
+  // フィルムストリップのサムネ発行ゲート:
+  // 大きくページ移動した直後は、着地ページ本体・先読み・サムネ十数枚が同時に
+  // サーバーへ殺到する。キャッシュが冷えていると1枚ずつRAR展開が必要なため
+  // 行列の後ろに並んだサムネが10秒タイムアウト（_TimeoutFileService）に達し、
+  // ブロークンアイコンとして残っていた。着地ページが表示されるまでサムネの
+  // 「リクエスト発行そのもの」を止める（ウィジェットを作らない）ことで、
+  // タイムアウトの砂時計を回さずに順番待ちさせる。空いてから要求するので
+  // サムネ自身の成功率も上がる。
+  // 通常のページ送りではゲートを閉じないため、フィルムストリップは点滅しない。
+  static const Duration _kThumbGateTimeout = Duration(seconds: 3);
+  bool   _thumbGateClosed = false;
+  Timer? _thumbGateTimer;
+
+  // サムネの自動リトライ:
+  // サムネの失敗は経路回復(_onImageError)を呼ばない設計のため（本編表示まで
+  // 巻き込む再読み込みを避ける意図）、一度失敗するとページを動かして作り直される
+  // まで壊れたまま残っていた。原因のほとんどは上記の混雑由来タイムアウトなので、
+  // 少し待って1回だけ取り直せば大半は表示できる。
+  // 複数枚が同時に失敗しても1本のタイマーにまとめ、再構築を1回で済ませる。
+  static const int      _kThumbMaxRetry   = 1;
+  static const Duration _kThumbRetryDelay = Duration(milliseconds: 1200);
+  final Map<int, int> _thumbRetry        = {};  // ページ番号 -> 再試行済み回数
+  final Set<int>      _thumbRetryPending = {};  // 次のタイマーで取り直す対象
+  Timer?              _thumbRetryTimer;
+
+  /// 大きなページ移動の直後だけ、着地ページが出るまでサムネ取得を止める。
+  void _closeThumbGate() {
+    _thumbGateTimer?.cancel();
+    _thumbGateClosed = true;
+    // 着地ページ自体が失敗して _onImageLoaded が来ない場合の保険。
+    _thumbGateTimer = Timer(_kThumbGateTimeout, _openThumbGate);
+  }
+
+  void _openThumbGate() {
+    _thumbGateTimer?.cancel();
+    _thumbGateTimer = null;
+    if (!_thumbGateClosed) return;
+    _thumbGateClosed = false;
+    // imageBuilder（build中）から呼ばれ得るので、そのフレーム内では setState しない。
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) setState(() {});
+    });
+  }
+
+  void _scheduleThumbRetry(int page) {
+    if ((_thumbRetry[page] ?? 0) >= _kThumbMaxRetry) return;
+    if (!_thumbRetryPending.add(page)) return;
+    _thumbRetryTimer ??= Timer(_kThumbRetryDelay, () {
+      _thumbRetryTimer = null;
+      if (!mounted) {
+        _thumbRetryPending.clear();
+        return;
+      }
+      setState(() {
+        for (final p in _thumbRetryPending) {
+          _thumbRetry[p] = (_thumbRetry[p] ?? 0) + 1;
+        }
+        _thumbRetryPending.clear();
+      });
+    });
+  }
+
   // 画像の自己回復:
   // ページ画像(CachedNetworkImage)はAPI経路(_getWithRecovery)を通らないため、
   // 経路が一時的に切れると（IPv6プレフィックス/一時アドレスのローテーション、
@@ -299,6 +361,7 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
     _imgWatchdogs.remove(genKey)?.cancel();
     _imgWatchdogFired.remove(n);   // 成功したので次回また監視を有効化
     _imgFailStreak = 0;            // 1枚でも読めたら不調局面を解除（バックオフをリセット）
+    _openThumbGate();              // 着地ページが出たのでサムネ取得を解禁する
   }
 
   void _onImageFailed(int n, String genKey) {
@@ -409,6 +472,8 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
     WidgetsBinding.instance.removeObserver(this);
     _connectivitySub?.cancel();
     _prefetchTimer?.cancel();
+    _thumbGateTimer?.cancel();
+    _thumbRetryTimer?.cancel();
     _clearAllImageWatchdogs();
     _pageCtrl.dispose();
     _filmCtrl.removeListener(_onFilmScrollTick);
@@ -512,6 +577,8 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
     if (_total <= 0) return;
     _filmUserScrolling = false;
     _filmNeedsSync = false;
+    // 着地ページ本体が出るまでサムネは発行しない（混雑を避ける）。
+    _closeThumbGate();
     _jumpToMangaPage(toStart ? 0 : _total - 1);
     _prefetchAround(_currentPvIndex());
     _scheduleFilmSyncToIndex(_currentPvIndex(), animate: false);
@@ -1227,6 +1294,8 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
                     _jumpToMangaPage(_rtl ? (_total - 1 - raw) : raw);
                   },
                   onChangeEnd: (_) {
+                    // 着地ページ本体が出るまでサムネは発行しない（混雑を避ける）。
+                    _closeThumbGate();
                     setState(() => _sliderDragging = false);
                     _prefetchAround(_currentPvIndex());
                   },
@@ -1317,11 +1386,15 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
       // ドラッグ中は通過するスロットが次々に生成されるため、そのたびに
       // 画像を取りに行くと数十〜数百枚分の通信が走り、着地したページ本体の
       // 表示まで遅らせてしまう（指を離した時点でまとめて読み込む）。
-      if (_sliderDragging) {
+      // 指を離した後も、着地ページ本体が出るまではゲートで発行を止める。
+      if (_sliderDragging || _thumbGateClosed) {
         return Container(color: const Color(0xFF1e1e2e));
       }
+      final retry = _thumbRetry[page] ?? 0;
       return CachedNetworkImage(
-        key: ValueKey('thumb_${page}_$_imgGen'),
+        // retry を key に含めることで、再試行時にウィジェットごと作り直して
+        // 取得をやり直させる（同じ key のままでは再リクエストが走らない）。
+        key: ValueKey('thumb_${page}_${_imgGen}_$retry'),
         // サムネはサーバー側で縮小したものを貰う（対応サーバーなら通信量が激減）。
         // maxWidthDiskCache だけでは「原寸をダウンロードしてから縮小」になり、
         // フィルムストリップを開くたびに本文と同じ大きさの画像を何枚も取っていた。
@@ -1337,7 +1410,9 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
         ),
         // サムネ1枚の失敗では経路回復を呼ばない（本編表示まで巻き込む不要な再読み込みを防ぐ）。
         // フィルムストリップは非クリティカルで、本編側の回復で _imgGen が進めば一緒に作り直される。
+        // 代わりに、この1枚だけを少し待って取り直す（混雑由来の失敗を自力で拾う）。
         errorWidget: (_, __, ___) {
+          _scheduleThumbRetry(page);
           return const ColoredBox(
             color: Color(0xFF1e1e2e),
             child: Center(
@@ -1558,7 +1633,14 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
         // 旧世代のタイマーだけ無効化（発火済みフラグは維持し、再試行が無制限に待てる
         // ようにする＝短周期の無限やり直しループを防ぐ）。
         _cancelPendingImageTimers();
-        setState(() => _imgGen++);
+        // 経路をやり直すので、サムネの再試行回数もリセットして取り直させる。
+        _thumbRetryTimer?.cancel();
+        _thumbRetryTimer = null;
+        _thumbRetryPending.clear();
+        setState(() {
+          _thumbRetry.clear();
+          _imgGen++;
+        });
         _prefetchAround(_pageToUnitIndex(_page));
       } finally {
         _imgRecovering = false;

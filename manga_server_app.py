@@ -279,7 +279,10 @@ def save_config(cfg: dict) -> None:
     )
 
 # RARページ展開の同時実行数。unrar.exeの子プロセス起動が競合しないよう絞る。
-_rar_extract_sem = threading.Semaphore(2)
+# 2は絞りすぎだった: 総スラッシングは減るが1件あたりの待ちが伸び、行列の後ろに
+# 並んだフィルムストリップのサムネがクライアント側10秒タイムアウトに達して
+# ブロークン表示になる頻度が上がっていた。4なら競合を抑えつつ待ち行列も短い。
+_rar_extract_sem = threading.Semaphore(4)
 
 def natural_key(s: str) -> list:
     """'第99巻' → ['第', 99, '巻'] のように数字を整数化して自然順ソートに使う"""
