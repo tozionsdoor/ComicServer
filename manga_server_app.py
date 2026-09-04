@@ -11,6 +11,7 @@ if not getattr(sys, "frozen", False):
         sys.path.insert(0, os.path.join(os.path.dirname(_keiri_python), "Lib", "site-packages"))
 
 import asyncio
+import contextlib
 import hashlib
 import io
 import ipaddress
@@ -24,6 +25,7 @@ import threading
 import time
 import webbrowser
 import zipfile
+from collections import OrderedDict
 from pathlib import Path
 
 import rarfile
@@ -284,6 +286,43 @@ def save_config(cfg: dict) -> None:
 # ブロークン表示になる頻度が上がっていた。4なら競合を抑えつつ待ち行列も短い。
 _rar_extract_sem = threading.Semaphore(4)
 
+# ─── PDF/EPUB(fitz) のドキュメントハンドル使い回し ────────────────────────────
+# read_raw_image は fitz 経路で1ページ毎に pymupdf.open() を呼び直していた。
+# EPUB はリフロー型なので開く度に全文レイアウトが走り、これが効いてくる。
+# 実測（転スラ第20巻.epub / 546ページ）:
+#   毎回open  0.25秒/枚   ハンドル使い回し  0.09秒/枚（約3倍速）
+#   巻頭ジャンプ相当の20並列: RAR 1.27秒 に対し EPUB は 5.02秒
+# pymupdf.Document はスレッドセーフではないため1ドキュメント1ロックで直列化する
+# （GILがある以上レンダリング自体はどのみち並列化しない）。
+FITZ_CACHE_MAX   = 4
+_fitz_cache      = OrderedDict()      # str(path) -> (doc, lock)
+_fitz_cache_lock = threading.Lock()
+
+@contextlib.contextmanager
+def fitz_doc(path: Path):
+    """開いた fitz ドキュメントを使い回して貸し出す（1度に1スレッドだけ使う）。"""
+    key = str(path)
+    with _fitz_cache_lock:
+        ent = _fitz_cache.get(key)
+        if ent is None:
+            ent = (pymupdf.open(key), threading.Lock())
+            _fitz_cache[key] = ent
+            # 溢れた分はキャッシュから外すだけにする。使用中のスレッドが参照を
+            # 持っている間は生き残り、最後の参照が消えた時点で解放される
+            # （使用中に close() すると落ちるため明示クローズはしない）。
+            while len(_fitz_cache) > FITZ_CACHE_MAX:
+                _fitz_cache.popitem(last=False)
+        else:
+            _fitz_cache.move_to_end(key)
+    doc, lock = ent
+    with lock:
+        yield doc
+
+def _fitz_cache_clear() -> None:
+    """書庫の再スキャン時など、開きっぱなしのハンドルを手放したい時に呼ぶ。"""
+    with _fitz_cache_lock:
+        _fitz_cache.clear()
+
 def natural_key(s: str) -> list:
     """'第99巻' → ['第', 99, '巻'] のように数字を整数化して自然順ソートに使う"""
     return [int(c) if c.isdigit() else c.lower()
@@ -310,11 +349,8 @@ def get_page_list(path: Path) -> list[str]:
                        if c.is_file() and c.suffix.lower() in IMAGE_EXT),
                       key=natural_key)
     if path.suffix.lower() in FITZ_EXT:
-        doc = pymupdf.open(str(path))
-        try:
+        with fitz_doc(path) as doc:
             return [str(i) for i in range(len(doc))]
-        finally:
-            doc.close()
     with open_archive(path) as af:
         return sorted(f for f in af.namelist()
                       if Path(f).suffix.lower() in IMAGE_EXT)
@@ -324,12 +360,10 @@ def read_raw_image(path: Path, page_id: str) -> bytes:
     if path.is_dir():
         return (path / page_id).read_bytes()
     if path.suffix.lower() in FITZ_EXT:
-        doc = pymupdf.open(str(path))
-        try:
+        # ハンドルを使い回す（EPUBは開く度に全文レイアウトが走るため効果が大きい）。
+        with fitz_doc(path) as doc:
             pix = doc[int(page_id)].get_pixmap(matrix=pymupdf.Matrix(2, 2))
             return pix.tobytes("jpeg")
-        finally:
-            doc.close()
     is_rar = path.suffix.lower() in ('.rar', '.cbr')
     if is_rar:
         # RARはページ1枚読むだけでも unrar.exe を子プロセスで起動する（ZIPと違い
@@ -378,6 +412,7 @@ def thumb_jpeg(data: bytes, max_w: int, quality: int = 78) -> bytes:
 def scan_books(dirs: list[str]) -> int:
     global _books
     _books = {}
+    _fitz_cache_clear()   # 開きっぱなしのPDF/EPUBハンドルを手放す（差し替え対応）
     scan_roots = [Path(d) for d in dirs if Path(d).exists()]
 
     # スキャンフォルダが2つ以上のときは、各ルートをトップ階層のフォルダとして見せる。
@@ -579,8 +614,10 @@ def _warm_book_cache(bid: str) -> None:
         pages = info["pages"]
         is_fitz = (not path.is_dir()) and path.suffix.lower() in FITZ_EXT
         is_dir = path.is_dir()
-        doc = pymupdf.open(str(path)) if is_fitz else None
-        af  = None if (is_fitz or is_dir) else open_archive(path)
+        # fitz は共有ハンドル(fitz_doc)を1ページずつ借りる。専用に開き直すと
+        # EPUBの全文レイアウトを二重に持つことになる上、読書中のリクエストと
+        # 別ハンドルで競合してCPUを食い合うため。ロックは1ページ分しか握らない。
+        af = None if (is_fitz or is_dir) else open_archive(path)
         try:
             for n, page_id in enumerate(pages):
                 cp = _page_cache_path(bid, n)
@@ -589,8 +626,9 @@ def _warm_book_cache(bid: str) -> None:
                 _bg_wait_while_active()   # 読書中は先読みを止めて、要求中のページを優先する
                 try:
                     if is_fitz:
-                        pix = doc[int(page_id)].get_pixmap(matrix=pymupdf.Matrix(2, 2))
-                        raw = pix.tobytes("jpeg")
+                        with fitz_doc(path) as doc:
+                            pix = doc[int(page_id)].get_pixmap(matrix=pymupdf.Matrix(2, 2))
+                            raw = pix.tobytes("jpeg")
                     elif is_dir:
                         raw = (path / page_id).read_bytes()
                     else:
@@ -600,8 +638,6 @@ def _warm_book_cache(bid: str) -> None:
                 except Exception:
                     pass   # 1ページ失敗しても続行
         finally:
-            if doc is not None:
-                doc.close()
             if af is not None:
                 af.close()
         _log_queue.put(f"[キャッシュ] 本文先読み完了: {info.get('title','')[:30]} ({len(pages)}p)")
