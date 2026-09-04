@@ -99,7 +99,14 @@ CERT_PATH   = _TLS_DIR / "server.crt"
 KEY_PATH    = _TLS_DIR / "server.key"
 CACHE_DIR   = Path.home() / ".manga_server" / "cache"  # ローカルに保存（NAS越しI/O回避）
 PAGE_CACHE_DIR = CACHE_DIR / "pages"   # リサイズ済み本文ページのディスクキャッシュ
-PAGE_CACHE_MAX = 4000                  # 本文ページキャッシュの最大ファイル数（超過分は古い順に削除）
+# 本文ページキャッシュの最大ファイル数（超過分は古い順に削除）。
+# 1冊数百ページの本を何冊も読み進めると数千ファイル単位で消費するため、
+# 上限が低いと「少し前に読み終えた本」の前半ページがすぐ追い出されてしまい、
+# スライダーで巻頭へ戻った時にアーカイブからの再生成待ちが発生する
+# （resize_jpeg 1枚あたり数百KB程度なのでディスクコストは軽い）。
+# サムネイル(?w=)追加でページ1枚につき最大2ファイル(本体+サムネ)消費するように
+# なった分も見込んで、4000→20000に引き上げる。
+PAGE_CACHE_MAX = 20000
 
 # ─── Firebase（シグナリング）開発者設定 ─────────────────────────────────────────
 # 設計: 開発者の1プロジェクトを全ユーザー共通の"伝言板"にする。サーバーは匿名認証の
@@ -271,6 +278,9 @@ def save_config(cfg: dict) -> None:
         json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8"
     )
 
+# RARページ展開の同時実行数。unrar.exeの子プロセス起動が競合しないよう絞る。
+_rar_extract_sem = threading.Semaphore(2)
+
 def natural_key(s: str) -> list:
     """'第99巻' → ['第', 99, '巻'] のように数字を整数化して自然順ソートに使う"""
     return [int(c) if c.isdigit() else c.lower()
@@ -317,6 +327,18 @@ def read_raw_image(path: Path, page_id: str) -> bytes:
             return pix.tobytes("jpeg")
         finally:
             doc.close()
+    is_rar = path.suffix.lower() in ('.rar', '.cbr')
+    if is_rar:
+        # RARはページ1枚読むだけでも unrar.exe を子プロセスで起動する（ZIPと違い
+        # 純Python完結ではない）。キャッシュが冷えた状態（巻頭ジャンプ直後など）で
+        # 本編・先読み・フィルムストリップのサムネが同時多発的に同じ大きなRARへ
+        # アクセスすると、プロセス起動とディスクI/Oが競合して個々の応答が
+        # 数十秒単位まで悪化することがあった。同時展開数を絞って直列化寄りにし、
+        # 1本あたりの応答は遅くとも全体の破綻を防ぐ。
+        with _rar_extract_sem:
+            with open_archive(path) as af:
+                with af.open(page_id) as f:
+                    return f.read()
     with open_archive(path) as af:
         with af.open(page_id) as f:
             return f.read()
@@ -506,10 +528,29 @@ def _page_cache_put(path: Path, data: bytes) -> None:
     if _page_cache_writes % 200 == 0:
         _trim_page_cache()
 
-def _trim_page_cache() -> None:
-    """キャッシュ数が上限を超えたら、更新時刻の古いファイルから削除する。"""
+CACHE_KEEP_FRONT = 10   # 各本の巻頭Nページは最後まで残す
+
+def _cache_page_no(p: Path) -> int:
+    """キャッシュ名 {bid}_{n}_1800.jpg / {bid}_{n}_w{幅}.jpg からページ番号を取り出す。"""
     try:
-        files = sorted(PAGE_CACHE_DIR.glob("*.jpg"), key=lambda p: p.stat().st_mtime)
+        return int(p.name.split("_")[1])
+    except (IndexError, ValueError):
+        return 10 ** 9   # 解析不能なものは「巻頭ではない」扱い
+
+def _trim_page_cache() -> None:
+    """キャッシュ数が上限を超えたら、更新時刻の古いファイルから削除する。
+
+    ただし単純な mtime 順だと巻頭ページばかりが消える。_warm_book_cache が
+    ページ0から昇順に書くため、巻頭は常にその本で最も古いファイルになるため。
+    （実測: ある本のキャッシュがページ13〜502だけ残り、0〜12が消滅していた）
+    巻頭へジャンプした時だけ極端に遅くなる原因なので、巻頭 CACHE_KEEP_FRONT
+    ページは他に消せるものが尽きるまで残す。
+    """
+    try:
+        files = sorted(
+            PAGE_CACHE_DIR.glob("*.jpg"),
+            key=lambda p: (_cache_page_no(p) < CACHE_KEEP_FRONT, p.stat().st_mtime),
+        )
         for p in files[: max(0, len(files) - PAGE_CACHE_MAX)]:
             try:
                 p.unlink()
