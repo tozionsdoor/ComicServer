@@ -409,11 +409,15 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
     // ユーザーがタップで到達した直後に比率検出→再ペア化が走り、見開きが
     // 意図せず切り替わってしまう（右→左ページ送りのはずが次ユニットへ飛ぶ）。
     // 到達前に検出を済ませておくことでこの競合を防ぐ。
+    // 比率検出は「集めるだけ」にして、発行はデバウンス後にまとめて行う。
+    // ここで即発行すると、スライダーのドラッグ中も1目盛りごとに走ってしまう
+    // （divisions=総ページ数なので、巻末→巻頭で数百ページ分になる）。
+    // _detectRatio はフルサイズのページ画像を落とすため、これが着地ページの
+    // 取得を行列の後ろへ押しやり、表示までの待ちが何十秒にも伸びていた。
+    final ratioUnits = <int>[];
     void detectAheadRatios(int idx) {
       if (idx < 0 || idx >= _units.length) return;
-      final unit = _units[idx];
-      _detectRatio(unit.first);
-      if (unit.second != null) _detectRatio(unit.second!);
+      ratioUnits.add(idx);
     }
     // 順序は「次ユニット → 前ユニット → 以降の先読み」。
     // 前ユニットを最後尾に回すと、8ユニット先までの取得が終わるまで手当てされず、
@@ -444,6 +448,12 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
       _prefetchTimer = null;
       final c = _ctx;
       if (!mounted || c == null) return;
+      for (final idx in ratioUnits) {
+        if (idx < 0 || idx >= _units.length) continue;   // 待つ間に組み直された分は捨てる
+        final unit = _units[idx];
+        _detectRatio(unit.first);
+        if (unit.second != null) _detectRatio(unit.second!);
+      }
       _pumpPrefetch(c);
     });
   }
@@ -1061,8 +1071,12 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
       return SizedBox.expand(child: _img(pvIdx, BoxFit.contain));
     }
     final unit = _units[pvIdx];
-    _detectRatio(unit.first);
-    if (unit.second != null) _detectRatio(unit.second!);
+    // ドラッグ中は通過するだけのユニットも build されるので、ここでも比率検出を止める。
+    // 指を離すと _sliderDragging=false で再build されて着地ユニット分だけが走る。
+    if (!_sliderDragging) {
+      _detectRatio(unit.first);
+      if (unit.second != null) _detectRatio(unit.second!);
+    }
 
     final ur = _unitRatio(unit);
     final wc = _H * ur;
