@@ -2425,7 +2425,14 @@ async def _signaling_loop_async(api_key: str, db_url: str, room_id: str) -> None
             finally:
                 loop.call_soon_threadsafe(done.set)
 
-        loop.run_in_executor(None, _sse_thread)
+        # 専用のデーモンスレッドで回す。ここを loop.run_in_executor(None, ...) にすると
+        # 既定エグゼキュータ(ThreadPoolExecutor)のワーカーで動くことになるが、
+        # そのワーカーは非デーモンで、concurrent.futures がインタプリタ終了時に
+        # atexitフックで全ワーカーをjoinする。_fb_sse_listenはSSEの読み込みで
+        # 最大65秒ブロックし、しかも再接続ループで回り続けるため、joinが終わらず
+        # 「ウィンドウは閉じたのにプロセスが死なない」ゾンビ化を招いていた。
+        # (この待ちは threading.enumerate() に非デーモンとして現れないため気づきにくい)
+        threading.Thread(target=_sse_thread, daemon=True).start()
 
         reauth_needed = False
         while _signaling_running and not sse_done.is_set():
