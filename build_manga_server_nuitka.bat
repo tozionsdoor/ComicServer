@@ -5,6 +5,15 @@ rem Nuitka build script for ArcHiveServer (Python 3.14 + ziglang)
 set NUITKA_PY=C:\Users\taka\AppData\Local\Programs\Python\Python313\python.exe
 set WORK_DIR=%~dp0
 
+rem Nuitka's default for the zig backend embeds the constants blob with the C23
+rem "#embed" directive. zig's compile cache does not hash the embedded file, and the
+rem generated __constants_data.c is byte-identical in every project, so whichever of
+rem ArcHive and MovieServer is built second reuses the other one's object file and
+rem ends up carrying the wrong constants table, segfaulting before main() ever runs.
+rem coff_obj has Nuitka write that object itself in Python, so no C compiler and no
+rem cache sit between the blob and the exe.
+set NUITKA_RESOURCE_MODE=coff_obj
+
 if not exist "%NUITKA_PY%" (
     echo ERROR: Python not found at %NUITKA_PY%
     pause & exit /b 1
