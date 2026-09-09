@@ -13,6 +13,7 @@ if not getattr(sys, "frozen", False):
 import asyncio
 import atexit
 import contextlib
+import ctypes
 import hashlib
 import io
 import ipaddress
@@ -55,6 +56,11 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509 import load_pem_x509_certificate
 
 # ─── 実行パス解決（PyInstaller化したexeでも正しく動くようにする） ─────────────
+def _is_frozen() -> bool:
+    """exeに固めた状態か。Nuitkaはsys.frozenを立てず__compiled__を付ける、
+    PyInstallerはsys.frozenを立てる、と目印が違うので両方を見る。"""
+    return getattr(sys, "frozen", False) or "__compiled__" in globals()
+
 def _app_dir() -> Path:
     """exe本体（またはスクリプト）が置かれているディレクトリ。
     設定ファイル・TLS証明書など書き込み/永続化が必要なものはここに置く。
@@ -65,14 +71,18 @@ def _app_dir() -> Path:
         p = Path(override)
         p.mkdir(parents=True, exist_ok=True)
         return p
-    if getattr(sys, "frozen", False):
+    if _is_frozen():
         return Path(sys.executable).parent
     return Path(__file__).parent
 
 def _resource_path(*parts: str) -> Path:
     """同梱した読み取り専用リソース（アイコン等）の場所。"""
-    if getattr(sys, "frozen", False):
-        return Path(sys._MEIPASS, *parts)
+    meipass = getattr(sys, "_MEIPASS", None)   # PyInstallerの展開先
+    if meipass:
+        return Path(meipass, *parts)
+    if _is_frozen():
+        # Nuitka standalone は同梱データをexeの隣へ置く
+        return Path(sys.executable).parent.joinpath(*parts)
     return Path(__file__).parent.joinpath(*parts)
 
 # ─── 定数 ────────────────────────────────────────────────────────────────────
@@ -334,7 +344,7 @@ def autostart_is_supported() -> tuple[bool, str]:
 
 def _autostart_launch_target() -> tuple[str, str, str]:
     """(実行ファイル, 引数, 作業ディレクトリ)を返す。"""
-    if getattr(sys, "frozen", False):
+    if _is_frozen():
         exe = str(Path(sys.executable).resolve())
         return exe, AUTOSTART_ARG, str(Path(exe).parent)
     # スクリプト実行時。python.exeだとログオンのたびにコンソール窓が出るので
@@ -391,74 +401,158 @@ def autostart_is_enabled() -> bool:
     return _autostart_shortcut_exists() or _autostart_legacy_run_exists()
 
 
-def _psq(s: str) -> str:
-    """PowerShellのシングルクォート文字列にエスケープする。"""
-    return "'" + s.replace("'", "''") + "'"
+# ─── ショートカット(.lnk)の作成/読み取り ──────────────────────────────────────
+# 以前はPowerShellを子プロセスとして起動し、WScript.Shell(COM)経由で作っていた。
+# しかし「署名の無いexeが powershell.exe を隠しウィンドウで起動し、スタートアップ
+# フォルダに .lnk を書き込む」という並びはマルウェアの常駐手口そのものなので、
+# セキュリティソフトの振る舞い検知に引っかかる（2026-09-09、Kasperskyがトロイの
+# 木馬と判定してアプリを遮断した）。
+# そこで、ショートカットの実体を作っているWindows標準のCOMインターフェース
+# (IShellLinkW / IPersistFile) を ctypes で直接呼ぶ。子プロセスが増えないので
+# 上の並びが発生しない。Inno Setupなど普通のインストーラーと同じAPIである。
+# pywin32を入れれば数行で書けるが、配布物を太らせたくないので標準ライブラリだけで済ませる。
+_CLSID_SHELL_LINK  = "{00021401-0000-0000-C000-000000000046}"
+_IID_ISHELLLINKW   = "{000214F9-0000-0000-C000-000000000046}"
+_IID_IPERSISTFILE  = "{0000010B-0000-0000-C000-000000000046}"
+_CLSCTX_INPROC_SERVER    = 1
+_COINIT_APARTMENTTHREADED = 2
+_RPC_E_CHANGED_MODE = -2147417850   # 0x80010106 別モデルで初期化済み
+_STGM_READ   = 0
+_SW_SHOWNORMAL = 1
+_SLGP_RAWPATH  = 4   # 環境変数を展開せず保存されたままのパスを返させる
+# IShellLinkW の仮想関数テーブル上の位置（先頭3つはIUnknown）
+_VT_RELEASE, _VT_GET_PATH = 2, 3
+_VT_SET_DESCRIPTION = 7
+_VT_GET_WORKING_DIRECTORY, _VT_SET_WORKING_DIRECTORY = 8, 9
+_VT_GET_ARGUMENTS, _VT_SET_ARGUMENTS = 10, 11
+_VT_SET_SHOW_CMD, _VT_SET_PATH = 15, 20
+# IPersistFile 側（IUnknown 3つ + IPersist 1つの後ろ）
+_VT_PF_LOAD, _VT_PF_SAVE = 5, 6
+_LNK_PATH_BUF = 1024   # MAX_PATH(260)では足りない長いパスへの保険
 
 
-def _powershell() -> str:
-    """PATHにpowershellが無い環境でも動くよう、実体のパスを優先して探す。"""
-    root = os.environ.get("SystemRoot", r"C:\Windows")
-    full = Path(root) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
-    return str(full) if full.exists() else "powershell"
+class _GUID(ctypes.Structure):
+    _fields_ = [("Data1", ctypes.c_uint32), ("Data2", ctypes.c_uint16),
+                ("Data3", ctypes.c_uint16), ("Data4", ctypes.c_ubyte * 8)]
+
+    def __init__(self, text: str) -> None:
+        super().__init__()
+        # 手でバイト列を並べるより、OSに文字列を解釈させたほうが間違いが無い。
+        hr = ctypes.windll.ole32.CLSIDFromString(ctypes.c_wchar_p(text), ctypes.byref(self))
+        if hr < 0:
+            raise OSError(f"CLSIDFromString({text}) 失敗 (0x{hr & 0xFFFFFFFF:08X})")
+
+
+def _com_method(ptr, index: int, *argtypes):
+    """COMポインタの仮想関数テーブルからindex番目のメソッドを取り出す。"""
+    vtbl = ctypes.cast(ptr, ctypes.POINTER(ctypes.c_void_p))[0]
+    func = ctypes.cast(vtbl, ctypes.POINTER(ctypes.c_void_p))[index]
+    return ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, *argtypes)(func)
+
+
+def _com_check(hr: int, what: str) -> None:
+    if hr < 0:
+        raise OSError(f"{what} 失敗 (0x{hr & 0xFFFFFFFF:08X})")
+
+
+@contextlib.contextmanager
+def _shell_link():
+    """COMを初期化してIShellLinkWを1つ作る。後始末までまとめて面倒を見る。"""
+    ole32 = ctypes.windll.ole32
+    hr = ole32.CoInitializeEx(None, _COINIT_APARTMENTTHREADED)
+    # 別のモデルで初期化済みなら、そのまま使わせてもらう（解放もしない）。
+    owned = hr != _RPC_E_CHANGED_MODE
+    if hr < 0 and hr != _RPC_E_CHANGED_MODE:
+        raise OSError(f"CoInitializeEx 失敗 (0x{hr & 0xFFFFFFFF:08X})")
+    ptr = ctypes.c_void_p()
+    try:
+        _com_check(ole32.CoCreateInstance(
+            ctypes.byref(_GUID(_CLSID_SHELL_LINK)), None, _CLSCTX_INPROC_SERVER,
+            ctypes.byref(_GUID(_IID_ISHELLLINKW)), ctypes.byref(ptr)),
+            "CoCreateInstance(ShellLink)")
+        yield ptr
+    finally:
+        if ptr:
+            _com_method(ptr, _VT_RELEASE)(ptr)
+        if owned:
+            ole32.CoUninitialize()
+
+
+@contextlib.contextmanager
+def _persist_file(ptr):
+    """IShellLinkWから読み書き用のIPersistFileを取り出す。"""
+    pf = ctypes.c_void_p()
+    _com_check(_com_method(ptr, 0, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p))(
+        ptr, ctypes.byref(_GUID(_IID_IPERSISTFILE)), ctypes.byref(pf)),
+        "QueryInterface(IPersistFile)")
+    try:
+        yield pf
+    finally:
+        _com_method(pf, _VT_RELEASE)(pf)
+
+
+def _lnk_create(lnk: Path, target: str, args: str, workdir: str, description: str = "") -> None:
+    """ショートカットを作る（既にあれば上書き）。失敗時はOSErrorを投げる。"""
+    lnk.parent.mkdir(parents=True, exist_ok=True)
+    W = ctypes.c_wchar_p
+    with _shell_link() as p:
+        _com_check(_com_method(p, _VT_SET_PATH, W)(p, target), "SetPath")
+        _com_check(_com_method(p, _VT_SET_ARGUMENTS, W)(p, args), "SetArguments")
+        _com_check(_com_method(p, _VT_SET_WORKING_DIRECTORY, W)(p, workdir), "SetWorkingDirectory")
+        if description:
+            _com_check(_com_method(p, _VT_SET_DESCRIPTION, W)(p, description), "SetDescription")
+        _com_check(_com_method(p, _VT_SET_SHOW_CMD, ctypes.c_int)(p, _SW_SHOWNORMAL), "SetShowCmd")
+        with _persist_file(p) as pf:
+            _com_check(_com_method(pf, _VT_PF_SAVE, W, ctypes.c_int)(pf, str(lnk), 1),
+                       "IPersistFile::Save")
+
+
+def _lnk_read(lnk: Path) -> "tuple[str, str, str] | None":
+    """既存ショートカットの (リンク先, 引数, 作業フォルダ) を読む。読めなければNone。"""
+    if not lnk.exists():
+        return None
+    try:
+        with _shell_link() as p:
+            with _persist_file(p) as pf:
+                _com_check(_com_method(pf, _VT_PF_LOAD, ctypes.c_wchar_p, ctypes.c_uint)(
+                    pf, str(lnk), _STGM_READ), "IPersistFile::Load")
+            buf = ctypes.create_unicode_buffer(_LNK_PATH_BUF)
+            # 第3引数のWIN32_FIND_DATAWは省略可(NULL)。
+            _com_check(_com_method(p, _VT_GET_PATH, ctypes.POINTER(ctypes.c_wchar),
+                                   ctypes.c_int, ctypes.c_void_p, ctypes.c_uint)(
+                p, buf, _LNK_PATH_BUF, None, _SLGP_RAWPATH), "GetPath")
+            target = buf.value
+            _com_check(_com_method(p, _VT_GET_ARGUMENTS,
+                                   ctypes.POINTER(ctypes.c_wchar), ctypes.c_int)(
+                p, buf, _LNK_PATH_BUF), "GetArguments")
+            args = buf.value
+            _com_check(_com_method(p, _VT_GET_WORKING_DIRECTORY,
+                                   ctypes.POINTER(ctypes.c_wchar), ctypes.c_int)(
+                p, buf, _LNK_PATH_BUF), "GetWorkingDirectory")
+            return target, args, buf.value
+    except OSError:
+        return None
 
 
 def autostart_enable() -> tuple[Path, bool]:
     """スタートアップフォルダにショートカットを作る（既存があれば作り直す）。
-    ショートカット作成にはWScript.Shell(COM)が要るが、pywin32を追加依存にしたくないので
-    Windows標準のPowerShell経由で作る。呼ばれるのはON/OFFの切り替え時だけ。
     戻り値は (作ったショートカット, 旧Runキーを消したか)。"""
     lnk = autostart_shortcut_path()
-    lnk.parent.mkdir(parents=True, exist_ok=True)
     exe, args, workdir = _autostart_launch_target()
-    script = (
-        "$s = (New-Object -ComObject WScript.Shell).CreateShortcut(" + _psq(str(lnk)) + ");"
-        "$s.TargetPath = " + _psq(exe) + ";"
-        "$s.Arguments = " + _psq(args) + ";"
-        "$s.WorkingDirectory = " + _psq(workdir) + ";"
-        "$s.Description = 'ArcHive Server をWindows起動時に自動で開始します';"
-        "$s.Save()"
-    )
-    proc = subprocess.run(
-        [_powershell(), "-NoProfile", "-NonInteractive", "-Command", script],
-        capture_output=True, text=True, timeout=30,
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-    )
-    if proc.returncode != 0 or not lnk.exists():
-        detail = (proc.stderr or proc.stdout or "").strip().splitlines()
-        raise RuntimeError(detail[0] if detail else "ショートカットを作成できませんでした。")
+    try:
+        _lnk_create(lnk, exe, args, workdir,
+                    "ArcHive Server をWindows起動時に自動で開始します")
+    except OSError as e:
+        raise RuntimeError(f"ショートカットを作成できませんでした。({e})") from e
+    if not lnk.exists():
+        raise RuntimeError("ショートカットを作成できませんでした。")
     # 二重に登録されたままにしない（Runキーとショートカットの両建てを避ける）
     return lnk, _autostart_clear_legacy_run()
 
 
-def _autostart_read_shortcut() -> "tuple[str, str] | None":
-    """既存ショートカットの (TargetPath, WorkingDirectory) を読む。読めなければNone。
-
-    日本語ユーザー名などでPowerShellの出力エンコーディングに引きずられないよう、
-    UTF-8をBase64にしてから受け渡す。
-    """
-    lnk = autostart_shortcut_path()
-    if not lnk.exists():
-        return None
-    script = (
-        "$s = (New-Object -ComObject WScript.Shell).CreateShortcut(" + _psq(str(lnk)) + ");"
-        "$t = $s.TargetPath + [char]10 + $s.WorkingDirectory;"
-        "[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($t))"
-    )
-    try:
-        proc = subprocess.run(
-            [_powershell(), "-NoProfile", "-NonInteractive", "-Command", script],
-            capture_output=True, text=True, timeout=30,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
-        if proc.returncode != 0:
-            return None
-        parts = base64.b64decode(proc.stdout.strip()).decode("utf-8").splitlines()
-    except (OSError, subprocess.SubprocessError, ValueError):
-        return None
-    if len(parts) < 2:
-        return None
-    return parts[0].strip(), parts[1].strip()
+def _autostart_read_shortcut() -> "tuple[str, str, str] | None":
+    """既存ショートカットの (リンク先, 引数, 作業フォルダ) を読む。読めなければNone。"""
+    return _lnk_read(autostart_shortcut_path())
 
 
 def _autostart_norm(path: str) -> str:
@@ -472,6 +566,9 @@ def autostart_repair_if_stale() -> bool:
     **黙って**壊れる（ログオンしても何も起動せず、エラーも出ない）。
     判定にWorkingDirectory(=アプリのフォルダ)を使うのは、スクリプト実行時の
     TargetPathがアプリ外のpythonw.exeで、フォルダを移動しても変わらないため。
+    引数まで見るのは、sys.frozenを見ていた頃のexe版が「スクリプト実行」と誤認して、
+    存在しない.pyのパスを引数に書き込んだショートカットを作っていたため。
+    リンク先と作業フォルダは合っているので、引数を見ないと直しにいけない。
     見るのは.lnkだけで旧Runキーは対象にしない（あちらは作り直さず消す側）。
     """
     if not _autostart_shortcut_exists() or not autostart_is_supported()[0]:
@@ -479,13 +576,14 @@ def autostart_repair_if_stale() -> bool:
     cur = _autostart_read_shortcut()
     if cur is None:
         return False
-    exe, _args, workdir = _autostart_launch_target()
+    exe, args, workdir = _autostart_launch_target()
     if (_autostart_norm(cur[0]) == _autostart_norm(exe)
-            and _autostart_norm(cur[1]) == _autostart_norm(workdir)):
+            and cur[1] == args
+            and _autostart_norm(cur[2]) == _autostart_norm(workdir)):
         return False
     try:
         autostart_enable()
-    except (OSError, RuntimeError, subprocess.SubprocessError):
+    except (OSError, RuntimeError):
         return False
     return True
 
