@@ -11,6 +11,7 @@ if not getattr(sys, "frozen", False):
         sys.path.insert(0, os.path.join(os.path.dirname(_keiri_python), "Lib", "site-packages"))
 
 import asyncio
+import atexit
 import contextlib
 import hashlib
 import io
@@ -428,6 +429,65 @@ def autostart_enable() -> tuple[Path, bool]:
         raise RuntimeError(detail[0] if detail else "ショートカットを作成できませんでした。")
     # 二重に登録されたままにしない（Runキーとショートカットの両建てを避ける）
     return lnk, _autostart_clear_legacy_run()
+
+
+def _autostart_read_shortcut() -> "tuple[str, str] | None":
+    """既存ショートカットの (TargetPath, WorkingDirectory) を読む。読めなければNone。
+
+    日本語ユーザー名などでPowerShellの出力エンコーディングに引きずられないよう、
+    UTF-8をBase64にしてから受け渡す。
+    """
+    lnk = autostart_shortcut_path()
+    if not lnk.exists():
+        return None
+    script = (
+        "$s = (New-Object -ComObject WScript.Shell).CreateShortcut(" + _psq(str(lnk)) + ");"
+        "$t = $s.TargetPath + [char]10 + $s.WorkingDirectory;"
+        "[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($t))"
+    )
+    try:
+        proc = subprocess.run(
+            [_powershell(), "-NoProfile", "-NonInteractive", "-Command", script],
+            capture_output=True, text=True, timeout=30,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        if proc.returncode != 0:
+            return None
+        parts = base64.b64decode(proc.stdout.strip()).decode("utf-8").splitlines()
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    if len(parts) < 2:
+        return None
+    return parts[0].strip(), parts[1].strip()
+
+
+def _autostart_norm(path: str) -> str:
+    return os.path.normcase(os.path.normpath(path)) if path else ""
+
+
+def autostart_repair_if_stale() -> bool:
+    """自動起動が有効なのに向き先がずれていたらショートカットを作り直す。直したらTrue。
+
+    .lnkは絶対パスを持つので、インストール後にフォルダごと移動されると自動起動は
+    **黙って**壊れる（ログオンしても何も起動せず、エラーも出ない）。
+    判定にWorkingDirectory(=アプリのフォルダ)を使うのは、スクリプト実行時の
+    TargetPathがアプリ外のpythonw.exeで、フォルダを移動しても変わらないため。
+    見るのは.lnkだけで旧Runキーは対象にしない（あちらは作り直さず消す側）。
+    """
+    if not _autostart_shortcut_exists() or not autostart_is_supported()[0]:
+        return False
+    cur = _autostart_read_shortcut()
+    if cur is None:
+        return False
+    exe, _args, workdir = _autostart_launch_target()
+    if (_autostart_norm(cur[0]) == _autostart_norm(exe)
+            and _autostart_norm(cur[1]) == _autostart_norm(workdir)):
+        return False
+    try:
+        autostart_enable()
+    except (OSError, RuntimeError, subprocess.SubprocessError):
+        return False
+    return True
 
 
 def autostart_disable() -> bool:
@@ -4250,6 +4310,74 @@ class App(tk.Tk):
         self.after(100, self._poll_log)
 
 
+# ─── フォルダの移動防止 ───────────────────────────────────────────────────────
+# Windowsは実行中のexeを含むフォルダでも、同じドライブ内でのリネーム(=移動)なら
+# 許してしまう（実測で確認済み。プロセスは動いたまま、移動元だけが消える）。
+# 移動されても _app_dir() は起動時に決めた値のままなので、
+#   - 設定(manga_server_config.json)の保存が、親フォルダごと消えていて失敗する
+#   - 自動起動の.lnkも証明書も、消えたはずの古い場所を指したままになる
+# という「画面上は動いているのに設定が保存されない」状態になる。一番気づきにくい
+# 壊れ方なので、そもそも移動させないほうがいい。
+#
+# 仕組み: 共有指定なしで開かれたファイルが中にひとつでもあると、Windowsは親フォルダの
+# リネームを拒否する。Pythonの素の open() がまさにそれ（読み取り共有は許すので、
+# バックアップソフトのコピーは妨げない）。起動中だけロックファイルを開いておけば、
+# Explorerが「フォルダーまたはファイルが別のプログラムで開かれています」という
+# 見慣れたメッセージで止めてくれる。
+FOLDER_LOCK_PATH = _app_dir() / ".folder_lock"
+
+# 開いたファイルオブジェクトはここで保持する。GCされて閉じるとロックの意味が無くなる。
+_folder_lock_handle = None
+
+_FOLDER_LOCK_NOTICE = (
+    "ArcHive Serverの起動中だけ開かれるファイルです。\n"
+    "開いている間はこのフォルダを移動・削除できません。\n"
+    "（起動中に移動されると設定の保存先を見失うのを防ぐため）\n"
+    "サーバーを終了すると自動で消えます。手で消しても問題ありません。\n"
+)
+
+
+def _acquire_folder_lock() -> bool:
+    """ロックを取る。取れたらTrue。
+    書き込めない場所に置かれている等で失敗しても、起動そのものは止めない。"""
+    global _folder_lock_handle
+    if _folder_lock_handle is not None:
+        return True
+    try:
+        try:
+            # 既存があれば "w" で作り直さず開き直す。隠し属性が付いたファイルに対して
+            # "w"(=CREATE_ALWAYS)はWindowsに拒否されるため（SambaのNASなどでは、
+            # ドットで始まるファイルを隠しファイル扱いにする設定が珍しくない）。
+            f = open(FOLDER_LOCK_PATH, "r+", encoding="utf-8")
+            f.truncate(0)
+        except FileNotFoundError:
+            f = open(FOLDER_LOCK_PATH, "w", encoding="utf-8")
+        f.write(_FOLDER_LOCK_NOTICE)
+        f.flush()
+    except OSError:
+        return False
+    _folder_lock_handle = f
+    atexit.register(_release_folder_lock)
+    return True
+
+
+def _release_folder_lock() -> None:
+    """ロックを外してファイルも消す。
+    強制終了された場合は残るが、次回起動時に開き直すだけなので実害はない。"""
+    global _folder_lock_handle
+    if _folder_lock_handle is None:
+        return
+    f, _folder_lock_handle = _folder_lock_handle, None
+    try:
+        f.close()
+    except OSError:
+        pass
+    try:
+        FOLDER_LOCK_PATH.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 # ─── 単一インスタンス管理 ─────────────────────────────────────────────────────
 _ipc_sock: "socket.socket | None" = None  # GC防止のためグローバル保持
 
@@ -4296,6 +4424,18 @@ def _start_ipc_listener(app: App) -> None:
 if __name__ == "__main__":
     if not _acquire_single_instance():
         sys.exit(0)
+    # 起動中にフォルダごと移動されると、設定の保存先を見失ったまま動き続けてしまう。
+    # Windowsに移動を拒否させておく（取れなくても起動は続ける）。
+    if not _acquire_folder_lock():
+        _log_queue.put("[注意] フォルダのロックを取得できませんでした。"
+                       "起動中はこのフォルダを移動しないでください。")
+    # フォルダごと移動されると .lnk の絶対パスが古いままになるので、ここで直す。
+    # (_log_queueに積んだ分はGUIが立ち上がってから表示される)
+    try:
+        if autostart_repair_if_stale():
+            _log_queue.put("[自動起動] 登録先が古かったので、今の場所に登録し直しました。")
+    except Exception as e:   # 自動起動の修復失敗で起動そのものを止めない
+        _log_queue.put(f"[自動起動] 登録の確認に失敗しました: {e}")
     app = App()
     _start_ipc_listener(app)
     app.mainloop()

@@ -49,6 +49,8 @@ server.key
 # ── Windows ──────────────────────────────────────────────
 Thumbs.db
 desktop.ini
+# 起動中だけ作られる、フォルダ移動防止のロックファイル
+.folder_lock
 
 # ── スクショ元データ（個人情報マスク前、非公開） ─────────────
 docs/images/_unmasked_originals/
