@@ -280,6 +280,170 @@ def save_config(cfg: dict) -> None:
         json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8"
     )
 
+
+# ─── Windows起動時の自動起動（スタートアップフォルダのショートカット） ────────────
+# レジストリ(HKCU\Software\Microsoft\Windows\CurrentVersion\Run)ではなく、
+# **スタートアップフォルダに置いたショートカット(.lnk)** で実現する。
+#
+# Runキーを使わない理由:
+#   - regeditを開かないと存在を確認できないので、消し忘れても利用者が気づけない
+#     （「切ったつもりなのに起動する」状態になりやすい）。
+#   - スタートアップフォルダなら実体がただの.lnkで、Explorerで見えて手で消せる。
+# （タスクマネージャーの「スタートアップアプリ」タブに出る点はどちらの方式でも同じ）
+#
+# ただしArcHiveのインストーラー(archive_setup.py / archive_setup.iss)は従来Runキーに
+# 登録していた。その値が残ったままだとGUIのチェックと実際の挙動が食い違うので、
+# 「有効かどうか」は両方を見て判定し、有効化/解除のどちらでもRunキー側は消す
+# （＝GUIを一度でも触れば、以後は.lnk一本に片付く）。
+AUTOSTART_SHORTCUT_NAME = "ArcHiveServer.lnk"
+AUTOSTART_ARG           = "--autostart"
+_LEGACY_RUN_KEY   = r"Software\Microsoft\Windows\CurrentVersion\Run"
+_LEGACY_RUN_VALUE = "ArcHiveServer"   # インストーラーが作る値の名前
+
+
+def autostart_startup_dir() -> Path:
+    """ログオン時に中身が実行されるスタートアップフォルダ。
+    ARCHIVE_STARTUP_DIRが設定されていればそちらを使う（テスト用の逃がし口）。"""
+    override = os.environ.get("ARCHIVE_STARTUP_DIR")
+    if override:
+        p = Path(override)
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+    appdata = os.environ.get("APPDATA")
+    if not appdata:
+        raise RuntimeError("APPDATA環境変数が取得できませんでした。")
+    return Path(appdata) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup"
+
+
+def autostart_shortcut_path() -> Path:
+    return autostart_startup_dir() / AUTOSTART_SHORTCUT_NAME
+
+
+def autostart_is_supported() -> tuple[bool, str]:
+    """GUIから設定できるかどうか。できない場合は理由も返す。"""
+    if os.name != "nt":
+        return False, "Windows以外では自動起動の設定に対応していません。"
+    if os.environ.get("ARCHIVE_APP_DIR") or os.environ.get("ARCHIVE_IPC_PORT"):
+        # ショートカットは環境変数を引き継げないため、ここで登録しても
+        # ログオン時に立ち上がるのは環境変数なしの既定インスタンスになってしまう。
+        # 黙って別インスタンスを起動するより、設定できないと明示するほうが安全。
+        return False, "環境変数で設定先を変更した別インスタンスのため、ここからは設定できません。"
+    return True, ""
+
+
+def _autostart_launch_target() -> tuple[str, str, str]:
+    """(実行ファイル, 引数, 作業ディレクトリ)を返す。"""
+    if getattr(sys, "frozen", False):
+        exe = str(Path(sys.executable).resolve())
+        return exe, AUTOSTART_ARG, str(Path(exe).parent)
+    # スクリプト実行時。python.exeだとログオンのたびにコンソール窓が出るので
+    # 同じ場所にあるpythonw.exeを優先する。
+    script = Path(__file__).resolve()
+    pyw = Path(sys.executable).resolve().with_name("pythonw.exe")
+    exe = str(pyw if pyw.exists() else Path(sys.executable).resolve())
+    return exe, f'"{script}" {AUTOSTART_ARG}', str(script.parent)
+
+
+def autostart_describe() -> str:
+    """ログ表示用に「何が起動されるか」を1行で返す。"""
+    exe, args, _ = _autostart_launch_target()
+    return f"{exe} {args}".strip()
+
+
+def _autostart_legacy_run_exists() -> bool:
+    """インストーラーが作ったRunキーの値が残っているか。"""
+    if os.name != "nt":
+        return False
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _LEGACY_RUN_KEY) as key:
+            winreg.QueryValueEx(key, _LEGACY_RUN_VALUE)
+        return True
+    except Exception:
+        return False
+
+
+def _autostart_clear_legacy_run() -> bool:
+    """Runキーの値を消す。消したらTrue（元から無ければFalse）。"""
+    if not _autostart_legacy_run_exists():
+        return False
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _LEGACY_RUN_KEY, 0,
+                            winreg.KEY_SET_VALUE) as key:
+            winreg.DeleteValue(key, _LEGACY_RUN_VALUE)
+        return True
+    except Exception:
+        return False
+
+
+def _autostart_shortcut_exists() -> bool:
+    try:
+        return autostart_shortcut_path().exists()
+    except Exception:
+        return False
+
+
+def autostart_is_enabled() -> bool:
+    """ショートカットとRunキーのどちらかがあれば「有効」。
+    片方だけ見るとGUIの表示が実際の挙動と食い違うため。"""
+    return _autostart_shortcut_exists() or _autostart_legacy_run_exists()
+
+
+def _psq(s: str) -> str:
+    """PowerShellのシングルクォート文字列にエスケープする。"""
+    return "'" + s.replace("'", "''") + "'"
+
+
+def _powershell() -> str:
+    """PATHにpowershellが無い環境でも動くよう、実体のパスを優先して探す。"""
+    root = os.environ.get("SystemRoot", r"C:\Windows")
+    full = Path(root) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+    return str(full) if full.exists() else "powershell"
+
+
+def autostart_enable() -> tuple[Path, bool]:
+    """スタートアップフォルダにショートカットを作る（既存があれば作り直す）。
+    ショートカット作成にはWScript.Shell(COM)が要るが、pywin32を追加依存にしたくないので
+    Windows標準のPowerShell経由で作る。呼ばれるのはON/OFFの切り替え時だけ。
+    戻り値は (作ったショートカット, 旧Runキーを消したか)。"""
+    lnk = autostart_shortcut_path()
+    lnk.parent.mkdir(parents=True, exist_ok=True)
+    exe, args, workdir = _autostart_launch_target()
+    script = (
+        "$s = (New-Object -ComObject WScript.Shell).CreateShortcut(" + _psq(str(lnk)) + ");"
+        "$s.TargetPath = " + _psq(exe) + ";"
+        "$s.Arguments = " + _psq(args) + ";"
+        "$s.WorkingDirectory = " + _psq(workdir) + ";"
+        "$s.Description = 'ArcHive Server をWindows起動時に自動で開始します';"
+        "$s.Save()"
+    )
+    proc = subprocess.run(
+        [_powershell(), "-NoProfile", "-NonInteractive", "-Command", script],
+        capture_output=True, text=True, timeout=30,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    if proc.returncode != 0 or not lnk.exists():
+        detail = (proc.stderr or proc.stdout or "").strip().splitlines()
+        raise RuntimeError(detail[0] if detail else "ショートカットを作成できませんでした。")
+    # 二重に登録されたままにしない（Runキーとショートカットの両建てを避ける）
+    return lnk, _autostart_clear_legacy_run()
+
+
+def autostart_disable() -> bool:
+    """ショートカットを削除する（無ければ何もしない）。
+    戻り値は旧Runキーも消したかどうか。"""
+    autostart_shortcut_path().unlink(missing_ok=True)
+    return _autostart_clear_legacy_run()
+
+
+def autostart_open_folder() -> None:
+    """スタートアップフォルダをExplorerで開く（登録された実体を目で確認するため）。"""
+    d = autostart_startup_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    os.startfile(str(d))   # type: ignore[attr-defined]
+
+
 # RARページ展開の同時実行数。unrar.exeの子プロセス起動が競合しないよう絞る。
 # 2は絞りすぎだった: 総スラッシングは減るが1件あたりの待ちが伸び、行列の後ろに
 # 並んだフィルムストリップのサムネがクライアント側10秒タイムアウトに達して
@@ -1643,7 +1807,7 @@ async def register_device(request: Request):
     save_config(_config)
     _log_queue.put(
         f"[認証] 新端末が接続要求中: {device_name} ({device_id[:8]}) "
-        f"— GUIの「端末管理」ボタンで承認してください"
+        f"— GUIの「端末」欄で承認してください"
     )
     return {"status": "pending", "reg_token": reg_token}
 
@@ -3226,6 +3390,10 @@ FG_GREEN = "#a6e3a1"
 FG_RED   = "#f38ba8"
 ACCENT   = "#89b4fa"
 
+# ウィンドウ操作の選択肢。設定ファイルの値 → 画面に出す日本語。
+MINIMIZE_LABELS = {"minimize": "タスクバーに最小化", "tray": "システムトレイに格納"}
+CLOSE_LABELS    = {"exit":     "サーバーの終了",     "tray": "システムトレイに格納"}
+
 # ─── ヘルプHTML（help.htmlが見つからない場合のフォールバック） ────────────────────
 HELP_HTML = (Path(__file__).parent / "help.html").read_text(encoding="utf-8") if (Path(__file__).parent / "help.html").exists() else ""
 
@@ -3234,8 +3402,8 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("MangaServer")
-        self.geometry("720x560")
-        self.minsize(620, 480)
+        self.geometry("760x600")
+        self.minsize(640, 500)
         self.configure(bg=BG)
         try:
             self.iconbitmap(str(ICON_PATH))
@@ -3251,13 +3419,16 @@ class App(tk.Tk):
 
         self._build()
         self._update_dir_list()
+        self._update_device_list()
         self._log(f"MangaServer 起動 | Python {sys.version.split()[0]}")
         if not UNRAR_AVAILABLE:
             self._log(f"[警告] WinRAR が見つかりません（RAR/CBR は使用不可）: {UNRAR_PATH}")
+        self.after(2000, self._poll_devices)
 
-        if os.environ.get("ARCHIVE_AUTOSTART") == "1" or "--autostart" in sys.argv[1:]:
-            # 無人運用インスタンス(ARCHIVE_AUTOSTART=1)、または
-            # Windows起動時のRunキー経由(--autostart引数)での起動: 起動後に自動でサーバー起動→トレイに格納
+        if os.environ.get("ARCHIVE_AUTOSTART") == "1" or AUTOSTART_ARG in sys.argv[1:]:
+            # 無人運用インスタンス(ARCHIVE_AUTOSTART=1)、または Windows起動時の
+            # スタートアップ登録経由(--autostart引数)での起動:
+            # 起動後に自動でサーバー起動→トレイに格納
             self.after(500, self._start_server)
             self.after(1500, self._hide_to_tray)
 
@@ -3296,18 +3467,19 @@ class App(tk.Tk):
         main.grid(row=1, column=0, sticky="ew", padx=10, pady=(10, 0))
         main.columnconfigure(0, weight=3)
         main.columnconfigure(1, weight=2)
+        main.rowconfigure(1, weight=1)
 
         # 左: スキャンフォルダ
         lf = tk.LabelFrame(main, text=" 本棚登録 ", bg=BG, fg=FG,
                             font=("Yu Gothic UI", 9), pady=4)
-        lf.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        lf.grid(row=0, column=0, rowspan=2, sticky="nsew", padx=(0, 8))
         lf.columnconfigure(0, weight=1)
         lf.rowconfigure(0, weight=1)
 
         self._dir_lb = tk.Listbox(
             lf, bg=PANEL, fg=FG, selectbackground=ACCENT,
             selectforeground=BG, font=("Consolas", 9),
-            height=5, borderwidth=0, highlightthickness=0)
+            height=8, borderwidth=0, highlightthickness=0)
         self._dir_lb.grid(row=0, column=0, columnspan=2, sticky="ew", padx=6, pady=2)
 
         btn_f = tk.Frame(lf, bg=BG)
@@ -3337,79 +3509,43 @@ class App(tk.Tk):
         self._port_entry.insert(0, str(_config.get("port", 8765)))
         self._port_entry.grid(row=0, column=1, padx=(0, 8), pady=5, sticky="ew")
 
-        # 外部からのIPv4自動接続（UPnPでルーターのポートを自動開放）
-        self._upnp4_var = tk.BooleanVar(value=bool(_config.get("upnp_ipv4_open", True)))
-        tk.Checkbutton(
-            rf, text="外出先からのIPv4自動接続を許可（UPnP）",
-            variable=self._upnp4_var, bg=BG, fg=FG_DIM, selectcolor=PANEL,
-            activebackground=BG, activeforeground=FG, font=("Yu Gothic UI", 8),
-            anchor="w").grid(row=1, column=0, columnspan=2, sticky="w", padx=6, pady=(6, 0))
+        tk.Button(rf, text="保存", bg="#2a2a4a", fg=FG, relief="flat",
+                  font=("Yu Gothic UI", 9), padx=10, command=self._save_settings
+                  ).grid(row=0, column=2, padx=(0, 8), pady=5)
+        tk.Label(rf, text="変更するとサーバーの再起動が必要です", bg=BG, fg=FG_DIM,
+                 font=("Yu Gothic UI", 8)).grid(row=1, column=0, columnspan=3,
+                                                padx=8, pady=(0, 4), sticky="w")
 
-        # 外出先からのIPv6直結を許可（テスト用にOFFにするとWebRTCフォールバックを検証しやすい）
-        self._ipv6_var = tk.BooleanVar(value=bool(_config.get("report_ipv6", True)))
-        tk.Checkbutton(
-            rf, text="外出先からのIPv6直結を許可（テスト用にOFF可）",
-            variable=self._ipv6_var, bg=BG, fg=FG_DIM, selectcolor=PANEL,
-            activebackground=BG, activeforeground=FG, font=("Yu Gothic UI", 8),
-            anchor="w").grid(row=2, column=0, columnspan=2, sticky="w", padx=6, pady=(2, 0))
+        # 右下: 端末
+        # 別窓だと「スマホでペアリング → 窓を開いて承認」の往復が要るので常設にした。
+        # _config はサーバースレッドと同じ辞書なので、承認待ちはここに自動で出てくる。
+        self._dev_frame = tk.LabelFrame(main, text=" 端末 ", bg=BG, fg=FG,
+                                        font=("Yu Gothic UI", 9), pady=4)
+        self._dev_frame.grid(row=1, column=1, sticky="nsew", pady=(8, 0))
+        self._dev_frame.columnconfigure(0, weight=1)
+        self._dev_frame.rowconfigure(0, weight=1)
 
-        tk.Label(rf,
-                 text="【接続方法】 同じWi-Fi内ならアプリの「LAN内を探す」でサーバーを自動検出。"
-                      "タップすると認証要求が届くので「端末管理」から承認してください。"
-                      "一度認証が終われば、外出先では自動で接続方法を切り替えて接続されます。",
-                 bg=BG, fg=FG_DIM, font=("Yu Gothic UI", 8),
-                 wraplength=340, justify="left").grid(
-            row=3, column=0, columnspan=2, sticky="w", padx=8, pady=(6, 0))
+        self._dev_lb = tk.Listbox(
+            self._dev_frame, bg=PANEL, fg=FG, selectbackground=ACCENT, selectforeground=BG,
+            font=("Consolas", 9), height=5, borderwidth=0, highlightthickness=0)
+        self._dev_lb.grid(row=0, column=0, sticky="nsew", padx=(6, 0), pady=2)
+        dev_sb = ttk.Scrollbar(self._dev_frame, command=self._dev_lb.yview)
+        dev_sb.grid(row=0, column=1, sticky="ns", padx=(0, 6), pady=2)
+        self._dev_lb.configure(yscrollcommand=dev_sb.set)
+        self._device_ids: list[str] = []
+        self._device_sig = None
 
-        btn_rf = tk.Frame(rf, bg=BG)
-        btn_rf.grid(row=4, column=0, columnspan=2, sticky="e", padx=8, pady=(8, 6))
-        tk.Button(btn_rf, text="端末管理...", bg="#1a2a3a", fg=ACCENT, relief="flat",
-                  font=("Yu Gothic UI", 9), padx=8,
-                  command=self._manage_devices).pack(side=tk.LEFT, padx=(0, 4))
-        tk.Button(btn_rf, text="設定を保存", bg="#2a2a4a", fg=FG, relief="flat",
-                  font=("Yu Gothic UI", 9), padx=8,
-                  command=self._save_settings).pack(side=tk.LEFT)
-
-        # ウィンドウ操作
-        _MINIMIZE_LABELS = {"minimize": "タスクバーに最小化", "tray": "システムトレイに格納"}
-        _CLOSE_LABELS    = {"exit":     "サーバーの終了",     "tray": "システムトレイに格納"}
-        wf = tk.LabelFrame(main, text=" ウィンドウ操作 ", bg=BG, fg=FG,
-                           font=("Yu Gothic UI", 9), pady=6)
-        wf.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
-
-        def _om(parent, var, options, cmd):
-            m = tk.OptionMenu(parent, var, *options, command=cmd)
-            m.config(bg=PANEL, fg=FG, activebackground=ACCENT, activeforeground=BG,
-                     relief="flat", font=("Yu Gothic UI", 9), anchor="w",
-                     highlightthickness=0, bd=0)
-            m["menu"].config(bg=PANEL, fg=FG, activebackground=ACCENT,
-                             activeforeground=BG, font=("Yu Gothic UI", 9))
-            return m
-
-        # 最小化ボタン
-        tk.Label(wf, text="最小化ボタン:", bg=BG, fg=FG_DIM,
-                 font=("Yu Gothic UI", 9)).grid(row=0, column=0, padx=(12, 4), pady=4, sticky="w")
-        self._min_var = tk.StringVar(
-            value=_MINIMIZE_LABELS.get(_config.get("on_minimize", "minimize"), "タスクバーに最小化"))
-        def _on_min_change(label, _ml=_MINIMIZE_LABELS):
-            _config["on_minimize"] = {v: k for k, v in _ml.items()}[label]
-            save_config(_config)
-        _om(wf, self._min_var, list(_MINIMIZE_LABELS.values()), _on_min_change
-            ).grid(row=0, column=1, padx=(0, 24), pady=4, sticky="ew")
-
-        # 閉じるボタン
-        tk.Label(wf, text="閉じるボタン:", bg=BG, fg=FG_DIM,
-                 font=("Yu Gothic UI", 9)).grid(row=0, column=2, padx=(0, 4), pady=4, sticky="w")
-        self._close_var = tk.StringVar(
-            value=_CLOSE_LABELS.get(_config.get("on_close", "exit"), "サーバーの終了"))
-        def _on_close_change(label, _cl=_CLOSE_LABELS):
-            _config["on_close"] = {v: k for k, v in _cl.items()}[label]
-            save_config(_config)
-        _om(wf, self._close_var, list(_CLOSE_LABELS.values()), _on_close_change
-            ).grid(row=0, column=3, padx=(0, 12), pady=4, sticky="ew")
-
-        wf.columnconfigure(1, weight=1)
-        wf.columnconfigure(3, weight=1)
+        btn_df = tk.Frame(self._dev_frame, bg=BG)
+        btn_df.grid(row=1, column=0, columnspan=2, sticky="w", padx=4, pady=(2, 0))
+        tk.Button(btn_df, text="✓ 承認", bg="#1a472a", fg=FG_GREEN, relief="flat",
+                  font=("Yu Gothic UI", 9), padx=8, command=self._approve_device
+                  ).pack(side=tk.LEFT, padx=2)
+        tk.Button(btn_df, text="失効", bg="#3a2a0a", fg="#f9e2af", relief="flat",
+                  font=("Yu Gothic UI", 9), padx=8, command=self._revoke_device
+                  ).pack(side=tk.LEFT, padx=2)
+        tk.Button(btn_df, text="✕ 削除", bg="#3a0a0a", fg=FG_RED, relief="flat",
+                  font=("Yu Gothic UI", 9), padx=8, command=self._remove_device
+                  ).pack(side=tk.LEFT, padx=2)
 
     def _build_log(self):
         f = tk.Frame(self, bg=BG)
@@ -3457,6 +3593,12 @@ class App(tk.Tk):
             state=tk.DISABLED, command=self._open_browser)
         self._browser_btn.pack(side=tk.LEFT, padx=4)
 
+        tk.Button(
+            f, text="⚙ 詳細設定", width=12,
+            bg="#1a2a3a", fg=ACCENT, relief="flat",
+            font=("Yu Gothic UI", 10), pady=6,
+            command=self._open_advanced_settings).pack(side=tk.LEFT, padx=(8, 0))
+
 
     # ── フォルダ操作 ───────────────────────────────────────────────────────────
     def _add_dir(self):
@@ -3486,6 +3628,344 @@ class App(tk.Tk):
         for d in _config.get("scan_dirs", []):
             self._dir_lb.insert(tk.END, d)
 
+    # ── 端末 ───────────────────────────────────────────────────────────────────
+    # 表示幅を揃えるため、状態はどれも全角4文字にしてある。
+    DEVICE_STATUS = {
+        "pending":  ("承認待ち", "#f9e2af"),
+        "approved": ("承認済み", FG),
+        "revoked":  ("失効済み", FG_DIM),
+    }
+
+    @staticmethod
+    def _device_signature():
+        """一覧を作り直す必要があるかの判定用。ペアリングで_configが書き換わると変化する。"""
+        return [(did, d.get("status"), d.get("name"))
+                for did, d in sorted((_config.get("devices") or {}).items())]
+
+    def _update_device_list(self):
+        keep = None
+        sel = self._dev_lb.curselection()
+        if sel and sel[0] < len(self._device_ids):
+            keep = self._device_ids[sel[0]]
+
+        self._dev_lb.delete(0, tk.END)
+        self._device_ids.clear()
+        pending = 0
+        for did, d in (_config.get("devices") or {}).items():
+            if did == "browser-local":
+                continue
+            status = d.get("status", "pending")
+            label, color = self.DEVICE_STATUS.get(status, (status, FG_DIM))
+            if status == "pending":
+                pending += 1
+            ts = (d.get("approved_at") or d.get("requested_at") or "")[:10]
+            self._device_ids.append(did)
+            self._dev_lb.insert(tk.END, f"{label}  {d.get('name', '不明')}  ({did[:8]})  {ts}")
+            self._dev_lb.itemconfigure(tk.END, foreground=color)
+
+        if keep in self._device_ids:
+            i = self._device_ids.index(keep)
+            self._dev_lb.selection_set(i)
+            self._dev_lb.see(i)
+
+        if not self._device_ids:
+            self._dev_lb.insert(
+                tk.END, "  （端末はまだありません。アプリの「LAN内を探す」で出ます）")
+            self._dev_lb.itemconfigure(tk.END, foreground=FG_DIM)
+
+        # 承認待ちは見出しに出す。ログを見ていなくても気づけるように。
+        self._dev_frame.configure(
+            text=f" 端末（承認待ち {pending} 台） " if pending else " 端末 ",
+            fg="#f9e2af" if pending else FG)
+        self._device_sig = self._device_signature()
+
+    def _poll_devices(self):
+        """サーバースレッドと同じ_config辞書を見ているので、ペアリングはここで拾える。
+        毎回作り直すと選択が飛ぶため、変化したときだけ更新する。"""
+        try:
+            if self._device_signature() != self._device_sig:
+                self._update_device_list()
+        except tk.TclError:
+            return
+        self.after(2000, self._poll_devices)
+
+    def _selected_device(self):
+        sel = self._dev_lb.curselection()
+        if not sel or sel[0] >= len(self._device_ids):
+            return None, None
+        did = self._device_ids[sel[0]]
+        return did, _config.get("devices", {}).get(did)
+
+    def _approve_device(self):
+        did, d = self._selected_device()
+        if not d:
+            return
+        if d.get("status") == "approved":
+            return
+        d["token"]       = _new_token()
+        d["status"]      = "approved"
+        d["approved_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+        save_config(_config)
+        self._log(f"[認証] 端末を承認しました: {d.get('name', did[:8])}")
+        self._update_device_list()
+
+    def _revoke_device(self):
+        """接続だけ止める。登録は残るので、あとから「承認」で戻せる
+        （reg_tokenを残しておけばアプリ側のポーリングがそのまま復帰する）。"""
+        did, d = self._selected_device()
+        if not d or d.get("status") == "revoked":
+            return
+        d["status"] = "revoked"
+        d["token"]  = ""
+        save_config(_config)
+        self._log(f"[認証] 端末を失効させました: {d.get('name', did[:8])}")
+        self._update_device_list()
+
+    def _remove_device(self):
+        did, d = self._selected_device()
+        if not d:
+            return
+        name = d.get("name", did[:8])
+        if not messagebox.askyesno(
+                "端末を削除",
+                f"「{name}」の登録を削除しますか？\n"
+                "再び使うにはアプリからのペアリングをやり直しになります。"):
+            return
+        _config.get("devices", {}).pop(did, None)
+        save_config(_config)
+        self._log(f"[認証] 端末を削除しました: {name}")
+        self._update_device_list()
+
+    # ── Windows起動時の自動起動 ────────────────────────────────────────────────
+    def _open_startup_folder(self):
+        """登録先のスタートアップフォルダをExplorerで開く（実体を目で確認できるように）。"""
+        try:
+            autostart_open_folder()
+        except Exception as e:
+            messagebox.showerror("自動起動", f"フォルダを開けませんでした:\n{e}")
+
+    # ── 詳細設定 ───────────────────────────────────────────────────────────────
+    def _open_advanced_settings(self):
+        """メイン画面に出していない設定をまとめて編集する。
+        上から順に「普通の人が一度は決める項目」→「既定のままで動く技術寄りの項目」の並び。"""
+        win = tk.Toplevel(self, bg=BG)
+        win.title("詳細設定")
+        win.geometry("640x640")
+        win.configure(bg=BG)
+        win.transient(self)
+
+        # 保存/キャンセルは先に下端へ確保しておく。あとから pack すると、
+        # 上のセクションが伸びたときにボタンが窓の外へ押し出されてしまうため。
+        btn_f = tk.Frame(win, bg=BG)
+        btn_f.pack(side=tk.BOTTOM, pady=14)
+
+        # Database URLが長いなど、内容が窓に収まらないことがあるので本文はスクロールさせる。
+        canvas = tk.Canvas(win, bg=BG, highlightthickness=0)
+        vsb = ttk.Scrollbar(win, command=canvas.yview)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        canvas.configure(yscrollcommand=vsb.set)
+        body = tk.Frame(canvas, bg=BG)
+        body_id = canvas.create_window((0, 0), window=body, anchor="nw")
+        body.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(body_id, width=e.width))
+        # ホイールはToplevelに束ねる。bindtags経由で子ウィジェット上でも拾えるので、
+        # bind_all(アプリ全体を巻き込む)を使わずにこのダイアログ内だけで効く。
+        win.bind("<MouseWheel>", lambda e: canvas.yview_scroll(int(-e.delta / 120), "units"))
+
+        entries: dict[str, tk.Entry] = {}
+
+        def section(title):
+            lf = tk.LabelFrame(body, text=f" {title} ", bg=BG, fg=FG,
+                               font=("Yu Gothic UI", 9), pady=4)
+            lf.pack(fill=tk.X, padx=10, pady=(8, 0))
+            lf.columnconfigure(1, weight=1)
+            return lf
+
+        def row(parent, r, key, label, value, hint="", secret=False):
+            tk.Label(parent, text=label, bg=BG, fg=FG_DIM, font=("Yu Gothic UI", 9)
+                     ).grid(row=r, column=0, padx=(8, 6), pady=3, sticky="w")
+            e = tk.Entry(parent, bg=PANEL, fg=FG, insertbackground=FG, relief="flat",
+                         font=("Consolas", 9), show="*" if secret else "")
+            e.insert(0, value)
+            e.grid(row=r, column=1, padx=(0, 8), pady=3, sticky="ew")
+            entries[key] = e
+            if hint:
+                tk.Label(parent, text=hint, bg=BG, fg=FG_DIM, font=("Yu Gothic UI", 8)
+                         ).grid(row=r + 1, column=1, padx=(0, 6), sticky="w")
+            return e
+
+        # ── 起動とウィンドウ操作 ──────────────────────────────────────────────
+        # 毎日は触らないが最初に一度は必ず決める項目なので、技術寄りの項目より上に置く。
+        sw = section("起動とウィンドウ操作")
+
+        def _om(parent, var, options):
+            m = tk.OptionMenu(parent, var, *options)
+            m.config(bg=PANEL, fg=FG, activebackground=ACCENT, activeforeground=BG,
+                     relief="flat", font=("Yu Gothic UI", 9), anchor="w",
+                     highlightthickness=0, bd=0)
+            m["menu"].config(bg=PANEL, fg=FG, activebackground=ACCENT,
+                             activeforeground=BG, font=("Yu Gothic UI", 9))
+            return m
+
+        tk.Label(sw, text="最小化ボタン", bg=BG, fg=FG_DIM, font=("Yu Gothic UI", 9)
+                 ).grid(row=0, column=0, padx=(8, 6), pady=3, sticky="w")
+        min_var = tk.StringVar(value=MINIMIZE_LABELS.get(
+            _config.get("on_minimize", "minimize"), "タスクバーに最小化"))
+        _om(sw, min_var, list(MINIMIZE_LABELS.values())).grid(
+            row=0, column=1, columnspan=2, padx=(0, 8), pady=3, sticky="w")
+
+        tk.Label(sw, text="閉じるボタン", bg=BG, fg=FG_DIM, font=("Yu Gothic UI", 9)
+                 ).grid(row=1, column=0, padx=(8, 6), pady=3, sticky="w")
+        close_var = tk.StringVar(value=CLOSE_LABELS.get(
+            _config.get("on_close", "exit"), "サーバーの終了"))
+        _om(sw, close_var, list(CLOSE_LABELS.values())).grid(
+            row=1, column=1, columnspan=2, padx=(0, 8), pady=3, sticky="w")
+
+        # 自動起動はレジストリ(Runキー)ではなくスタートアップフォルダの
+        # ショートカットで登録する（理由は autostart_* 群の冒頭コメント）。
+        as_ok, as_reason = autostart_is_supported()
+        as_var = tk.BooleanVar(value=as_ok and autostart_is_enabled())
+        as_cb = tk.Checkbutton(
+            sw, text="Windows起動時に自動で開始してトレイに常駐する",
+            variable=as_var, bg=BG, fg=FG_DIM, selectcolor=PANEL,
+            activebackground=BG, activeforeground=FG, font=("Yu Gothic UI", 9))
+        as_cb.grid(row=2, column=0, columnspan=2, padx=(6, 0), pady=(6, 0), sticky="w")
+        if as_ok:
+            tk.Button(sw, text="登録先フォルダを開く", bg="#2a2a4a", fg=FG, relief="flat",
+                      font=("Yu Gothic UI", 8), padx=6, command=self._open_startup_folder
+                      ).grid(row=2, column=2, padx=(0, 8), pady=(6, 0), sticky="e")
+            as_note = ("スタートアップフォルダにショートカットを1つ置くだけです"
+                       "（レジストリは使いません）。インストーラーがレジストリに登録した"
+                       "古い自動起動が残っていた場合は、ここで保存すると一緒に片付きます。")
+        else:
+            as_cb.configure(state=tk.DISABLED)
+            as_note = as_reason
+        tk.Label(sw, text=as_note, bg=BG, fg=FG_DIM, font=("Yu Gothic UI", 8),
+                 justify="left", wraplength=560
+                 ).grid(row=3, column=0, columnspan=3, padx=(28, 6), pady=(0, 4), sticky="w")
+
+        tk.Label(body, text="ここから下は通常は変更不要です。"
+                            "外出先からうまくつながらないときに使います。",
+                 bg=BG, fg=FG_DIM, font=("Yu Gothic UI", 8), justify="left",
+                 wraplength=580).pack(anchor="w", padx=12, pady=(14, 0))
+
+        s2 = section("接続")
+        upnp_var = tk.BooleanVar(value=bool(_config.get("upnp_ipv4_open", True)))
+        tk.Checkbutton(s2, text="UPnPでIPv4ポートを自動開放（外出先から直接閲覧）",
+                       variable=upnp_var, bg=BG, fg=FG_DIM, selectcolor=PANEL,
+                       activebackground=BG, activeforeground=FG,
+                       font=("Yu Gothic UI", 9)
+                       ).grid(row=0, column=0, columnspan=3, padx=6, pady=3, sticky="w")
+        tk.Label(s2, text="ルーターに穴を開けてIPv4でも外から直接つながるようにします",
+                 bg=BG, fg=FG_DIM, font=("Yu Gothic UI", 8)
+                 ).grid(row=1, column=0, columnspan=3, padx=(28, 6), sticky="w")
+        ipv6_var = tk.BooleanVar(value=bool(_config.get("report_ipv6", True)))
+        tk.Checkbutton(s2, text="IPv6アドレスを端末に知らせる（IPv6直結を使う）",
+                       variable=ipv6_var, bg=BG, fg=FG_DIM, selectcolor=PANEL,
+                       activebackground=BG, activeforeground=FG,
+                       font=("Yu Gothic UI", 9)
+                       ).grid(row=2, column=0, columnspan=3, padx=6, pady=3, sticky="w")
+        tk.Label(s2, text="切ると外からの接続はIPv4(UPnP)経由かP2Pフォールバックだけになります",
+                 bg=BG, fg=FG_DIM, font=("Yu Gothic UI", 8)
+                 ).grid(row=3, column=0, columnspan=3, padx=(28, 6), sticky="w")
+
+        s3 = section("Firebase（P2Pのシグナリング）")
+        fb = _config.get("firebase") or {}
+        row(s3, 0, "fb_api_key", "APIキー", fb.get("api_key", ""),
+            hint="両方とも空欄 = 開発者共通の既定プロジェクトを使います")
+        row(s3, 2, "fb_database_url", "Database URL", fb.get("database_url", ""))
+
+        s4 = section("WebRTC（直結できないときのP2Pフォールバック）")
+        row(s4, 0, "stun", "STUNサーバー", ", ".join(_config.get("stun_servers") or []),
+            hint="カンマ区切り。空欄 = stun:stun.l.google.com:19302")
+        turn = _config.get("turn") or {}
+        row(s4, 2, "turn_url", "TURN URL", turn.get("url", ""),
+            hint="TURNは任意。設定するとNATが厳しい環境でも中継でつながります")
+        row(s4, 4, "turn_user", "TURN ユーザー名", turn.get("username", ""))
+        row(s4, 5, "turn_cred", "TURN パスワード", turn.get("credential", ""), secret=True)
+
+        def save():
+            try:
+                self._apply_advanced_settings(
+                    on_minimize=min_var.get(),
+                    on_close=close_var.get(),
+                    autostart_enabled=bool(as_var.get()) if as_ok else None,
+                    upnp_ipv4_open=bool(upnp_var.get()),
+                    report_ipv6=bool(ipv6_var.get()),
+                    fb_api_key=entries["fb_api_key"].get(),
+                    fb_database_url=entries["fb_database_url"].get(),
+                    stun_text=entries["stun"].get(),
+                    turn_url=entries["turn_url"].get(),
+                    turn_username=entries["turn_user"].get(),
+                    turn_credential=entries["turn_cred"].get(),
+                )
+            except Exception as e:
+                # 自動起動の登録/解除に失敗したとき。ダイアログは閉じずに残して、
+                # チェックを外してもう一度保存できるようにする。
+                messagebox.showerror("詳細設定", f"保存できませんでした: {e}")
+                return
+            self._log("詳細設定を保存しました"
+                      "（IPv4/IPv6の変更は60秒以内、STUN/TURNはサーバー再起動後に反映）")
+            win.destroy()
+
+        tk.Button(btn_f, text="保存", bg="#1a472a", fg=FG_GREEN, relief="flat",
+                  font=("Yu Gothic UI", 9), padx=20, command=save).pack(side=tk.LEFT, padx=4)
+        tk.Button(btn_f, text="キャンセル", bg="#2a2a4a", fg=FG, relief="flat",
+                  font=("Yu Gothic UI", 9), padx=20, command=win.destroy).pack(side=tk.LEFT, padx=4)
+
+    def _apply_advanced_settings(self, *, on_minimize: str, on_close: str,
+                                 autostart_enabled: bool | None, upnp_ipv4_open: bool,
+                                 report_ipv6: bool, fb_api_key: str, fb_database_url: str,
+                                 stun_text: str, turn_url: str, turn_username: str,
+                                 turn_credential: str) -> None:
+        """詳細設定の入力値を設定に反映して保存する。
+        「空欄 = 既定を使う」の解釈をここに集約してあるので、UIと切り離して検証できる。
+        autostart_enabled が None のときは自動起動に対応していない環境なので触らない。"""
+        # 自動起動だけは設定ファイルではなく実ファイル(ショートカット)の操作なので
+        # 失敗しうる。先に済ませて、失敗したら何も保存せずに例外を呼び出し元へ返す。
+        # 正しい状態は「.lnkがあり、旧Runキー(インストーラーが作った値)は無い」。
+        # is_enabled同士で比べると、旧Runキーだけ残った状態で「有効」に見えてしまい、
+        # チェックONのまま保存してもショートカットが作られないまま素通りしてしまう。
+        if autostart_enabled is not None and (
+                autostart_enabled != _autostart_shortcut_exists()
+                or _autostart_legacy_run_exists()):
+            if autostart_enabled:
+                lnk, legacy = autostart_enable()
+                self._log(f"Windows起動時の自動起動を有効にしました: {lnk}")
+                self._log(f"  起動されるコマンド: {autostart_describe()}")
+            else:
+                legacy = autostart_disable()
+                self._log("Windows起動時の自動起動を解除しました（ショートカットを削除）")
+            if legacy:
+                self._log("  インストーラーが登録した古い自動起動（レジストリ）も削除しました")
+
+        _config["on_minimize"] = {v: k for k, v in MINIMIZE_LABELS.items()}[on_minimize]
+        _config["on_close"] = {v: k for k, v in CLOSE_LABELS.items()}[on_close]
+        _config["upnp_ipv4_open"] = bool(upnp_ipv4_open)
+        _config["report_ipv6"] = bool(report_ipv6)
+
+        # 空欄のキーは書き出さない。シグナリング側がDEFAULT_FIREBASEへ
+        # フォールバックする作りなので、設定ファイルを見たときに
+        # 「既定を使っている」と一目で分かるようにするため。
+        fb_new = {}
+        if fb_api_key.strip():
+            fb_new["api_key"] = fb_api_key.strip()
+        if fb_database_url.strip():
+            fb_new["database_url"] = fb_database_url.strip()
+        _config["firebase"] = fb_new
+
+        stun = [v.strip() for v in stun_text.replace("\n", ",").split(",") if v.strip()]
+        _config["stun_servers"] = stun or list(DEFAULT_CONFIG["stun_servers"])
+
+        _config["turn"] = {
+            "url":        turn_url.strip(),
+            "username":   turn_username.strip(),
+            "credential": turn_credential.strip(),
+        } if turn_url.strip() else {}
+
+        save_config(_config)
+
     # ── 設定保存 ───────────────────────────────────────────────────────────────
     def _save_settings(self):
         try:
@@ -3493,134 +3973,8 @@ class App(tk.Tk):
         except ValueError:
             messagebox.showerror("エラー", "ポート番号は整数で入力してください")
             return
-        _config["upnp_ipv4_open"] = bool(self._upnp4_var.get())
-        _config["report_ipv6"] = bool(self._ipv6_var.get())
         save_config(_config)
-        self._log("設定を保存しました（IPv4/IPv6の変更は60秒以内に反映）")
-
-    # ── 端末管理 ─────────────────────────────────────────────────────────────────
-    def _manage_devices(self):
-        """端末管理ダイアログを開く（承認・抹消）。"""
-        dlg = tk.Toplevel(self)
-        dlg.title("接続端末の管理")
-        dlg.configure(bg=BG)
-        dlg.geometry("540x310")
-        dlg.resizable(True, False)
-        dlg.grab_set()
-
-        tk.Label(dlg, text="接続端末の管理", bg=BG, fg=FG,
-                 font=("Yu Gothic UI", 11, "bold")).pack(pady=(10, 2))
-        tk.Label(dlg, text="承認待ち端末を選択して「承認」を押してください",
-                 bg=BG, fg=FG_DIM, font=("Yu Gothic UI", 8)).pack()
-
-        content = tk.Frame(dlg, bg=BG)
-        content.pack(fill=tk.BOTH, expand=True, padx=10, pady=4)
-
-        lb_frame = tk.Frame(content, bg=BG)
-        lb_frame.pack(fill=tk.BOTH, expand=True)
-        lb = tk.Listbox(lb_frame, bg=PANEL, fg=FG, selectbackground=ACCENT,
-                        selectforeground=BG, font=("Yu Gothic UI", 9),
-                        height=8, borderwidth=0, highlightthickness=0)
-        vsb = ttk.Scrollbar(lb_frame, command=lb.yview)
-        lb.configure(yscrollcommand=vsb.set)
-        lb.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        vsb.pack(side=tk.RIGHT, fill=tk.Y)
-
-        btn_frame = tk.Frame(content, bg=BG)
-        btn_frame.pack(pady=6, anchor="w")
-        approve_btn = tk.Button(btn_frame, text="✓ 承認", bg="#1a472a", fg=FG_GREEN,
-                                relief="flat", font=("Yu Gothic UI", 9), padx=8,
-                                state=tk.DISABLED)
-        approve_btn.pack(side=tk.LEFT, padx=4)
-        revoke_btn = tk.Button(btn_frame, text="✕ 抹消", bg="#3a0a0a", fg=FG_RED,
-                               relief="flat", font=("Yu Gothic UI", 9), padx=8,
-                               state=tk.DISABLED)
-        revoke_btn.pack(side=tk.LEFT, padx=4)
-
-        dev_ids: list[str | None] = []
-
-        def refresh():
-            nonlocal dev_ids
-            try:
-                sel = lb.curselection()
-                lb.delete(0, tk.END)
-                dev_ids = []
-                devices = _config.get("devices", {})
-                for did, d in devices.items():
-                    if did == "browser-local":
-                        continue
-                    st   = d.get("status", "pending")
-                    name = d.get("name", "不明")
-                    ts   = (d.get("approved_at") or d.get("requested_at") or "")[:10]
-                    icon = "🟡" if st == "pending" else ("🟢" if st == "approved" else "🔴")
-                    label = f"{icon}  {name}  ({did[:8]})  {ts}"
-                    if st == "pending":
-                        label += "  ← 承認待ち"
-                    lb.insert(tk.END, label)
-                    dev_ids.append(did)
-                    if st == "pending":
-                        lb.itemconfigure(tk.END, fg="#f38ba8")
-                if not dev_ids:
-                    lb.insert(tk.END, "（登録済み端末はありません）")
-                    dev_ids.append(None)
-                # 選択を復元
-                if sel and sel[0] < lb.size():
-                    lb.selection_set(sel[0])
-                    on_select()
-            except tk.TclError:
-                pass
-
-        def on_select(event=None):
-            sel = lb.curselection()
-            if not sel or dev_ids[sel[0]] is None:
-                approve_btn.configure(state=tk.DISABLED)
-                revoke_btn.configure(state=tk.DISABLED)
-                return
-            did = dev_ids[sel[0]]
-            d   = _config.get("devices", {}).get(did, {})
-            st  = d.get("status", "pending")
-            approve_btn.configure(state=tk.NORMAL if st == "pending"  else tk.DISABLED)
-            revoke_btn.configure (state=tk.NORMAL if st != "revoked"  else tk.DISABLED)
-
-        def approve():
-            sel = lb.curselection()
-            if not sel or dev_ids[sel[0]] is None:
-                return
-            did = dev_ids[sel[0]]
-            d   = _config.get("devices", {}).get(did)
-            if not d:
-                return
-            d["token"]       = _new_token()
-            d["status"]      = "approved"
-            d["approved_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
-            save_config(_config)
-            self._log(f"[認証] 端末を承認しました: {d.get('name', did[:8])}")
-            refresh()
-
-        def revoke():
-            sel = lb.curselection()
-            if not sel or dev_ids[sel[0]] is None:
-                return
-            did  = dev_ids[sel[0]]
-            name = _config.get("devices", {}).get(did, {}).get("name", did[:8])
-            if not messagebox.askyesno("端末を抹消",
-                    f"「{name}」の接続を抹消しますか？\n"
-                    "次回からこの端末は接続できなくなります。", parent=dlg):
-                return
-            _config.get("devices", {}).pop(did, None)
-            save_config(_config)
-            self._log(f"[認証] 端末を抹消しました: {name}")
-            refresh()
-
-        lb.bind("<<ListboxSelect>>", on_select)
-        approve_btn.configure(command=approve)
-        revoke_btn.configure(command=revoke)
-
-        def auto_refresh():
-            if dlg.winfo_exists():
-                refresh()
-                dlg.after(2000, auto_refresh)
-        auto_refresh()
+        self._log("ポート番号を保存しました（サーバー再起動後に反映）")
 
     # ── スキャン ───────────────────────────────────────────────────────────────
     def _do_scan(self):
