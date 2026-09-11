@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io' show HttpException, SocketException;
 import 'package:firebase_database/firebase_database.dart';
 import 'package:flutter/foundation.dart';   // ValueNotifier
 import 'package:flutter_cache_manager/flutter_cache_manager.dart';
@@ -9,8 +10,54 @@ import 'firebase_signaling.dart';
 import 'http_pinned_client.dart';
 import 'webrtc_service.dart';
 
+/// keep-alive でプールに残っていた接続が、サーバー側では既に閉じられていた
+/// 時の失敗かどうかを判定する。
+///
+/// HTTP/1.1 の keep-alive はサーバーが好きな時に接続を切れるが、dart:io の
+/// HttpClient はプールから取り出した接続が死んでいても張り直さず、GET の
+/// 再送もしない。サーバー(uvicorn)の既定は5秒で切る / dart:io のプールは
+/// 15秒保持するので、その差の10秒間に来た最初のリクエストは必ず
+/// 「Connection closed before full header was received」で即死する。
+///
+/// 判定は経過時間で行う。まだ一度もネットワークを往復していない（1秒未満で
+/// 通信例外）なら、経路が死んだのではなく掴んだ接続が古かっただけなので、
+/// 張り直せば直る。逆に本当に経路が死んでいる時は接続試行に時間がかかるため
+/// ここには該当せず、従来どおりの回復処理へ進む。
+bool _looksLikeStaleConnection(Object e, Stopwatch sw) =>
+    sw.elapsedMilliseconds < 1000 &&
+    (e is http.ClientException || e is HttpException || e is SocketException);
+
+/// 寝ていた接続を掴んで即死した時だけ、張り直して取り直す。
+///
+/// 本命の対策は makePinnedClient の idleTimeout 短縮（死んだ接続をプールに
+/// 残さない）で、こちらはその取りこぼし用の保険。keep-alive を4秒より短く
+/// 切るサーバーや中継（トンネル等）、タイマーがずれた時の境界を拾う。
+///
+/// 1回では足りない。プールには死んだ接続が複数溜まっていることがあり、
+/// 実測では2本続けて掴まされた。1本あたり数ミリ秒で落ちるので、
+/// 数回回しても体感には出ない。参照系(GET/POST)なので再送して安全。
+Future<T> _retryOnStaleConnection<T>(Future<T> Function() send,
+    {int maxRetry = 3}) async {
+  var tries = 0;
+  while (true) {
+    final sw = Stopwatch()..start();
+    try {
+      return await send();
+    } catch (e) {
+      if (tries >= maxRetry || !_looksLikeStaleConnection(e, sw)) rethrow;
+      tries++;
+    }
+  }
+}
+
 /// HttpFileService にダウンロードタイムアウトを付与するラッパー。
 /// flutter_cache_manager のデフォルトはタイムアウト無し（ハングが永続する）。
+///
+/// あわせて「寝ていた接続を掴んで即死した」時だけ取り直す。
+/// ページ画像は _getWithRecovery を通らないため、ここで拾わないと
+/// CachedNetworkImage の errorWidget（ブロークンアイコン）に直行する。
+/// 本を開いた直後の1ページ目は、書棚の表紙取得から数秒〜十数秒空いた後の
+/// 最初の1本になりやすく、ここが一番の当たり所だった。
 class _TimeoutFileService implements FileService {
   final FileService _inner;
   const _TimeoutFileService(this._inner);
@@ -22,8 +69,10 @@ class _TimeoutFileService implements FileService {
   set concurrentFetches(int value) => _inner.concurrentFetches = value;
 
   @override
-  Future<FileServiceResponse> get(String url, {Map<String, String>? headers}) =>
-      _inner.get(url, headers: headers).timeout(const Duration(seconds: 10));
+  Future<FileServiceResponse> get(String url,
+          {Map<String, String>? headers}) =>
+      _retryOnStaleConnection(() =>
+          _inner.get(url, headers: headers).timeout(const Duration(seconds: 10)));
 }
 
 class ApiService {
@@ -356,8 +405,13 @@ class ApiService {
   Future<http.Response> _getWithRecovery(String pathAndQuery) async {
     Uri u() => Uri.parse('$baseUrl$pathAndQuery');
     try {
-      final res = await _client.get(u(), headers: headers)
-          .timeout(const Duration(seconds: 8));
+      // 寝ていた接続を掴んで即死しただけなら経路は生きているので、
+      // reconnect()（候補レース・Firebase参照）まで行かずに張り直す。
+      // 本を開いた直後の /info がここで数秒遅れると、1ページ目の取得も
+      // まるごと後ろへずれてしまう。
+      final res = await _retryOnStaleConnection(() =>
+          _client.get(u(), headers: headers)
+              .timeout(const Duration(seconds: 8)));
       // WebRTC切断後はローカルプロキシが404を返す（例外でないので個別に検知）。
       // 経路が死んでいる時の404だけ「繋ぎ直し」シグナルとして扱う。
       if (res.statusCode == 404 && _transportDead && await reconnect()) {
@@ -378,8 +432,9 @@ class ApiService {
   Future<http.Response> _postWithRecovery(String pathAndQuery) async {
     Uri u() => Uri.parse('$baseUrl$pathAndQuery');
     try {
-      final res = await _client.post(u(), headers: headers)
-          .timeout(const Duration(seconds: 8));
+      final res = await _retryOnStaleConnection(() =>
+          _client.post(u(), headers: headers)
+              .timeout(const Duration(seconds: 8)));
       // WebRTC切断後はローカルプロキシが404を返す（例外でないので個別に検知）。
       if (res.statusCode == 404 && _transportDead && await reconnect()) {
         return _client.post(u(), headers: headers)

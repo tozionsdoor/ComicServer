@@ -3478,7 +3478,15 @@ class _UvicornThread(threading.Thread):
     def __init__(self, host: str, port: int,
                  ssl_certfile: str = "", ssl_keyfile: str = ""):
         super().__init__(daemon=True)
-        kw: dict = dict(host=host, port=port, log_config=None)
+        # timeout_keep_alive: uvicorn の既定は5秒。一方 Dart(dart:io) の
+        # HttpClient は使い終わった接続を既定15秒プールに残し、しかも取り出した
+        # 接続がサーバー側で閉じられていても張り直してくれない（GETの再送もしない）。
+        # 差の10秒間に来た最初のリクエストは必ず
+        # 「Connection closed before full header was received」で即死するため、
+        # 書棚を眺めてから本を開いた時の1ページ目がブロークンアイコンになっていた。
+        # クライアントの保持時間より長くして、切るのは常にクライアント側にする。
+        kw: dict = dict(host=host, port=port, log_config=None,
+                        timeout_keep_alive=75)
         if ssl_certfile and ssl_keyfile:
             kw["ssl_certfile"] = ssl_certfile
             kw["ssl_keyfile"]  = ssl_keyfile
