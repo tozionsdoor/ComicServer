@@ -535,10 +535,13 @@ class PairingDialog(tk.Toplevel):
         self._clear()
         tk.Label(self._body, text="承認待ち", bg=BG, fg=FG,
                  font=("Meiryo UI", 13, "bold")).pack(pady=(20, 8))
+        # 承認する場所はサーバーの種類で違う（PC版＝GUIの「端末」欄／NAS版＝管理ページ）。
+        # どちらかは発見の応答では分からないので、両方を案内する。
         tk.Label(self._body,
-                 text=f"{server.name} に接続を申請しました。\n\n"
-                      "サーバーPCの ArcHive サーバー画面 右下「端末」欄で\n"
-                      f"「{self._app._cfg['device_name']}」を承認してください。",
+                 text=f"{server.name} に接続を申請しました。\n"
+                      f"「{self._app._cfg['device_name']}」を承認してください。\n\n"
+                      "PC版: サーバー画面 右下の「端末」欄\n"
+                      f"NAS版: {server.base_url}/admin の「端末」",
                  bg=BG, fg=FG_DIM, font=("Meiryo UI", 10), justify=tk.CENTER).pack()
         self._remain_lbl = tk.Label(self._body, text=f"残り約 {self._remain} 秒",
                                     bg=BG, fg=FG_DIM, font=("Meiryo UI", 9))

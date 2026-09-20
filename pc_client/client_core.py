@@ -266,6 +266,35 @@ class CertificateMismatch(Exception):
     """証明書が保存済みフィンガープリントと違う（サーバー入れ替え or 中間者）。"""
 
 
+# NAS版サーバー（ReadyNAS = Debian 8 + 古いOpenSSL）は TLS1.2 でも
+# ECDHE-RSA-AES256-SHA のような SHA-1 MAC の暗号しか喋らない。こちらのPythonが使う
+# OpenSSL 3.x は既定のセキュリティレベル2でそれを弾き、ハンドシェイクが
+# 「UNEXPECTED_EOF_WHILE_READING」で落ちる（＝サーバーが落ちているように見える）。
+#
+# 既定のまま繋ぎに行き、TLSで落ちた相手にだけレベルを1に下げて繋ぎ直す。
+# 相手は証明書のフィンガープリントで固定しているので、暗号が古くても
+# 「知らないサーバーに繋がる」ことは起きない。一度判明した相手は覚えておき、
+# 以降の接続では二度手間にしない。
+_LEGACY_CIPHERS = "DEFAULT@SECLEVEL=1"
+_legacy_tls_hosts: set[tuple[str, int]] = set()
+_legacy_tls_lock = threading.Lock()
+
+
+def _open_tls(host: str, port: int, timeout: float,
+              legacy: bool) -> http.client.HTTPSConnection:
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False          # IP直打ち＋自己署名なので名前では検証できない
+    ctx.verify_mode    = ssl.CERT_NONE  # 代わりにフィンガープリント照合で担保する
+    if legacy:
+        try:
+            ctx.set_ciphers(_LEGACY_CIPHERS)
+        except ssl.SSLError:
+            pass                        # この環境のOpenSSLが解釈できなければ既定のまま
+    conn = http.client.HTTPSConnection(host, port, timeout=timeout, context=ctx)
+    conn.connect()
+    return conn
+
+
 @dataclass
 class Response:
     status:  int
@@ -321,11 +350,16 @@ class PinnedHttps:
         parts = urllib.parse.urlsplit(self.base_url)
         host  = parts.hostname or ""
         port  = parts.port or DEFAULT_PORT
-        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-        ctx.check_hostname = False          # IP直打ち＋自己署名なので名前では検証できない
-        ctx.verify_mode    = ssl.CERT_NONE  # 代わりに下のフィンガープリント照合で担保する
-        conn = http.client.HTTPSConnection(host, port, timeout=timeout, context=ctx)
-        conn.connect()
+        with _legacy_tls_lock:
+            legacy = (host, port) in _legacy_tls_hosts
+        try:
+            conn = _open_tls(host, port, timeout, legacy)
+        except (ssl.SSLError, ConnectionResetError):
+            if legacy:
+                raise
+            conn = _open_tls(host, port, timeout, True)   # 古いサーバー向けに緩めて再挑戦
+            with _legacy_tls_lock:
+                _legacy_tls_hosts.add((host, port))
         der = conn.sock.getpeercert(binary_form=True) or b""
         fp  = hashlib.sha256(der).hexdigest()
         self.observed_fingerprint = fp
