@@ -12,7 +12,7 @@ if [ ! -f "$NOTES" ]; then
   exit 0
 fi
 
-URL=$(grep -oE 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' "$NOTES" | head -1)
+URL=$(grep -oE 'https://([a-zA-Z0-9.-]+\.trycloudflare\.com|archive-demo\.uk)' "$NOTES" | head -1)
 TOKEN=$(grep -oE '^[[:space:]]*[A-Za-z0-9_-]{25,}[[:space:]]*$' "$NOTES" | head -1 | tr -d '[:space:]')
 
 if [ -z "$URL" ] || [ -z "$TOKEN" ]; then

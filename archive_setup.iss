@@ -3,7 +3,7 @@
 ; Build:  build_archive_setup_inno.bat  ->  dist\ArcHive_Setup.exe
 
 #define AppName "ArcHive Server"
-#define AppVersion "1.1.0"
+#define AppVersion "1.2.0"
 #define AppPublisher "ArcHive"
 #define AppExeName "ArcHiveServer.exe"
 
