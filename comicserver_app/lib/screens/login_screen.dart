@@ -10,6 +10,46 @@ import '../services/saved_connections.dart';
 import '../services/webrtc_service.dart';
 import 'shelf_screen.dart';
 
+/// サーバーごとに違う接続情報（証明書フィンガープリント・外部アドレス・WebRTC部屋ID）。
+typedef _ConnMeta = ({
+  String certFingerprint,
+  String ipv6,
+  String ipv4Global,
+  int    ipv4Port,
+  String roomId,
+});
+
+const _ConnMeta _noMeta =
+    (certFingerprint: '', ipv6: '', ipv4Global: '', ipv4Port: 0, roomId: '');
+
+_ConnMeta _metaFromPrefs(SharedPreferences prefs) => (
+      certFingerprint: prefs.getString('cert_fingerprint') ?? '',
+      ipv6:            prefs.getString('ipv6') ?? '',
+      ipv4Global:      prefs.getString('ipv4_global') ?? '',
+      ipv4Port:        prefs.getInt('ipv4_port') ?? 0,
+      roomId:          prefs.getString('room_id') ?? '',
+    );
+
+/// 接続に成功したサーバーを「現在の接続先」として prefs に書き、接続履歴にも残す。
+/// url/token と接続情報は必ず同じサーバーのものを組で書く（別サーバーの値が混ざると、
+/// 次回の自動接続や履歴からの接続が証明書のピン留めで弾かれる）。
+Future<void> _saveCurrentServer(
+    SharedPreferences prefs, String url, String token, _ConnMeta meta) async {
+  await prefs.setString('url',   url);
+  await prefs.setString('token', token);
+  await prefs.setString('cert_fingerprint', meta.certFingerprint);
+  await prefs.setString('ipv6',             meta.ipv6);
+  await prefs.setString('ipv4_global',      meta.ipv4Global);
+  await prefs.setInt('ipv4_port',           meta.ipv4Port);
+  await prefs.setString('room_id',          meta.roomId);
+  await SavedConnectionsStore.upsert(url, token,
+      certFingerprint: meta.certFingerprint,
+      ipv6:            meta.ipv6,
+      ipv4Global:      meta.ipv4Global,
+      ipv4Port:        meta.ipv4Port,
+      roomId:          meta.roomId);
+}
+
 class LoginScreen extends StatefulWidget {
   const LoginScreen({super.key});
   @override
@@ -34,6 +74,9 @@ class _LoginScreenState extends State<LoginScreen> {
   bool   _waitingApproval  = false;
   String _regToken         = '';
   String _certFingerprint  = '';   // LAN発見で取得した証明書フィンガープリント
+  // LAN発見で選んだサーバー。接続が成立するまでは prefs に書かず、ここに持っておく
+  // （承認待ちをキャンセルした時に、別サーバーの接続情報だけが prefs に残らないように）。
+  DiscoveredServer? _pairing;
   int    _approvalTimeout  = 180;
   Timer? _approvalTimer;
 
@@ -57,7 +100,20 @@ class _LoginScreenState extends State<LoginScreen> {
   Future<void> _loadSaved() async {
     final prefs = await SharedPreferences.getInstance();
     _certFingerprint = prefs.getString('cert_fingerprint') ?? '';
-    final savedConns = await SavedConnectionsStore.load();
+    var savedConns = await SavedConnectionsStore.load();
+    // 旧バージョンが保存した履歴には接続情報が無い。現在の接続先の分だけは
+    // prefs に残っているので、別のサーバーへ切り替える前に履歴へ写しておく。
+    final curUrl   = prefs.getString('url') ?? '';
+    final curToken = prefs.getString('token') ?? '';
+    if (savedConns.any((c) => c.url == curUrl && !c.hasMeta)) {
+      final m = _metaFromPrefs(prefs);
+      savedConns = await SavedConnectionsStore.upsert(curUrl, curToken,
+          certFingerprint: m.certFingerprint,
+          ipv6:            m.ipv6,
+          ipv4Global:      m.ipv4Global,
+          ipv4Port:        m.ipv4Port,
+          roomId:          m.roomId);
+    }
     if (!mounted) return;
     setState(() {
       _savedConnections = savedConns;
@@ -125,17 +181,12 @@ class _LoginScreenState extends State<LoginScreen> {
         await _startRegistration(selected);
       } else if (selected.token.isNotEmpty) {
         // 旧サーバー互換: トークンを直接受け取る
+        // 接続情報は「接続」を押した時に _connect が _pairing から拾う
         setState(() {
+          _pairing        = selected;
           _urlCtrl.text   = selected.baseUrl;
           _tokenCtrl.text = selected.token;
         });
-        final prefs = await SharedPreferences.getInstance();
-        await prefs.setString('ipv6', selected.ipv6);
-        await prefs.setString('ipv4_global', selected.ipv4Global);
-        await prefs.setInt('ipv4_port', selected.ipv4Port);
-        if (selected.roomId.isNotEmpty) {
-          await prefs.setString('room_id', selected.roomId);
-        }
       }
     }
   }
@@ -143,18 +194,12 @@ class _LoginScreenState extends State<LoginScreen> {
   // ── 端末登録フロー ──────────────────────────────────────────────────────────
   Future<void> _startRegistration(DiscoveredServer server) async {
     setState(() { _loading = true; _error = ''; });
-    final prefs    = await SharedPreferences.getInstance();
     final deviceId = await DeviceService.getDeviceId();
     final baseUrl  = server.baseUrl;
-    await prefs.setString('ipv6', server.ipv6);
-    await prefs.setString('ipv4_global', server.ipv4Global);
-    await prefs.setInt('ipv4_port', server.ipv4Port);
-    if (server.roomId.isNotEmpty) await prefs.setString('room_id', server.roomId);
-    // フィンガープリントを保存し、以降の接続でピン留めに使う
+    // フィンガープリントはこの登録フローのピン留めに使い、接続成立時に
+    // _saveAndNavigate が他の接続情報と一緒に保存する
+    _pairing         = server;
     _certFingerprint = server.certFingerprint;
-    if (server.certFingerprint.isNotEmpty) {
-      await prefs.setString('cert_fingerprint', server.certFingerprint);
-    }
 
     final pinnedClient = makePinnedClient(_certFingerprint);
     try {
@@ -244,47 +289,93 @@ class _LoginScreenState extends State<LoginScreen> {
   }
 
   Future<void> _saveAndNavigate(String baseUrl, String token) async {
-    final prefs           = await SharedPreferences.getInstance();
-    final ipv6            = prefs.getString('ipv6');
-    final ipv4Global      = prefs.getString('ipv4_global');
-    final ipv4Port        = prefs.getInt('ipv4_port') ?? 0;
-    final roomId          = prefs.getString('room_id') ?? '';
-    final certFingerprint = prefs.getString('cert_fingerprint') ?? '';
-    final candidates      = buildCandidates(
-        primaryUrl: baseUrl, ipv6: ipv6, ipv4Global: ipv4Global, ipv4Port: ipv4Port);
-    await prefs.setString('url',   baseUrl);
-    await prefs.setString('token', token);
-    await SavedConnectionsStore.upsert(baseUrl, token);
+    final prefs = await SharedPreferences.getInstance();
+    final s     = _pairing;
+    final _ConnMeta meta = s == null
+        ? _metaFromPrefs(prefs)
+        : (
+            certFingerprint: s.certFingerprint,
+            ipv6:            s.ipv6,
+            ipv4Global:      s.ipv4Global,
+            ipv4Port:        s.ipv4Port,
+            roomId:          s.roomId,
+          );
+    final candidates = buildCandidates(
+        primaryUrl: baseUrl, ipv6: meta.ipv6,
+        ipv4Global: meta.ipv4Global, ipv4Port: meta.ipv4Port);
+    await _saveCurrentServer(prefs, baseUrl, token, meta);
     final working = await ApiService.resolveBaseUrl(candidates, token,
-        certFingerprint: certFingerprint);
+        certFingerprint: meta.certFingerprint);
     if (!mounted) return;
     final api = ApiService(
       baseUrl:          working ?? baseUrl,
       token:            token,
       candidates:       candidates,
-      roomId:           roomId,
+      roomId:           meta.roomId,
       turnUrl:          prefs.getString('turn_url'),
       turnUsername:     prefs.getString('turn_username'),
       turnCredential:   prefs.getString('turn_credential'),
-      certFingerprint:  certFingerprint,
+      certFingerprint:  meta.certFingerprint,
     );
     setState(() { _waitingApproval = false; });
     Navigator.pushReplacement(context, MaterialPageRoute(builder: (_) => ShelfScreen(api: api)));
   }
 
-  void _refreshConnInfo(ApiService api) {
+  /// 接続後にサーバーから最新の接続情報をもらい、現在の接続先と履歴を更新する。
+  /// フィンガープリントを知らずに繋いだ（TOFU）場合は、ここで覚えて次回からピン留めする。
+  void _refreshConnInfo(ApiService api, String url, String token, _ConnMeta used) {
     api.getConnectionInfo().then((info) async {
       if (info == null) return;
       final pr = await SharedPreferences.getInstance();
-      final v6 = (info['ipv6'] ?? '').toString();
-      if (v6.isNotEmpty) await pr.setString('ipv6', v6);
-      final g4 = (info['ipv4_global'] ?? '').toString();
-      if (g4.isNotEmpty) await pr.setString('ipv4_global', g4);
-      final p4 = (info['ipv4_port'] as num?)?.toInt() ?? 0;
-      if (p4 > 0) await pr.setInt('ipv4_port', p4);
+      // 取得を待つ間に別のサーバーへ切り替わっていたら、そちらの情報を上書きしない
+      if (pr.getString('url') != url) return;
+      final fp  = (info['cert_fingerprint'] ?? '').toString();
+      final v6  = (info['ipv6'] ?? '').toString();
+      final g4  = (info['ipv4_global'] ?? '').toString();
+      final p4  = (info['ipv4_port'] as num?)?.toInt() ?? 0;
       final rid = (info['room_id'] ?? '').toString();
-      if (rid.isNotEmpty) await pr.setString('room_id', rid);
+      await _saveCurrentServer(pr, url, token, (
+        certFingerprint:
+            used.certFingerprint.isNotEmpty ? used.certFingerprint : fp,
+        ipv6:       v6.isNotEmpty  ? v6  : used.ipv6,
+        ipv4Global: g4.isNotEmpty  ? g4  : used.ipv4Global,
+        ipv4Port:   p4 > 0         ? p4  : used.ipv4Port,
+        roomId:     rid.isNotEmpty ? rid : used.roomId,
+      ));
     });
+  }
+
+  /// 入力されたURLのサーバーに繋ぐための接続情報を選ぶ。
+  /// 接続情報はサーバーごとに違うので、必ず「そのURLのもの」を使う。
+  _ConnMeta _metaFor(SharedPreferences prefs, String url) {
+    // LAN発見で選んだばかりのサーバー
+    final s = _pairing;
+    if (s != null && s.baseUrl == url) {
+      return (
+        certFingerprint: s.certFingerprint,
+        ipv6:            s.ipv6,
+        ipv4Global:      s.ipv4Global,
+        ipv4Port:        s.ipv4Port,
+        roomId:          s.roomId,
+      );
+    }
+    // 現在の接続先（prefs は起動時の自動接続でも更新されるので履歴より新しい）
+    if (prefs.getString('url') == url) return _metaFromPrefs(prefs);
+    // 履歴から選んだ別のサーバー
+    for (final c in _savedConnections) {
+      if (c.url == url && c.hasMeta) {
+        return (
+          certFingerprint: c.certFingerprint,
+          ipv6:            c.ipv6,
+          ipv4Global:      c.ipv4Global,
+          ipv4Port:        c.ipv4Port,
+          roomId:          c.roomId,
+        );
+      }
+    }
+    // 手入力のURL、または接続情報を持たない旧バージョンの履歴。
+    // 証明書は初回だけそのまま受け入れ、繋がった後に _refreshConnInfo が覚える。
+    return _noMeta;
   }
 
   Future<void> _connect() async {
@@ -297,21 +388,17 @@ class _LoginScreenState extends State<LoginScreen> {
     await prefs.setString('turn_url',        _turnUrlCtrl.text.trim());
     await prefs.setString('turn_username',   _turnUserCtrl.text.trim());
     await prefs.setString('turn_credential', _turnCredCtrl.text.trim());
-    final ipv6            = prefs.getString('ipv6');
-    final ipv4Global      = prefs.getString('ipv4_global');
-    final ipv4Port        = prefs.getInt('ipv4_port') ?? 0;
-    final roomId          = prefs.getString('room_id') ?? '';
-    final certFingerprint = prefs.getString('cert_fingerprint') ?? '';
+    final meta       = _metaFor(prefs, url);
+    final roomId     = meta.roomId;
     final candidates = buildCandidates(
-        primaryUrl: url, ipv6: ipv6, ipv4Global: ipv4Global, ipv4Port: ipv4Port);
+        primaryUrl: url, ipv6: meta.ipv6,
+        ipv4Global: meta.ipv4Global, ipv4Port: meta.ipv4Port);
     final working = await ApiService.resolveBaseUrl(candidates, token,
-        certFingerprint: certFingerprint);
+        certFingerprint: meta.certFingerprint);
 
     if (!mounted) return;
     if (working != null) {
-      await prefs.setString('url',   url);
-      await prefs.setString('token', token);
-      await SavedConnectionsStore.upsert(url, token);
+      await _saveCurrentServer(prefs, url, token, meta);
       if (!mounted) return;
       final api = ApiService(
           baseUrl: working, token: token, candidates: candidates,
@@ -319,8 +406,8 @@ class _LoginScreenState extends State<LoginScreen> {
           turnUrl:          prefs.getString('turn_url'),
           turnUsername:     prefs.getString('turn_username'),
           turnCredential:   prefs.getString('turn_credential'),
-          certFingerprint:  certFingerprint);
-      _refreshConnInfo(api);
+          certFingerprint:  meta.certFingerprint);
+      _refreshConnInfo(api, url, token, meta);
       Navigator.pushReplacement(context,
           MaterialPageRoute(builder: (_) => ShelfScreen(api: api)));
       return;
@@ -339,9 +426,7 @@ class _LoginScreenState extends State<LoginScreen> {
       );
       if (!mounted) return;
       if (localUrl != null) {
-        await prefs.setString('url',   url);
-        await prefs.setString('token', token);
-        await SavedConnectionsStore.upsert(url, token);
+        await _saveCurrentServer(prefs, url, token, meta);
         if (!mounted) return;
         final api = ApiService(
             baseUrl: localUrl, token: token, candidates: candidates,
@@ -349,8 +434,8 @@ class _LoginScreenState extends State<LoginScreen> {
             turnUrl:          prefs.getString('turn_url'),
             turnUsername:     prefs.getString('turn_username'),
             turnCredential:   prefs.getString('turn_credential'),
-            certFingerprint:  certFingerprint);
-        _refreshConnInfo(api);
+            certFingerprint:  meta.certFingerprint);
+        _refreshConnInfo(api, url, token, meta);
         Navigator.pushReplacement(context,
             MaterialPageRoute(builder: (_) => ShelfScreen(api: api)));
         return;
