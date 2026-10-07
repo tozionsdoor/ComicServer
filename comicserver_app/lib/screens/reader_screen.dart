@@ -67,7 +67,9 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
   BuildContext? _ctx; // プリフェッチ用コンテキスト
 
   List<_SpreadUnit> _units = [];
-  int _spreadPairStart = 1;
+  // 「1ページずらす」で指定された、見開きペアの開始ページ（この本だけに効く）。
+  // そのページを含む縦長ページの連なりは、ここからペアが始まるように並べる。
+  final Set<int> _pairAnchors = {};
   bool _filmUserScrolling = false;
   bool _filmNeedsSync = false;
   int? _pendingFilmIndex;
@@ -159,7 +161,11 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
     setState(() {
       _rtl    = p.getBool('rtl')    ?? true;
       _spread = p.getBool('spread') ?? false;
-      _spreadPairStart = (p.getInt('spread_pair_offset') ?? 1).clamp(0, 1);
+      _pairAnchors
+        ..clear()
+        ..addAll((p.getStringList(_pairAnchorsKey) ?? const [])
+            .map(int.tryParse)
+            .whereType<int>());
       _heightFrac = p.getDouble('height_frac') ?? 0;
       _magSizeIdx = (p.getInt('mag_size_idx') ?? 2).clamp(0, _magSizePresets.length - 1);
     });
@@ -170,9 +176,20 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
     final p = await SharedPreferences.getInstance();
     await p.setBool('rtl',    _rtl);
     await p.setBool('spread', _spread);
-    await p.setInt('spread_pair_offset', _spreadPairStart.clamp(0, 1));
     await p.setDouble('height_frac', _heightFrac);
     await p.setInt('mag_size_idx', _magSizeIdx);
+  }
+
+  String get _pairAnchorsKey => 'spread_shift_${widget.book.id}';
+
+  Future<void> _savePairAnchors() async {
+    final p = await SharedPreferences.getInstance();
+    if (_pairAnchors.isEmpty) {
+      await p.remove(_pairAnchorsKey);
+    } else {
+      await p.setStringList(
+          _pairAnchorsKey, [for (final a in _pairAnchors) '$a']);
+    }
   }
 
   void _cycleMagSize() {
@@ -512,45 +529,62 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
     // 向きだけで決めれば他のページに依存せず、どこから開いても同じ結果になる。
     // 実測でも縦長は0.9以下・横長は1.03以上に分かれ、1.0付近のページは無かった
     // （1.03〜1.25 は表紙カバーや折り込みで、これも並べない方が正しい）。
-    bool wide(int p) {
-      final r = _ratioCache[p];
-      return r != null && r > 1.0;
-    }
+    final wide = _isWide;
 
+    // 横長ページで区切られた「縦長ページの連なり」ごとにペアを組む。
+    //  - 既定: 本の先頭は表紙を単独にして2枚目からペア。横長ページの後は
+    //    すぐペアから始める（実測で、本文の見開きに挟まれた縦長ページ数は
+    //    偶数173：奇数12。巻頭の横長の後は半々なので手動で直してもらう）。
+    //  - 「1ページずらす」が押された連なりは、指定ページ（_pairAnchors）から
+    //    ペアが始まるように揃える。以前は全書籍共通のON/OFFで、全ての連なりの
+    //    先頭1枚を単独にしていたため、1冊で直すと他の本や本文の見開きの後まで
+    //    ずれていた。
+    final anchors = _pairAnchors.toList()..sort();
+    int ai = 0;
     final list = <_SpreadUnit>[];
-    final offset = _spreadPairStart.clamp(0, 1);
     int i = 0;
-    // セグメント先頭（本の先頭・横長ページ直後）。横長ページは見開きペアを
-    // リセットするので、「1ページずらす」のオフセットを各セグメント先頭に
-    // 適用しないと、横長ページより後ろではペアの偶奇を直せない
-    // （横長の表紙を持つ本で「1ページずらす」が効かない不具合の原因）。
-    bool segmentStart = true;
     while (i < _total) {
-      // 横長（合成見開き）は単独表示し、次ページから新しいセグメントを開始
+      // 横長（合成見開き）は単独表示
       if (wide(i)) {
         list.add(_SpreadUnit(i));
         i++;
-        segmentStart = true;
         continue;
       }
-      // セグメント先頭でオフセット=1なら、先頭1枚を単独にしてペアの偶奇をずらす
-      if (segmentStart && offset == 1) {
-        segmentStart = false;
-        list.add(_SpreadUnit(i));
-        i++;
-        continue;
+      // 縦長ページの連なり [s, e)
+      final s = i;
+      int e = i;
+      while (e < _total && !wide(e)) {
+        e++;
       }
-      segmentStart = false;
-      // 次ページが範囲外/横長ならペアにせず単独表示（横長合成見開きの貼り付き防止）
-      if (i + 1 >= _total || wide(i + 1)) {
-        list.add(_SpreadUnit(i));
-        i++;
-      } else {
-        list.add(_SpreadUnit(i, i + 1));
-        i += 2;
+      while (i < e) {
+        while (ai < anchors.length && anchors[ai] < i) {
+          ai++;
+        }
+        final bool single;
+        if (ai < anchors.length && anchors[ai] < e) {
+          // この先の指定ページがペアの先頭になるよう、奇数枚手前なら1枚単独にする
+          single = (anchors[ai] - i).isOdd;
+        } else {
+          // 指定なし。連なりの先頭だけ既定に従い、以降はそのままペアを続ける
+          single = i == s && s == 0;
+        }
+        // 連なりの最後の1枚は相手がいないので単独（横長合成見開きの貼り付き防止）
+        if (single || i + 1 >= e) {
+          list.add(_SpreadUnit(i));
+          i++;
+        } else {
+          list.add(_SpreadUnit(i, i + 1));
+          i += 2;
+        }
       }
     }
     _units = list;
+  }
+
+  // 横長（幅 > 高さ）のページか。比率が未取得のページは縦長として扱う。
+  bool _isWide(int p) {
+    final r = _ratioCache[p];
+    return r != null && r > 1.0;
   }
 
   int _pageToUnitIndex(int mangaPage) {
@@ -1172,16 +1206,45 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
     final target = (currentUnit.second ?? min(currentUnit.first + 1, _total - 1))
         .clamp(0, _total - 1)
         .toInt();
+    // ずらす対象は、いま見ているページを含む縦長ページの連なりだけ。
+    // 横長ページを表示中なら、その次のページから始まる連なりをずらす。
+    var unit = currentUnit;
+    if (_isWide(unit.first)) {
+      final next = unit.first + 1;
+      if (next >= _total || _isWide(next)) return;
+      unit = _units[_pageToUnitIndex(next)];
+    }
+    int s = unit.first;
+    while (s > 0 && !_isWide(s - 1)) {
+      s--;
+    }
+    int e = unit.first;
+    while (e < _total && !_isWide(e)) {
+      e++;
+    }
+    if (e - s < 2) return;   // 1枚だけの連なりは並べ方が1通りしかない
+    // いまペアの先頭になっている側（偶数/奇数）の1つ隣を、新しいペアの先頭にする
+    final int anchor;
+    if (unit.second != null) {
+      anchor = unit.first + 1;
+    } else {
+      final startsWithPair = _units[_pageToUnitIndex(s)].second != null;
+      final pairHead = startsWithPair ? s : s + 1;
+      final a = unit.first;
+      anchor = (a - pairHead).isOdd ? a : (a > s ? a - 1 : a + 1);
+    }
     _filmUserScrolling = false;
     _filmNeedsSync = false;
     _resetFilmController();
     setState(() {
       _didRetreat = false;
       _unitKeys.clear();
-      _spreadPairStart = _spreadPairStart == 0 ? 1 : 0;
+      _pairAnchors
+        ..removeWhere((p) => p >= s && p < e)
+        ..add(anchor);
       _rebuildUnits();
     });
-    _savePrefs();
+    _savePairAnchors();
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
       _jumpToMangaPage(target);
