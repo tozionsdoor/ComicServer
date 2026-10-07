@@ -505,10 +505,15 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
       return;
     }
 
+    // _refRatio は「最初に比率が取れた縦長ページ」で決まるため、それが本文より幅広の
+    // 表紙だと閾値が上がりすぎ、合成見開きが通常ページ扱いでペアにされてしまう
+    // （表紙0.75・本文0.65・見開き1.30 の本で、途中から開く／表紙が先に届くと再現）。
+    // 適応値にする前の固定値 1.25 を上限にして、表紙に引きずられないようにする。
+    final wideThreshold = min(_refRatio * 1.8, 1.25);
     bool wide(int p) {
       final r = _ratioCache[p];
       if (r == null) return false;
-      return r > _refRatio * 1.8;
+      return r > wideThreshold;
     }
 
     final list = <_SpreadUnit>[];
