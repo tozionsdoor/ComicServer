@@ -1274,6 +1274,7 @@ header{background:#181825;padding:10px 14px;display:flex;align-items:center;gap:
 .rp.single{max-width:100vw}
 .rp.spread{max-width:50vw}
 #rmag{display:none;position:absolute;border:2px solid #89b4fa;border-radius:8px;pointer-events:none;z-index:5;background-repeat:no-repeat;box-shadow:0 2px 14px #000a}
+#rmag.pin{border-color:#f9e2af}
 #rzl{position:absolute;left:0;top:0;width:30%;height:80%;cursor:pointer;z-index:1}
 #rzc{position:absolute;left:30%;top:10%;width:40%;height:80%;cursor:default;z-index:1}
 #rzr{position:absolute;right:0;top:0;width:30%;height:80%;cursor:pointer;z-index:1}
@@ -1328,7 +1329,7 @@ header{background:#181825;padding:10px 14px;display:flex;align-items:center;gap:
     <span id="rtitle-d"></span>
     <button class="rbtn on" id="rbtn-dir" onclick="rToggleDir()">右綴じ</button>
     <button class="rbtn" id="rbtn-spr" onclick="rToggleSpread()">単ページ</button>
-    <button class="rbtn" id="rbtn-mag" onclick="rCycleMagSize()">🔍 小</button>
+    <button class="rbtn" id="rbtn-mag" onclick="rCycleMagSize()" title="長押しで虫眼鏡。表示中に Space か右クリックで固定（もう一度 Space / クリックで解除）">🔍 小</button>
     <button class="rbtn" id="rbtn-fs" onclick="rToggleFS()">⛶ 全画面</button>
     <button class="rbtn" onclick="rHideUI()" style="margin-left:auto">✕</button>
   </div>
@@ -1542,6 +1543,7 @@ async function rOpen(id,title){
 function rCloseUI(){
   // UIだけ閉じる（履歴操作なし）
   rIsOpen=false;
+  if(rMagPinned) rMagUnpin(false);
   document.getElementById('reader').style.display='none';
   document.body.style.overflow='';
   ['rsp','rsc','rsn'].forEach(id=>{
@@ -1598,6 +1600,7 @@ function rLoad(n){
     return;
   }
   n=Math.max(0,Math.min(n,rTotal-1));
+  if(rMagPinned) rMagUnpin(false);                  // 拡大像が前のページのまま残らないように
   rPage=n;
   rUpdateSlots();
   // 見開きで現在ページの偶奇が変わったら、フィルムのペア区切りを組み直して一致させる
@@ -1745,6 +1748,9 @@ document.addEventListener('mousedown',e=>{
 
 // ── 虫眼鏡（長押しで拡大レンズ・指/カーソル追従・離すと消える） ──
 let rMagOn=false, rMagTimer=null, rMagJustEnded=false;
+// 固定: 虫眼鏡を出したまま Space か右クリックすると、ボタンを離しても表示が残る
+// （Googleレンズ等に拡大像を読ませる用）。解除は クリック / Space / Esc / ページ送り。
+let rMagPinned=false;
 // レンズの幅/高さ(px)。本に合わせ横長。サイズはボタンで小/中/大を切替（localStorageに保持）。
 // 拡大率は一律 RMAG_SCALE（窓の大きさだけ変え、拡大倍率は小と同じにする）。
 // 画面より大きいサイズを選んでも、rMagAt内で縦横比を保ち画面に収まる最大へ自動縮小する。
@@ -1795,11 +1801,20 @@ function rMagAt(cx,cy){
   mag.style.display='block';
 }
 function rMagStart(cx,cy){ rMagOn=true; rMagAt(cx,cy); }
+function rMagPin(){
+  rMagPinned=true; rMagJustEnded=true;              // ボタンを離した時の click（ページ送り）を握りつぶす
+  document.getElementById('rmag').classList.add('pin');
+}
+function rMagUnpin(swallowClick){
+  rMagStop();
+  if(!swallowClick) rMagJustEnded=false;            // キー/ページ送りでの解除は後続の click が無い
+}
 function rMagStop(){
   if(rMagOn) rMagJustEnded=true;                    // 直後の click（ページ送り/UI）を1回握りつぶす
-  rMagOn=false;
+  rMagOn=false; rMagPinned=false;
   if(rMagTimer){clearTimeout(rMagTimer); rMagTimer=null;}
   document.getElementById('rmag').style.display='none';
+  document.getElementById('rmag').classList.remove('pin');
 }
 
 // ── スムーズスワイプ（カルーセル）＋ 長押し虫眼鏡 ───────────────
@@ -1811,15 +1826,20 @@ rdr.addEventListener('click',e=>{
 }, true);
 // マウス長押し
 rdr.addEventListener('mousedown',e=>{
-  if(e.button!==0||e.target.closest('#rui-top,#rui-bot')) return;
+  if(e.target.closest('#rui-top,#rui-bot')) return;
+  // 虫眼鏡を出したまま右クリック → 固定（そのままブラウザの右クリックメニューが出る）
+  if(e.button===2&&rMagOn&&!rMagPinned){ rMagPin(); return; }
+  if(e.button!==0) return;
+  if(rMagPinned){ rMagUnpin(true); return; }        // 固定中のクリックは解除だけ（ページ送りしない）
   const cx=e.clientX, cy=e.clientY;
   rMagTimer=setTimeout(()=>rMagStart(cx,cy), 320);
 });
 rdr.addEventListener('mousemove',e=>{
+  if(rMagPinned) return;                            // 固定中はカーソルに追従させない
   if(rMagOn){ e.preventDefault(); rMagAt(e.clientX,e.clientY); }
   else if(rMagTimer){ clearTimeout(rMagTimer); rMagTimer=null; }
 });
-window.addEventListener('mouseup',()=>{ if(rMagOn||rMagTimer) rMagStop(); });
+window.addEventListener('mouseup',()=>{ if(!rMagPinned&&(rMagOn||rMagTimer)) rMagStop(); });
 // タッチ
 rdr.addEventListener('touchstart',e=>{
   if(e.target.closest('#rui-top,#rui-bot')) return;
@@ -1892,6 +1912,13 @@ document.addEventListener('webkitfullscreenchange',()=>{
 // キーボード
 document.addEventListener('keydown',e=>{
   if(!rIsOpen) return;
+  // 虫眼鏡の固定/解除（Space）。固定中の Esc は本を閉じずに解除だけ行う。
+  if(e.key===' '&&rMagOn){
+    e.preventDefault();
+    if(!e.repeat){ if(rMagPinned) rMagUnpin(false); else rMagPin(); }
+    return;
+  }
+  if(e.key==='Escape'&&rMagPinned){ rMagUnpin(false); return; }
   if(e.key==='ArrowRight') rLoad(rPage+(rRtl?-rStep():+rStep()));
   else if(e.key==='ArrowLeft')  rLoad(rPage+(rRtl?+rStep():-rStep()));
   else if(e.key==='ArrowDown')  rLoad(rPage+rStep());
