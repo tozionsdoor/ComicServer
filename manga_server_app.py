@@ -199,7 +199,37 @@ def ensure_tls_cert() -> str:
 _books: dict[str, dict] = {}    # book_id -> {path, title, folder, pages}
 _preloading: bool       = False # キャッシュ生成スレッドが走っているか
 _config: dict           = {}
-_log_queue: queue.Queue = queue.Queue()
+
+
+class _FileLoggingQueue(queue.Queue):
+    """GUIのログ欄へ流すキュー。同じ内容を日時付きでログファイルにも書く。
+    GUIのログ欄は再起動で消えるため、「数日後に黙って止まった」類の不具合を後から
+    調べられなかった。ファイルは2MBで .1 に回して1世代だけ残す。書けなくても無視する。"""
+    _MAX_BYTES = 2 * 1024 * 1024
+
+    def __init__(self, path: Path):
+        super().__init__()
+        self._path = path
+        self._file_lock = threading.Lock()
+
+    def put(self, item, block=True, timeout=None):
+        super().put(item, block, timeout)
+        try:
+            line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {item}\n"
+            with self._file_lock:
+                try:
+                    if self._path.stat().st_size > self._MAX_BYTES:
+                        os.replace(self._path, self._path.with_name(self._path.name + ".1"))
+                except FileNotFoundError:
+                    pass
+                with open(self._path, "a", encoding="utf-8") as f:
+                    f.write(line)
+        except Exception:
+            pass
+
+
+LOG_PATH = _app_dir() / "server.log"
+_log_queue: queue.Queue = _FileLoggingQueue(LOG_PATH)
 
 # ─── 読書を最優先にするバックグラウンド一時停止（初回キャッシュが読書を邪魔しない） ──
 # 背景のキャッシュ生成（表紙プリロード・本文先読み）が、フォアグラウンドのページ取得と
@@ -2226,8 +2256,20 @@ import struct
 import urllib.request
 import urllib.error
 
-_signaling_running: bool = False
+_signaling_running: bool = False        # シグナリングを動かすべきか（終了時/恒久的な設定不備でFalse）
 _signaling_auth:    dict | None = None   # 終了時の presence 削除用
+# ── 待受の見張り ──
+# 待受が数日〜11日で黙って止まり（スレッドが死ぬ/どこかで固まる）、外出先のアプリが
+# WebRTCに転落しても誰も応答しない状態が続いていた。ループは世代番号を持ち、見張りが
+# 張り直すと古いループは自分が古いと気付いて抜ける（固まったままなら放置＝デーモン）。
+_signaling_gen: int = 0
+_signaling_thread: threading.Thread | None = None
+_signaling_heartbeat: float = 0.0       # ループが回っている印（time.monotonic）
+_signaling_stage: str = ""              # 今どこで待っているか（固まった時のログ用）
+_signaling_watchdog_started: bool = False
+SIGNALING_STALL_SECONDS = 300           # これだけ印が更新されなければ固まったとみなす
+SIGNALING_BACKOFF_MIN = 60              # 張り直しの間隔（失敗が続くと倍々で最大まで延ばす）
+SIGNALING_BACKOFF_MAX = 600
 _active_peers:  dict     = {}   # session_id → RTCPeerConnection
 _ipv6_monitor_running: bool = False
 
@@ -2412,6 +2454,11 @@ def _fb_sse_listen(db_url: str, path: str, auth: dict,
                 continue
             if event_type == "cancel":
                 loop.call_soon_threadsafe(out_q.put_nowait, ("__error__", "SSEキャンセル"))
+                return
+            if event_type == "auth_revoked":
+                # トークン期限切れ。Firebaseは接続を開いたままkeep-aliveだけ送り続けることがあり、
+                # 無視すると「繋がっているのに何も届かない」状態で黙って止まる。張り直させる。
+                loop.call_soon_threadsafe(out_q.put_nowait, ("__reauth__", None))
                 return
             if event_type in ("put", "patch"):
                 try:
@@ -2732,12 +2779,24 @@ async def _run_peer_async(session_id: str, offer_sdp: str,
             pass
 
 
-async def _signaling_loop_async(api_key: str, db_url: str, room_id: str) -> None:
+def _signaling_beat(stage: str) -> None:
+    """見張り用の生存印。stage は固まった時に「どこで止まったか」をログに出すため。"""
+    global _signaling_heartbeat, _signaling_stage
+    _signaling_heartbeat = time.monotonic()
+    _signaling_stage = stage
+
+
+async def _signaling_loop_async(api_key: str, db_url: str, room_id: str, gen: int = 0) -> None:
     """Firebase SSE ストリームで新セッションを監視し _run_peer_async をタスク起動する。
     ポーリング(3秒ごと全量GET)を廃止し変化時のみデータが届く方式に変更。
     Firebase ダウンロード量をほぼゼロに抑えられる。"""
     loop = asyncio.get_event_loop()
 
+    def alive() -> bool:
+        # 見張りが張り直した後は古い世代のループとして静かに抜ける（二重応答の防止）
+        return _signaling_running and gen == _signaling_gen
+
+    _signaling_beat("Firebase認証中")
     token = await loop.run_in_executor(None, lambda: _firebase_anon_signin(api_key))
     if not token:
         _log_queue.put("[WebRTC] Firebase認証失敗")
@@ -2747,6 +2806,7 @@ async def _signaling_loop_async(api_key: str, db_url: str, room_id: str) -> None
     global _signaling_auth
     _signaling_auth = auth   # 終了時の presence 削除で参照する
 
+    _signaling_beat("presence書き込み中")
     await loop.run_in_executor(None, lambda: _fb_put_retry(
         db_url, f"rooms/{room_id}/presence", {"host": True}, auth,
     ))
@@ -2756,20 +2816,22 @@ async def _signaling_loop_async(api_key: str, db_url: str, room_id: str) -> None
     # 実時間ベースで期限前に先回り更新（PCスリープ後もズレない。万一切れても下のretryが拾う）
     next_refresh = time.time() + 3300   # 有効期限1時間の5分前
 
-    while _signaling_running:
+    while alive():
         # トークン先回り更新
         if time.time() >= next_refresh:
+            _signaling_beat("トークン更新中")
             ok = await loop.run_in_executor(None, lambda: _reauth(auth))
             next_refresh = time.time() + (3300 if ok else 60)
 
         out_q: asyncio.Queue = asyncio.Queue()
         sse_done = asyncio.Event()
+        conn_stop = threading.Event()   # この接続だけを畳む合図（トークン更新のための張り直し）
 
-        def _sse_thread(q=out_q, done=sse_done):
+        def _sse_thread(q=out_q, done=sse_done, stop=conn_stop):
             try:
                 _fb_sse_listen(
                     db_url, f"rooms/{room_id}/sessions", auth, q, loop,
-                    lambda: not _signaling_running,
+                    lambda: stop.is_set() or not alive(),
                 )
             finally:
                 loop.call_soon_threadsafe(done.set)
@@ -2784,7 +2846,13 @@ async def _signaling_loop_async(api_key: str, db_url: str, room_id: str) -> None
         threading.Thread(target=_sse_thread, daemon=True).start()
 
         reauth_needed = False
-        while _signaling_running and not sse_done.is_set():
+        while alive() and not sse_done.is_set():
+            _signaling_beat("セッション待受中")
+            if time.time() >= next_refresh:
+                # SSEのURLに埋めたトークンは1時間で切れる。接続が長生きしても切れる前に
+                # 新しいトークンで張り直す（切れた接続は何も届けないまま生き続けることがある）。
+                conn_stop.set()
+                break
             try:
                 sid, sdata = await asyncio.wait_for(out_q.get(), timeout=1.0)
             except asyncio.TimeoutError:
@@ -2798,7 +2866,7 @@ async def _signaling_loop_async(api_key: str, db_url: str, room_id: str) -> None
                 _log_queue.put(f"[WebRTC] シグナリングエラー: {sdata}")
                 break
 
-            if sid in known:
+            if sid in known or not alive():
                 continue
             if not (isinstance(sdata, dict) and sdata.get("offer") and not sdata.get("answer")):
                 continue
@@ -2809,6 +2877,7 @@ async def _signaling_loop_async(api_key: str, db_url: str, room_id: str) -> None
             ts = _push_id_time_ms(sid)
             if ts is not None and time.time() * 1000 - ts > 90_000:
                 _log_queue.put(f"[WebRTC] 古いセッションを破棄: {sid[:8]}")
+                _signaling_beat("古いセッション削除中")
                 await loop.run_in_executor(None, lambda s=sid: _fb_delete_retry(
                     db_url, f"rooms/{room_id}/sessions/{s}", auth))
                 continue
@@ -2818,21 +2887,25 @@ async def _signaling_loop_async(api_key: str, db_url: str, room_id: str) -> None
                 _run_peer_async(sid, offer_sdp, db_url, room_id, auth, loop)
             )
 
-        await sse_done.wait()  # SSEスレッドの終了を待ってから再接続
+        _signaling_beat("SSE終了待ち")
+        await sse_done.wait()  # SSEスレッドの終了を待ってから再接続（keep-aliveが来れば30秒程度）
 
-        if not _signaling_running:
+        if not alive():
             break
         if reauth_needed:
+            _signaling_beat("再認証中")
             if await loop.run_in_executor(None, lambda: _reauth(auth)):
                 next_refresh = time.time() + 3300
             else:
                 await asyncio.sleep(60)
-        else:
+        elif not conn_stop.is_set():
             await asyncio.sleep(3)  # 切断後、短い待機を入れてから再接続
 
 
-def _signaling_thread_main() -> None:
-    """シグナリングスレッドのエントリーポイント。"""
+def _signaling_thread_main(gen: int = 0) -> None:
+    """シグナリングスレッドのエントリーポイント。
+    設定不備（Firebase未設定/aiortc無し/room_id無し）は直らないので _signaling_running を
+    落として見張りにも諦めさせる。それ以外の終わり方（認証失敗・例外）は見張りが張り直す。"""
     global _signaling_running
 
     fb = _fb_cfg()
@@ -2857,24 +2930,75 @@ def _signaling_thread_main() -> None:
         return
 
     _log_queue.put(f"[WebRTC] シグナリング開始 (room: {room_id[:8]}…)")
+    # 世代ごとに新しいイベントループ（＝新しい既定エグゼキュータ）で回す。固まった世代の
+    # ワーカーを使い切っていても、張り直した世代は巻き込まれない。
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
-        loop.run_until_complete(_signaling_loop_async(api_key, db_url, room_id))
+        loop.run_until_complete(_signaling_loop_async(api_key, db_url, room_id, gen))
+        if _signaling_running and gen == _signaling_gen:
+            _log_queue.put("[WebRTC] シグナリングが終了しました（見張りが張り直します）")
     except Exception as e:
-        _log_queue.put(f"[WebRTC] シグナリング終了: {e}")
+        _log_queue.put(f"[WebRTC] シグナリング終了: {type(e).__name__}: {e}")
     finally:
-        _signaling_running = False
-        loop.close()
+        try:
+            loop.close()
+        except Exception:
+            pass
+
+
+def _spawn_signaling_thread() -> None:
+    global _signaling_gen, _signaling_thread
+    _signaling_gen += 1
+    _signaling_beat("起動中")
+    t = threading.Thread(target=_signaling_thread_main, args=(_signaling_gen,), daemon=True)
+    _signaling_thread = t
+    t.start()
+
+
+def _signaling_watchdog() -> None:
+    """シグナリング待受を見張り、スレッドが死んだ/固まったら張り直す。
+    張り直しは60秒→最大10分の間隔を空ける（ネットワーク断の最中に連打しない）。"""
+    backoff = SIGNALING_BACKOFF_MIN
+    next_try = 0.0
+    healthy_since = time.monotonic()
+    while True:
+        time.sleep(30)
+        if not _signaling_running:
+            continue
+        now = time.monotonic()
+        t = _signaling_thread
+        age = now - _signaling_heartbeat
+        if t is None or not t.is_alive():
+            reason = "停止していました"
+        elif age > SIGNALING_STALL_SECONDS:
+            reason = f"「{_signaling_stage}」のまま{int(age)}秒応答しません"
+        else:
+            if now - healthy_since > 1800:
+                backoff = SIGNALING_BACKOFF_MIN  # 30分健全なら間隔を戻す
+            continue
+        healthy_since = now
+        if now < next_try:
+            continue
+        _log_queue.put(f"[WebRTC] 見張り: シグナリング待受が{reason}。張り直します")
+        try:
+            _spawn_signaling_thread()
+        except Exception as e:
+            _log_queue.put(f"[WebRTC] 見張り: 張り直しに失敗: {e}")
+        next_try = now + backoff
+        backoff = min(backoff * 2, SIGNALING_BACKOFF_MAX)
 
 
 def start_webrtc_signaling() -> None:
-    """WebRTCシグナリングスレッドを起動（多重起動防止）。"""
-    global _signaling_running
+    """WebRTCシグナリングスレッドを起動（多重起動防止）。見張りも1回だけ起動する。"""
+    global _signaling_running, _signaling_watchdog_started
     if _signaling_running:
         return
     _signaling_running = True
-    threading.Thread(target=_signaling_thread_main, daemon=True).start()
+    _spawn_signaling_thread()
+    if not _signaling_watchdog_started:
+        _signaling_watchdog_started = True
+        threading.Thread(target=_signaling_watchdog, daemon=True).start()
 
 
 # ─── IPv6監視 + UPnP + Firebase登録 ──────────────────────────────────────────
@@ -3069,6 +3193,10 @@ def _upnp_soap(url: str, service_type: str, action: str, body_args: str = "") ->
             return e.read().decode("utf-8", "replace")
         except Exception:
             return f"<errorCode>HTTP{e.code}</errorCode>"
+    except OSError:
+        # タイムアウト・接続拒否など。空文字＝「ルーターが答えなかった」の印。
+        # 例外として投げ上げると1回の取りこぼしで外部IPv4を失ったことにされてしまう。
+        return ""
 
 
 def _upnp_discover_wan_ipv4() -> tuple[str, str]:
@@ -3180,11 +3308,71 @@ def _pcp_map(gateway_ip: str, internal_ip: str, internal_port: int,
     return (ext_ip, assigned_ext_port)
 
 
+# ポートマッピングの説明文。「:内部ポート」を付けて登録し、ルーター上で自分の登録を見分ける印にする。
+# PC版/NAS版/MovieServerで別の名前にする（取り合い判定と候補ポートのずらしに使う）。
+_UPNP_MAP_DESC = "ArcHive"
+
+# ── 取り合い防止のための状態（MovieServer movie_server/upnp.py deaf5d3 から移植） ──
+# 同一LANに別のサーバー（PC版/NAS版/審査用サーバー/MovieServer）が居ると、同じ外部ポートを
+# 互いに登録し直して取り合いになり、外から見える転送先が数分おきに入れ替わる。
+# AddPortMappingの成功や718(衝突)を「開いている」と受け取るだけでは、ルーター上の転送先が
+# 他人に向いていることに気付けない。そこで照会で転送先の内部IP/ポート/説明文まで照合し
+# （_owner）、他人のものなら奪わずに別ポートへ移る（_upnp_abandoned に記録して二度と戻らない）。
+_upnp_abandoned: set = set()        # 他の機器/アプリのものだと判明した外部ポート
+_upnp_last_conflict_note: str = ""  # 「他人に占有されている」ログの重複抑止
+_upnp_last_fail_note: str = ""      # 「開けなかった」ログの重複抑止（60秒ごとに同じ行を出さない）
+# 直近のサイクルで「今のポートを維持できた」と言えなかった連続回数。ルーターのUPnPは一時的に
+# 答えが狂うことがあり（PR-400NEは登録済みの転送を照会で見失い、直後のAddは718を返す）、
+# その一瞬で別ポートへ移ると伝言板が書き換わり、外出先のアプリが古いポートを握ったまま繋がらなくなる。
+_upnp_fail_streak: int = 0
+_UPNP_GRACE_CYCLES = 5              # 監視は60秒間隔なので約5分は今のポートを据え置く
+_upnp_ever_opened: bool = False     # このプロセスで一度でもUPnPで開けたか（MAP-E探索の要否判断）
+_upnp_probe_cooldown_until: float = 0.0  # PCP/ポート帯スキャンを控える時刻（ルーターへの連打防止）
+_UPNP_PROBE_COOLDOWN = 1800
+
+
+def _upnp_g1(resp: str, name: str) -> str:
+    """SOAPレスポンスから要素の値を1つ取り出す。無ければ空文字。"""
+    m = re.search(rf"<{name}[^>]*>(.*?)</{name}>", resp, re.S)
+    return m.group(1).strip() if m else ""
+
+
+def _upnp_host_offset(internal_ip: str, port: int) -> int:
+    """高位フォールバック候補を製品/機器ごとにずらすための値（0〜15999）。
+    以前は全製品・全機器が同じ式(49152+port%16000)で同じ候補を選び、最初から同じ外部ポートを
+    取り合っていた。説明文(製品)・内部IP・内部ポートから決まるので、同じ機器では毎回同じ値になる。"""
+    h = hashlib.sha1(f"{_UPNP_MAP_DESC}|{internal_ip}|{port}".encode()).digest()
+    return int.from_bytes(h[:4], "big") % 16000
+
+
+def _upnp_mape_slots(internal_ip: str, port: int):
+    """MAP-E(OCNバーチャルコネクト等)の許可帯の中で、製品/機器ごとにずらした位置を返す。
+    戻り値: (下位4bit m, ブロック番号のリスト[4個])。外部ポート = ブロック*1024 + 残余先頭 + m。
+    以前は全製品が「ブロック49・残余先頭そのまま」を狙ったので、PC版/審査用/NAS版が
+    同じ外部ポート(例: 50688)に集まり、片方の転送を上書きしたまま気づかない事故が起きた。"""
+    h = int.from_bytes(hashlib.sha1(
+        f"{_UPNP_MAP_DESC}|{internal_ip}|{port}|mape".encode()).digest()[:8], "big")
+    m = h % 16
+    x = h >> 4
+    blocks: list = []
+    while len(blocks) < 4:
+        b = 32 + x % 32   # 32768〜65535 の範囲に置く
+        x >>= 5
+        if b not in blocks:
+            blocks.append(b)
+    return m, blocks
+
+
 def _upnp_open_ipv4(internal_ip: str, port: int) -> str:
     """UPnP IGD(v1) でIPv4ポートを自動開放し、ルーターのグローバルIPv4を返す。
     グローバルIPv4が無い（CGN/MAP-E回線）・ルーター非対応・設定OFF なら空文字。
-    毎回呼ぶことでポートマッピングのリースも更新される。失敗してもサーバーは動き続ける。"""
-    global _external_ipv4, _external_ipv4_port
+    毎回呼ぶことでポートマッピングのリースも更新される。失敗してもサーバーは動き続ける。
+
+    維持の判定はAddPortMappingの応答（成功 or 718）だけで行い、照会（GetSpecific/表の列挙）は
+    「別の機器/アプリに取られていないか」を見るためだけに使う。PR-400NEは照会の答えが当てにならず、
+    照会結果で維持を判定すると外部ポートが数分おきに入れ替わり続けるため。"""
+    global _external_ipv4, _external_ipv4_port, _upnp_fresh_add_done, _upnp_last_conflict_note
+    global _upnp_fail_streak, _upnp_ever_opened, _upnp_probe_cooldown_until, _upnp_last_fail_note
     if not _config.get("upnp_ipv4_open", True):
         _external_ipv4 = ""
         _external_ipv4_port = 0
@@ -3193,14 +3381,38 @@ def _upnp_open_ipv4(internal_ip: str, port: int) -> str:
         if not _upnp_v4["url"]:
             url, stype = _upnp_discover_wan_ipv4()
             if not url:
-                _log_queue.put("[IPv4] UPnP: IPv4ポート開放対応ルーターが見つかりません")
+                msg = "[IPv4] UPnP: IPv4ポート開放対応ルーターが見つかりません"
+                if msg != _upnp_last_fail_note:
+                    _upnp_last_fail_note = msg
+                    _log_queue.put(msg)
+                _upnp_fail_streak += 1
+                if _external_ipv4_port and _upnp_fail_streak <= _UPNP_GRACE_CYCLES:
+                    return _external_ipv4  # SSDPの取りこぼし。今の経路は維持する
+                _external_ipv4 = ""
+                _external_ipv4_port = 0
                 return ""
             _upnp_v4["url"], _upnp_v4["stype"] = url, stype
         url, stype = _upnp_v4["url"], _upnp_v4["stype"]
         resp = _upnp_soap(url, stype, "GetExternalIPAddress")
         fault = _upnp_fault(resp)
-        if fault:
-            _log_queue.put(f"[IPv4] UPnP: 外部IP取得を拒否されました (code={fault[0]} {fault[1]})")
+        if not resp or fault:
+            # ルーターが答えない/断った。今動いている経路を捨てる理由にはしないので、
+            # 猶予のうちはそのまま維持する（捨てると伝言板からIPv4が消え、外出先のアプリが
+            # 直結をあきらめてしまう）。
+            _upnp_fail_streak += 1
+            if _external_ipv4_port and _upnp_fail_streak <= _UPNP_GRACE_CYCLES:
+                if _upnp_fail_streak == 2:  # 1回きりの取りこぼしはログに出さない
+                    why = f"拒否されました (code={fault[0]} {fault[1]})" if fault else "応答がありません"
+                    _log_queue.put(f"[IPv4] UPnP: ルーターへの外部IP問い合わせに{why}。"
+                                   f"最大{_UPNP_GRACE_CYCLES}回ぶん（約{_UPNP_GRACE_CYCLES}分）今の経路を維持します")
+                return _external_ipv4
+            msg = (f"[IPv4] UPnP: 外部IP取得を拒否されました (code={fault[0]} {fault[1]})" if fault
+                   else "[IPv4] UPnP: ルーターが外部IPの問い合わせに応答しません")
+            if msg != _upnp_last_fail_note:
+                _upnp_last_fail_note = msg
+                _log_queue.put(msg)
+            if not resp:
+                _upnp_v4["url"] = ""  # controlURLが変わった可能性に備えて次回は再探索
             _external_ipv4 = ""
             _external_ipv4_port = 0
             return ""
@@ -3215,7 +3427,13 @@ def _upnp_open_ipv4(internal_ip: str, port: int) -> str:
             _external_ipv4_port = 0
             return ""
 
+        my_desc = f"{_UPNP_MAP_DESC}:{port}"
+        # ルーターのポートマッピング表のキャッシュ（at=0.0 で無効）。
+        # 個別照会が当てにならないルーターがあるので、表の全件列挙を裏取りに使う。
+        tbl: dict = {"rows": None, "at": 0.0}
+
         def _add(ext_port: int, lease: int) -> str:
+            tbl["at"] = 0.0  # 表が変わるのでキャッシュを捨てる
             return _upnp_soap(
                 url, stype, "AddPortMapping",
                 "<NewRemoteHost></NewRemoteHost>"
@@ -3224,121 +3442,242 @@ def _upnp_open_ipv4(internal_ip: str, port: int) -> str:
                 f"<NewInternalPort>{port}</NewInternalPort>"
                 f"<NewInternalClient>{internal_ip}</NewInternalClient>"
                 "<NewEnabled>1</NewEnabled>"
-                "<NewPortMappingDescription>ArcHive</NewPortMappingDescription>"
+                f"<NewPortMappingDescription>{my_desc}</NewPortMappingDescription>"
                 f"<NewLeaseDuration>{lease}</NewLeaseDuration>")
 
         def _del(ext_port: int) -> None:
+            tbl["at"] = 0.0
             _upnp_soap(
                 url, stype, "DeletePortMapping",
                 "<NewRemoteHost></NewRemoteHost>"
                 f"<NewExternalPort>{ext_port}</NewExternalPort>"
                 "<NewProtocol>TCP</NewProtocol>")
 
-        def _mapped(ext_port: int) -> bool:
+        def _entry(ext_port: int):
+            """個別照会でその外部ポートの登録内容を返す。None = 無い/答えなかった。"""
             chk = _upnp_soap(
                 url, stype, "GetSpecificPortMappingEntry",
                 "<NewRemoteHost></NewRemoteHost>"
                 f"<NewExternalPort>{ext_port}</NewExternalPort>"
                 "<NewProtocol>TCP</NewProtocol>")
-            # フォルト（714 NoSuchEntryInArray 等）なら実際には未登録
-            return _upnp_fault(chk) is None
+            if not chk or _upnp_fault(chk) is not None:
+                return None
+            return {
+                "client": _upnp_g1(chk, "NewInternalClient"),
+                "port": _upnp_g1(chk, "NewInternalPort"),
+                "enabled": _upnp_g1(chk, "NewEnabled"),
+                "desc": _upnp_g1(chk, "NewPortMappingDescription"),
+            }
 
-        # ── 外部ポートの選定 ───────────────────────────────────────────────
-        # まず内部ポートと同じ番号（普通のルーターはこれで通り、外部=内部で単純）。
-        # ダメな場合に備えMAP-E（v6プラス系のIPv4 over IPv6）を考慮する。MAP-Eはグローバル
-        # IPv4が複数ユーザーで共有され、使えるTCPポートがPSIDで決まる飛び飛びの帯に限られる
-        # （帯の外は 718 で拒否）。既存マッピング(例: Plex)や前回成功ポートの「下位10bit
-        # (mod 1024)」は許可帯に入っているので、同じ剰余の高位ポートを候補にすれば確実に通る。
-        # 直近成功ポートは config に控え次回最優先で試す（外部ポートを安定させアプリの学習を保つ）。
+        def _table():
+            """ルーターのポートマッピング表を全件読む。読めなければ None。"""
+            if tbl["rows"] is not None and time.monotonic() - float(tbl["at"]) < 20:
+                return tbl["rows"]
+            rows: list = []
+            answered = False
+            for i in range(64):
+                chk = _upnp_soap(url, stype, "GetGenericPortMappingEntry",
+                                 f"<NewPortMappingIndex>{i}</NewPortMappingIndex>")
+                if not chk:
+                    break            # 無応答。表は信用できない
+                if _upnp_fault(chk) is not None:
+                    answered = True  # 713/714 等＝表の終端。最後まで読めた
+                    break
+                answered = True
+                rows.append({
+                    "ext": _upnp_g1(chk, "NewExternalPort"),
+                    "proto": _upnp_g1(chk, "NewProtocol"),
+                    "client": _upnp_g1(chk, "NewInternalClient"),
+                    "port": _upnp_g1(chk, "NewInternalPort"),
+                    "enabled": _upnp_g1(chk, "NewEnabled"),
+                    "desc": _upnp_g1(chk, "NewPortMappingDescription"),
+                })
+            tbl["rows"] = rows if answered else None
+            tbl["at"] = time.monotonic()
+            return tbl["rows"]
+
+        def _row(ext_port: int):
+            for r in _table() or []:
+                if r["ext"] == str(ext_port) and r["proto"].upper() in ("TCP", ""):
+                    return r
+            return None
+
+        def _classify(e: dict) -> str:
+            if (e["client"] == internal_ip and e["port"] == str(port)
+                    and e["enabled"] not in ("0", "false", "False")):
+                return "mine"
+            # 説明文が自分と完全一致かつ同じ機器宛て → 自分の古い/無効化された登録。
+            # 前方一致にしないこと：同じPCで個人用(8765)と審査用(8786)が同時に動くので、
+            # 製品名だけで「自分の」と判断すると相手の転送を消してしまう。
+            if e["desc"] == my_desc and e["client"] == internal_ip:
+                return "stale"
+            return "other"
+
+        def _owner(ext_port: int) -> str:
+            """'mine'/'stale'/'other'/'free'/'unknown'（ルーターが答えなかった）。"""
+            e = _entry(ext_port)
+            if e is not None:
+                return _classify(e)
+            rows = _table()  # 個別照会が見失った。表の全件列挙で裏を取る
+            if rows is None:
+                return "unknown"
+            r = _row(ext_port)
+            return _classify(r) if r else "free"
+
+        def _note_conflict(ext_port: int) -> None:
+            global _upnp_last_conflict_note
+            e = _entry(ext_port) or _row(ext_port) or {}
+            msg = (f"[IPv4] UPnP: 外部ポート {ext_port} は別の機器/アプリ"
+                   f"（{e.get('client', '?')}:{e.get('port', '?')}"
+                   f" 説明={e.get('desc', '?')}）が使用中です。奪わずに別のポートを使います")
+            if msg != _upnp_last_conflict_note:
+                _upnp_last_conflict_note = msg
+                _log_queue.put(msg)
+
         def _try_open(ext_port: int):
-            resp = _add(ext_port, 0)            # 永続リース(0)優先（NTT系は有限リースを725で拒否）
-            f = _upnp_fault(resp)
-            if f and f[0] == "718":             # 衝突：まず既存マッピングが自分のものか確認
-                if _mapped(ext_port):
-                    return (True, None)         # 既に自分のマッピングが生きている→そのままOK
-                # 他デバイスの割当 or 確認失敗 → 消して再登録
+            """外部ポートを1つ試す。戻り値: (開けたか, フォルト, 理由ラベル)。
+            他人が使っているポートは奪わない（奪うと相手も奪い返して延々と取り合いになる）。"""
+            who = _owner(ext_port)
+            if who == "unknown":
+                return (False, None, "不明")
+            if who == "other":
+                _upnp_abandoned.add(ext_port)
+                _note_conflict(ext_port)
+                return (False, None, "占有")
+            if who == "mine":
+                f = _upnp_fault(_add(ext_port, 0))  # リース更新（冪等）
+                if f and f[0] != "718":
+                    _add(ext_port, 3600)  # 永続リース拒否(725)のルーター向け
+                if _owner(ext_port) == "other":
+                    _upnp_abandoned.add(ext_port)
+                    return (False, None, "占有")
+                return (True, None, "")
+            if who == "stale":
                 try:
-                    _del(ext_port)
+                    _del(ext_port)  # 自分の古い登録（説明文完全一致・同じ機器）なので作り直す
                 except Exception:
                     pass
-                resp = _add(ext_port, 0)
-                f = _upnp_fault(resp)
-            if f and f[0] != "718":             # 永続拒否(725)等は有限リースで再試行
-                resp = _add(ext_port, 3600)
-                f = _upnp_fault(resp)
-            if f:
-                return (False, f)
-            return (_mapped(ext_port), None)    # 成功応答でも実登録を確認（黙殺対策）
+            f = _upnp_fault(_add(ext_port, 0))  # 永続リース(0)優先（NTT系は有限リースを725で拒否）
+            if f and f[0] == "718":
+                # 衝突と言うが登録は見えない（RemoteHost指定付きの登録やMAP-Eの許可帯外）。
+                # 奪いにいかず次の候補へ。
+                after = _owner(ext_port)
+                if after == "mine":
+                    return (True, None, "")
+                return (False, None, "不明") if after == "unknown" else (False, f, "")
+            elif f:
+                f = _upnp_fault(_add(ext_port, 3600))
+                if f:
+                    return (False, f, "")
+            # 追加が通った（フォルト無し）。これが一番確かな信号なので、照会に見えなくても
+            # 開いたものとして扱う。唯一の例外は「別の機器/アプリのものになっていた」場合。
+            if _owner(ext_port) == "other":
+                _upnp_abandoned.add(ext_port)
+                return (False, None, "占有")
+            return (True, None, "")
 
         chosen = 0
         last_fault = None
-        attempts: list[str] = []
+        attempts: list = []
+        occupied = False  # 候補のどれかが他人に占有されていたか（PCPフォールバックの判断に使う）
         prev = int(_config.get("upnp_external_port", 0) or 0)
 
-        # 1) キャッシュ済み成功ポートを最優先（普段の60秒ループはここでリース更新して終わり）。
-        #    ★維持は冪等な再Addのみで判定し、GetSpecificPortMappingEntry(_mapped)に依存しない。
-        #    PR-400NE系では _add が成功(fault無し)を返しても _mapped が不定でFalseを返すことがあり、
-        #    それを「失敗」と誤判定して別候補へ流れ、外部ポートが60秒ごとに無限ローテーションしていた。
-        #    AddPortMapping は冪等なので、成功 or 718(既に自分の登録あり)なら「開いている」と確定扱い。
-        #
-        #    ★起動直後のみ Delete→新規Add でルーターの転送状態を強制リセットする。
-        #    PR-400NE は lease=0（永続）のマッピングを外部から見て登録済み（718を返す）でも、
-        #    サーバー再起動でUPnP制御接続が切れた後に転送を内部で無効化する不具合がある。
-        #    その場合 _add は 718 を返し「既存あり」と判断されるが実際には転送していない。
-        #    起動時に1回 _del → _add することで常に「新規作成」状態を保証する。
-        global _upnp_fresh_add_done
-        if prev:
-            if not _upnp_fresh_add_done:
-                # 起動1回目: 古いエントリを削除して新規追加（転送状態を確実にリセット）
-                _upnp_fresh_add_done = True
-                try:
-                    _del(prev)
-                except Exception:
-                    pass
-            resp = _add(prev, 0)                 # 新規追加 or 再登録（永続リース優先）
-            f = _upnp_fault(resp)
-            if f is not None and f[0] != "718":  # 永続拒否(725)等は有限リースで再試行
-                resp = _add(prev, 3600)
-                f = _upnp_fault(resp)
-            if f is None or f[0] == "718":        # 成功 or 既存 = 開いている → 固定
-                chosen = prev
+        # 1) 前回成功ポートを最優先。維持の判定は冪等な再Addで行い、照会の役目は
+        #    「別の機器/アプリに取られた」を見つけることだけに絞る。
+        if prev and prev not in _upnp_abandoned:
+            who = _owner(prev)
+            if who == "other":
+                occupied = True
+                _upnp_abandoned.add(prev)
+                _note_conflict(prev)
+                attempts.append(f"{prev}=占有")
             else:
-                last_fault = f
-                attempts.append(f"{prev}=NG({f[0]})")
+                # 起動直後のみ Delete→新規Add でルーターの転送状態を強制リセットする
+                # （PR-400NEはlease=0の登録でも、制御接続が切れた後に内部で転送を
+                # 無効化することがある）。自分の登録と確かめられた時だけ。他人のは消さない。
+                # 自分の古い登録（内部ポート変更後など）は転送先が違うので毎回作り直す。
+                if not _upnp_fresh_add_done:
+                    _upnp_fresh_add_done = True
+                    do_del = who in ("mine", "stale")
+                else:
+                    do_del = who == "stale"
+                if do_del:
+                    try:
+                        _del(prev)
+                    except Exception:
+                        pass
+                f = _upnp_fault(_add(prev, 0))
+                if f is not None and f[0] != "718":
+                    f = _upnp_fault(_add(prev, 3600))
+                if f is None or f[0] == "718":
+                    # 通った、または「既に登録がある」。他人のものでないことは上で確かめた。
+                    chosen = prev
+                    _upnp_fail_streak = 0
+                else:
+                    # ルーターが本当に断った。猶予のうちは今の経路を維持して様子を見る。
+                    if _external_ipv4_port == prev:
+                        _upnp_fail_streak += 1
+                        if _upnp_fail_streak <= _UPNP_GRACE_CYCLES:
+                            if _upnp_fail_streak == 1:
+                                _log_queue.put(
+                                    f"[IPv4] UPnP: 外部ポート {prev} の再登録を断られました"
+                                    f"(code={f[0]} {f[1]})。転送は生きているものとして"
+                                    f"最大{_UPNP_GRACE_CYCLES}回ぶん（約{_UPNP_GRACE_CYCLES}分）様子を見ます")
+                            _external_ipv4 = ext
+                            return ext
+                        _log_queue.put(
+                            f"[IPv4] UPnP: 外部ポート {prev} の再登録が {_upnp_fail_streak} 回続けて"
+                            "断られたため、別の外部ポートを選び直します")
+                    last_fault = f
+                    attempts.append(f"{prev}=NG({f[0]})")
 
         # 2) 未確定なら候補を組み立てて順に試す
         if not chosen:
-            # prevの残余が判明している場合は同じ帯の候補を先に試す（スキャン前の高速パス）
-            cands: list[int] = [port]
+            cands: list = [port]
             if prev:
-                for n in (49, 50, 51, 48):
-                    p = n * 1024 + (prev % 1024)
+                # MAP-E向け：前回ポートと同じ残余ブロック(下位10bitの上6bit)は許可帯に入っている。
+                # その中で製品/機器ごとにずらした位置を使う（全製品が同じ位置を狙うと取り合う）。
+                mm, blocks = _upnp_mape_slots(internal_ip, port)
+                rbase = prev % 1024 - prev % 16
+                same_blk = prev - prev % 16 + mm   # 前回と同じブロックの別の位置（許可帯が確実）
+                for p in [same_blk] + [b * 1024 + rbase + mm for b in blocks]:
                     if 1024 <= p <= 65535 and p != port and p != prev:
                         cands.append(p)
-            base = 49152 + (port % 16000)        # 非MAP-E（普通の）ルーター用の高位フォールバック
+            # 普通のルーター用の高位フォールバック。製品/機器ごとにずらす（_upnp_host_offset）。
+            base = 49152 + _upnp_host_offset(internal_ip, port)
             for off in (0, 277):
                 p = base + off
                 cands.append(p - 16000 if p > 65535 else p)
-            seen: set[int] = set()
+            seen: set = set()
             cands = [p for p in cands
-                     if p and p != prev and not (p in seen or seen.add(p))]
+                     if p and p != prev and p not in _upnp_abandoned
+                     and not (p in seen or seen.add(p))]
             for ext_port in cands:
-                ok, f = _try_open(ext_port)
+                ok, f, why = _try_open(ext_port)
                 if ok:
                     chosen = ext_port
                     break
-                if f:
+                if why == "占有":
+                    occupied = True
+                    attempts.append(f"{ext_port}=占有")
+                elif why == "不明":
+                    attempts.append(f"{ext_port}=応答なし")
+                elif f:
                     last_fault = f
                     attempts.append(f"{ext_port}=NG({f[0]})")
                 else:
                     attempts.append(f"{ext_port}=黙殺")
 
-        # PCP (RFC 6887) フォールバック ─────────────────────────────────────────
-        # UPnP AddPortMapping が全て 718 (ConflictInMappingEntry) で失敗した場合、
-        # MAP-E 回線で許可ポート帯を事前に特定できなかった可能性が高い。
-        # PCP の MAP opcode は suggested_external_port=0 にするとルーターが
-        # 許可帯から自動的にポートを割り当てて返すので、帯の知識が不要。
-        if not chosen and last_fault and last_fault[0] == "718":
+        # PCP/ポート帯スキャンは「この回線でUPnPの素直な開放が通らない」時だけの手段。
+        # 一度でも開けた実績がある回線はMAP-Eではないので毎分64連打しても無意味なうえ、
+        # ルーターのUPnPを疲れさせて誤判定を増やす。実績が無い時だけ、30分に1回までに絞る。
+        allow_probe = ((not _upnp_ever_opened or _upnp_fail_streak >= 10)
+                       and time.monotonic() >= _upnp_probe_cooldown_until)
+        probed = False
+
+        # PCP (RFC 6887): ルーターに空きポートを選ばせるので、718でも全候補占有でも有効。
+        if not chosen and allow_probe and ((last_fault and last_fault[0] == "718") or occupied):
+            probed = True
             gw = _pcp_gateway_ip(url)
             if gw:
                 _log_queue.put(f"[IPv4] PCP: ルーター {gw}:5351 へ MAP リクエスト送信中...")
@@ -3351,21 +3690,23 @@ def _upnp_open_ipv4(internal_ip: str, port: int) -> str:
                         f"[IPv4] PCP: MAP-E許可帯から外部ポート {pcp_port} を自動取得しました"
                         f"（外部 {ext}:{pcp_port}）。次回は UPnP でこのポートを維持します")
                 else:
-                    _log_queue.put(f"[IPv4] PCP: 失敗（ルーターが非対応またはタイムアウト）。ポート帯スキャンを試みます")
+                    _log_queue.put("[IPv4] PCP: 失敗（ルーターが非対応またはタイムアウト）。ポート帯スキャンを試みます")
 
-        # MAP-E ポート帯スキャン ──────────────────────────────────────────────────
-        # v6プラス系MAP-EのPSIDは4bitなので、許可帯の先頭残余は 0,16,32,...,1008 の64通りのみ。
-        # AddPortMapping を各先頭残余で試し、通ったら帯が判明（そのままそのポートを採用）。
-        # UPnPが通る回線であれば帯が必ず見つかる。最悪64試行≒数秒。
-        if not chosen and last_fault and last_fault[0] == "718":
+        # MAP-E ポート帯スキャン（v6プラス系のPSIDは4bit → 先頭残余は 0,16,...,1008 の64通り）
+        if not chosen and allow_probe and last_fault and last_fault[0] == "718":
+            probed = True
             _log_queue.put("[IPv4] MAP-E: ポート帯スキャン開始（最大64試行）...")
             sweep_residue = None
+            # 走査するブロックと下位4bitは製品/機器ごとにずらす（全製品が同じポートを狙わないように）
+            mm, blocks = _upnp_mape_slots(internal_ip, port)
             for residue_start in range(0, 1024, 16):
-                sweep_port = 49 * 1024 + residue_start   # 50176〜51200 の範囲
-                ok, f = _try_open(sweep_port)
+                sweep_port = blocks[0] * 1024 + residue_start + mm
+                if sweep_port in _upnp_abandoned:
+                    continue
+                ok, f, _why = _try_open(sweep_port)
                 if ok:
                     sweep_residue = residue_start
-                    chosen = sweep_port   # そのまま採用（既にマッピング登録済み）
+                    chosen = sweep_port
                     _log_queue.put(
                         f"[IPv4] MAP-E: ポート帯スキャンで残余 {residue_start} を発見、"
                         f"外部ポート {sweep_port} を開放しました（外部 {ext}:{sweep_port}）")
@@ -3375,14 +3716,27 @@ def _upnp_open_ipv4(internal_ip: str, port: int) -> str:
             if sweep_residue is None:
                 _log_queue.put("[IPv4] MAP-E: ポート帯スキャン失敗（全64残余が718）")
 
+        if not chosen and probed:
+            _upnp_probe_cooldown_until = time.monotonic() + _UPNP_PROBE_COOLDOWN
+            _log_queue.put(f"[IPv4] UPnP: ポート帯の特定に失敗したため、"
+                           f"{_UPNP_PROBE_COOLDOWN // 60}分間はPCP/帯スキャンを控えます"
+                           "（この間も通常の開放は毎分試します）")
+
         if not chosen:
-            if (ext, 0) != (_external_ipv4, _external_ipv4_port):
-                _log_queue.put(f"[IPv4] UPnP: ポート開放の試行結果 [{', '.join(attempts)}]")
+            note = f"[IPv4] UPnP: ポート開放の試行結果 [{', '.join(attempts)}]"
+            if note != _upnp_last_fail_note:
+                _upnp_last_fail_note = note
+                _log_queue.put(note)
                 if last_fault:
                     _log_queue.put(
                         f"[IPv4] UPnP: ポート開放を拒否されました (code={last_fault[0]} {last_fault[1]})。"
                         "MAP-E(v6プラス系)で利用可能ポート帯を特定できないか、UPnP追加不可のルーターの可能性"
                         "（IPv6/WebRTCで接続してください）")
+                elif occupied:
+                    _log_queue.put(
+                        "[IPv4] UPnP: 候補の外部ポートがすべて他の機器/アプリに使われていました。"
+                        "ルーターのポート転送設定を整理するか、設定で待ち受けポートを変えてください"
+                        "（IPv6/WebRTCでは接続できます）")
                 else:
                     _log_queue.put(
                         "[IPv4] UPnP: ルーターがポート開放を受理しませんでした（マッピング未登録）。"
@@ -3391,14 +3745,19 @@ def _upnp_open_ipv4(internal_ip: str, port: int) -> str:
             _external_ipv4_port = 0
             return ""
 
+        _upnp_last_conflict_note = ""  # 開けたので、次に占有されたときは再度ログを出す
+        _upnp_ever_opened = True
+        _upnp_fail_streak = 0
+        _upnp_last_fail_note = ""
+
         if _config.get("upnp_external_port") != chosen:
+            if prev and chosen != prev:
+                _log_queue.put(f"[IPv4] UPnP: 外部ポートを {prev} から {chosen} に変更しました"
+                               "（アプリ側は伝言板経由で新しいポートを受け取ります）")
+                # 古い方の登録はあえて消さない。PR-400NE では DeletePortMapping が
+                # 他のエントリまで巻き込んで消すことがある。
             _config["upnp_external_port"] = chosen   # 次回最優先で試す（外部ポートの安定化）
             save_config(_config)                      # 再起動後もポートを記憶
-
-        # 起動後1回限り：ローテーションバグ等で残ったゴミマッピング（ArcHive説明・異ポート）を削除。
-        # NOTE: PR-400NEでDeletePortMappingが他のエントリに影響する可能性があるため一時無効化中。
-        # global _upnp_cleanup_done
-        # if not _upnp_cleanup_done: ...
 
         if (ext, chosen) != (_external_ipv4, _external_ipv4_port):
             if chosen == port:
@@ -3410,8 +3769,14 @@ def _upnp_open_ipv4(internal_ip: str, port: int) -> str:
         _external_ipv4_port = chosen
         return ext
     except Exception as e:
-        _log_queue.put(f"[IPv4] UPnP: 失敗 ({e})")
+        msg = f"[IPv4] UPnP: 失敗 ({e})"
+        if msg != _upnp_last_fail_note:
+            _upnp_last_fail_note = msg
+            _log_queue.put(msg)
         _upnp_v4["url"] = ""          # 次回は再探索（controlURLが変わった可能性に備える）
+        _upnp_fail_streak += 1
+        if _external_ipv4_port and _upnp_fail_streak <= _UPNP_GRACE_CYCLES:
+            return _external_ipv4     # 一時的な異常とみなし、今の経路を維持する
         _external_ipv4 = ""
         _external_ipv4_port = 0
         return ""

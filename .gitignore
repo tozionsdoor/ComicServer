@@ -61,3 +61,7 @@ docs/images/_unmasked_originals/
 
 # ── NAS パッケージング（環境固有・公開不要） ─────────────────
 nas_packaging/
+
+# サーバーのログファイル（ソース起動時はリポジトリ直下に出る）
+server.log
+server.log.1
