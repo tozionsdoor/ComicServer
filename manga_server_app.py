@@ -1147,7 +1147,7 @@ def get_local_ip() -> str:
         s.close()
 
 # ─── FastAPI アプリ ────────────────────────────────────────────────────────────
-api       = FastAPI(title="MangaServer", docs_url=None, redoc_url=None)
+api       = FastAPI(title="MangaServer", docs_url=None, redoc_url=None, openapi_url=None)
 
 def _extract_token(authorization: str | None) -> str:
     """Authorization ヘッダからトークンを取り出す（2方式に対応）。
@@ -1175,12 +1175,39 @@ def _browser_token() -> str:
 
 def _find_device_by_token(token: str) -> tuple[str, dict] | None:
     """承認済み端末からトークンが一致するものを探す。(device_id, device情報) または None。"""
-    if not token:
+    # compare_digest は ASCII 以外の文字列を渡すと TypeError になる（Basic認証の
+    # パスワード部などに何でも入れられる）。正規のトークンは必ず ASCII なので、
+    # それ以外は照合せずに「誤トークン」として扱う。
+    if not token or not token.isascii():
         return None
     for did, d in _config.get("devices", {}).items():
         if d.get("status") == "approved" and d.get("token") and secrets.compare_digest(token, d["token"]):
             return did, d
     return None
+
+# ─── リクエスト本文の読み込み（上限付き） ────────────────────────────────────────
+# request.json() は本文を上限なしで全部メモリに溜める（chunked 送信なら Content-Length
+# の確認もすり抜ける）。認証前に届く本文はこれで上限付きで読む。
+_MAX_JSON_BODY = 16 * 1024   # 端末登録の本文は 200 バイト程度。十分な余裕を見た上限
+
+async def _read_json_object(request: Request, limit: int = _MAX_JSON_BODY) -> dict:
+    """本文を最大 limit バイトまで読み、JSON オブジェクトとして返す。
+    上限超えは 413、JSON でない・オブジェクトでない本文は 400。"""
+    declared = request.headers.get("content-length")
+    if declared is not None and declared.isdigit() and int(declared) > limit:
+        raise HTTPException(413, "Request body too large")
+    buf = bytearray()
+    async for chunk in request.stream():
+        buf += chunk
+        if len(buf) > limit:
+            raise HTTPException(413, "Request body too large")
+    try:
+        body = json.loads(buf)
+    except Exception:   # 不正な JSON・深すぎる入れ子（RecursionError）など
+        raise HTTPException(400, "Invalid JSON")
+    if not isinstance(body, dict):
+        raise HTTPException(400, "JSON object required")
+    return body
 
 # ─── ブルートフォース対策（IPごとに誤トークン回数を数えて一時ブロック） ──────────────
 _AUTH_FAIL_LIMIT    = 10   # この期間内にこの回数誤ったらブロック
@@ -1993,10 +2020,7 @@ init();
 @api.post("/api/devices/register")
 async def register_device(request: Request):
     """端末登録（認証不要）。LANペアリング時に発行したノンスで正当性を確認する。"""
-    try:
-        body = await request.json()
-    except Exception:
-        raise HTTPException(400, "Invalid JSON")
+    body = await _read_json_object(request)
     reg_nonce   = str(body.get("reg_nonce",   ""))
     device_id   = str(body.get("device_id",   ""))[:64]
     device_name = str(body.get("device_name", "Android"))[:50]
