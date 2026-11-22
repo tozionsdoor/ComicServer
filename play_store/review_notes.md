@@ -110,7 +110,19 @@ If you cannot connect or need more information, please contact
 - [x] cloudflared **named tunnel**（固定URL）→ `https://archive-demo.uk`（[[22_cloudflare_named_tunnel.md]]）。以後プロセス再起動してもURLは変わらない。
 - [x] 審査用デモサーバーは個人サーバーと**同一PC上で完全独立運用**（[[23_review_server_standalone.md]]）。設定は`Z:\Taka_Documents\ComicServer\review_server\manga_server_config.json`、`devices.google-review`のトークンは `{{DEMO_TOKEN}}`。
 - [x] デモサーバーの `scan_dirs` を `Z:/Taka_Documents/APP/ComicServer/sample` のみに設定済み（個人の本棚は含まない）
-- [x] Windowsスタートアップフォルダのショートカット2件（`ArcHiveServer_Review.lnk`/`CloudflaredTunnel_Review.lnk`）でPC再起動後も自動復帰
-- [ ] 審査期間中はreview_server＋named tunnelを起動したままにする（個人サーバーとは独立なので、個人サーバー側は自由に使ってよい）
-- [ ] 公開後の更新でも再審査が走るため、当面はデモ環境を残す
-- [ ] **本アップデートの審査提出前に、Play Consoleの「アプリへのアクセス権」欄を上記の新URL/新トークンに更新すること**（旧quick tunnel情報のままだと審査員が接続できない）
+- [x] デモサーバーの UPnP（`upnp_ipv4_open`）と IPv6 報告（`report_ipv6`）はオフ。外からはトンネル経由でしか届かない（2026-11-23。ルーターに残っていた 50688→8786 の転送も削除済み）
+
+## 4. 運用: 普段は止めておき、審査に出すときだけ起動する（2026-11-23〜）
+
+デモサーバーとトンネルは**自動起動しない**。審査に出さない間は止めておき、外から届く入り口を残さない。
+起動用のショートカットは `review_server/` にある（以前はスタートアップフォルダにあったもの）。
+
+**審査に出すとき:**
+1. `review_server/1_審査用サーバー起動.lnk` と `review_server/2_審査用トンネル起動.lnk` をダブルクリックで起動する。
+   **Claude のシェルからは起動しない**（Claude アプリの更新・終了と一緒に止まる。2026-11-22 にそれで落ちた）。
+2. `sh scripts/check_demo_login.sh` を実行し、`OK:https://archive-demo.uk` を確認する。
+3. Play Console「アプリへのアクセス権」のトークン欄が `play_store/review_secrets.local.md` の `DEMO_TOKEN` と同じか確認する。
+   **2026-11-23 にトークンを新しくしたので、次の提出時は必ず貼り替えること**（古いトークンは公開リポジトリの履歴に残っているため無効化した）。
+4. 審査提出。審査が通るまで起動したままにする。
+
+**審査が通ったら:** タスクトレイのサーバーを終了し、cloudflared のウィンドウを閉じる。

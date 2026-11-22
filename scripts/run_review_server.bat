@@ -1,8 +1,10 @@
 @echo off
 rem Starts the review (Play Store demo) instance of ArcHiveServer: sample books
 rem only, own HTTP port and own IPC port, so it runs next to the personal
-rem ArcHiveServer.exe. A shortcut to this file sits in the Windows Startup
-rem folder so the instance comes back at logon.
+rem ArcHiveServer.exe. It is NOT started at logon any more (since 2026-11-23):
+rem start it by hand only while an app update is under Play review, via the
+rem shortcut review_server_*.lnk. Do not start it from a Claude shell, or it
+rem stops when the Claude app updates or quits.
 rem
 rem KEEP THIS FILE ASCII-ONLY. cmd reads batch files as CP932; UTF-8 Japanese
 rem comments shift the line positions and commands get skipped silently (the

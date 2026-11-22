@@ -68,3 +68,6 @@ server.log.1
 
 # 審査用トークン・連絡先メールなど公開リポジトリに置かない値（play_store/review_secrets.local.md）
 *.local.md
+
+# 審査用デモサーバーの設定・ログ（トークンを含む）
+review_server/
