@@ -12,6 +12,10 @@ Google の審査員はそのままではログイン画面から先に進めな�
 **「すべての機能を利用するにはログイン等の特別なアクセスが必要」** を選び、
 インストラクションを1件追加する。フォームの各欄には以下を入れる。
 
+> `{{DEMO_TOKEN}}`（審査用トークン）と `{{CONTACT_EMAIL}}`（連絡先メール）の実際の値は、
+> git管理外の `play_store/review_secrets.local.md` にある。このリポジトリは公開なので、
+> 実際の値はここに書かないこと。
+
 | Play Console の欄 | 入れる値 |
 |---|---|
 | 名前 / フローの説明 | `デモサーバーへの接続 / Connect to demo server` |
@@ -42,7 +46,7 @@ ArcHive は、ユーザー自身の自宅PCに無料のサーバーソフトを�
 2. 「サーバーURL」欄に次を入力してください：
    https://archive-demo.uk
 3. 「認証トークン」欄に次を入力してください：
-   3-0Nt1zH2uHb87LFNjTKH72j4v-mRwAUmUZ3zYHQCmA
+   {{DEMO_TOKEN}}
    ※ 入力ミスを防ぐため、コピー＆ペーストを推奨します。
 4. 「接続」ボタンを押してください。本棚画面に進みます。
 
@@ -57,7 +61,7 @@ ArcHive は、ユーザー自身の自宅PCに無料のサーバーソフトを�
 
 【ご不明な点】
 接続できない場合や追加情報が必要な場合は、
-to.zionsdoor@gmail.com までご連絡ください。デモサーバーは審査期間中、起動したままにします。
+{{CONTACT_EMAIL}} までご連絡ください。デモサーバーは審査期間中、起動したままにします。
 ```
 
 ---
@@ -81,7 +85,7 @@ Please connect using the steps below (you do NOT need to be on any specific Wi-F
 2. In the "サーバーURL" (Server URL) field, enter:
    https://archive-demo.uk
 3. In the "認証トークン" (Auth token) field, enter:
-   3-0Nt1zH2uHb87LFNjTKH72j4v-mRwAUmUZ3zYHQCmA
+   {{DEMO_TOKEN}}
    (Copy & paste is recommended to avoid typos.)
 4. Tap the "接続" (Connect) button. You will be taken to the bookshelf screen.
 
@@ -96,7 +100,7 @@ That feature looks for a server on the same Wi-Fi and is not needed for the demo
 
 [Questions]
 If you cannot connect or need more information, please contact
-to.zionsdoor@gmail.com. The demo server will be kept running during the review period.
+{{CONTACT_EMAIL}}. The demo server will be kept running during the review period.
 ```
 
 ---
@@ -104,7 +108,7 @@ to.zionsdoor@gmail.com. The demo server will be kept running during the review p
 ## 3. 確定済みの値（2026-07-13更新: named tunnel + 独立運用構成に移行）
 
 - [x] cloudflared **named tunnel**（固定URL）→ `https://archive-demo.uk`（[[22_cloudflare_named_tunnel.md]]）。以後プロセス再起動してもURLは変わらない。
-- [x] 審査用デモサーバーは個人サーバーと**同一PC上で完全独立運用**（[[23_review_server_standalone.md]]）。設定は`Z:\Taka_Documents\ComicServer\review_server\manga_server_config.json`、`devices.google-review`のトークンは `3-0Nt1zH2uHb87LFNjTKH72j4v-mRwAUmUZ3zYHQCmA`。
+- [x] 審査用デモサーバーは個人サーバーと**同一PC上で完全独立運用**（[[23_review_server_standalone.md]]）。設定は`Z:\Taka_Documents\ComicServer\review_server\manga_server_config.json`、`devices.google-review`のトークンは `{{DEMO_TOKEN}}`。
 - [x] デモサーバーの `scan_dirs` を `Z:/Taka_Documents/APP/ComicServer/sample` のみに設定済み（個人の本棚は含まない）
 - [x] Windowsスタートアップフォルダのショートカット2件（`ArcHiveServer_Review.lnk`/`CloudflaredTunnel_Review.lnk`）でPC再起動後も自動復帰
 - [ ] 審査期間中はreview_server＋named tunnelを起動したままにする（個人サーバーとは独立なので、個人サーバー側は自由に使ってよい）

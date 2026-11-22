@@ -49,7 +49,7 @@ D-U-N-Sナンバーを取得したら、ステップ4（Play Console組織登録
 | フィーチャーグラフィック 1024x500 | ✅ `play_store/feature_graphic.png` |
 | スクリーンショット（2:1以内にクロップ済み） | ✅ `play_store/screenshots/` 4枚 |
 | プライバシーポリシーURL | ✅ `https://tozionsdoor.github.io/ComicServer/privacy.html` |
-| サポート用メールアドレス | ✅ `to.zionsdoor@gmail.com` |
+| サポート用メールアドレス | ✅ `{{CONTACT_EMAIL}}`（実際の値は git管理外の `play_store/review_secrets.local.md`） |
 | Webサイト | ✅ `https://tozionsdoor.github.io/ComicServer/` |
 
 **未対応・要確認:**
@@ -123,7 +123,7 @@ https://tozionsdoor.github.io/ComicServer/
 - カテゴリ: **書籍 & 参考書**（Books & Reference）
 
 ### 連絡先情報
-- メール: `to.zionsdoor@gmail.com`
+- メール: `{{CONTACT_EMAIL}}`（実際の値は git管理外の `play_store/review_secrets.local.md`）
 - ウェブサイト: `https://tozionsdoor.github.io/ComicServer/`
 - 電話番号: 不要（任意項目）
 

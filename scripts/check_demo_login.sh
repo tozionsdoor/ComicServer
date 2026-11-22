@@ -1,11 +1,13 @@
 #!/bin/sh
 # Play Store審査用デモサーバーのログイン確認。
-# review_notes.md からURL/トークンを毎回読み直すため、URLやトークンが
-# 再発行されても本スクリプト自体・呼び出しコマンドは常に同一文字列のまま。
+# URLは review_notes.md、トークンは git管理外の review_secrets.local.md から毎回読み直す
+# （公開リポジトリにトークンを置かないため）。URLやトークンが再発行されても、
+# 本スクリプト自体・呼び出しコマンドは常に同一文字列のまま。
 set -e
 
 DIR="$(cd "$(dirname "$0")/.." && pwd)"
 NOTES="$DIR/play_store/review_notes.md"
+SECRETS="$DIR/play_store/review_secrets.local.md"
 
 if [ ! -f "$NOTES" ]; then
   echo "FAIL:NOTFOUND:review_notes.mdが見つかりません($NOTES)"
@@ -13,10 +15,10 @@ if [ ! -f "$NOTES" ]; then
 fi
 
 URL=$(grep -oE 'https://([a-zA-Z0-9.-]+\.trycloudflare\.com|archive-demo\.uk)' "$NOTES" | head -1)
-TOKEN=$(grep -oE '^[[:space:]]*[A-Za-z0-9_-]{25,}[[:space:]]*$' "$NOTES" | head -1 | tr -d '[:space:]')
+TOKEN=$(grep -E '^DEMO_TOKEN=' "$SECRETS" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '[:space:]')
 
 if [ -z "$URL" ] || [ -z "$TOKEN" ]; then
-  echo "FAIL:NOTFOUND:review_notes.mdからURLまたはトークンを抽出できませんでした"
+  echo "FAIL:NOTFOUND:URL(review_notes.md)またはトークン(review_secrets.local.md)を抽出できませんでした"
   exit 0
 fi
 
