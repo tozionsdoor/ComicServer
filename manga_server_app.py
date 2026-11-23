@@ -121,16 +121,21 @@ PAGE_CACHE_DIR = CACHE_DIR / "pages"   # リサイズ済み本文ページのデ
 # ここを大きくして誤魔化す必要はない → _trim_page_cache のコメント参照。
 PAGE_CACHE_MAX = 10000
 
+# ─── 版とサポート期限 ───────────────────────────────────────────────────────────
+# このEXEの版。インストーラー(archive_setup.iss の AppVersion)と必ず揃える。
+# 起動時に GitHub の最新リリースと比べ、古ければ画面とトレイで知らせる。
+APP_VERSION = "1.2.2"
+# この版を作った日。リリースのたびに必ず更新する（APP_VERSION と一緒に）。
+# ここから _SUPPORT_GRACE_DAYS 日を過ぎ、support.json でも延長されていなければ、
+# 外部からの直接接続を自動で止める（_evaluate_support 参照）。
+APP_BUILD_DATE = "2026-11-23"
+
 # ─── Firebase（シグナリング）開発者設定 ─────────────────────────────────────────
 # 設計: 開発者の1プロジェクトを全ユーザー共通の"伝言板"にする。サーバーは匿名認証の
 # 一般クライアントとして繋ぐ。api_key はクライアント鍵で秘匿情報ではない（アプリにも
 # 同梱される）ため、ここ（＝全配布コピー共通の既定値）に直接書いてよい。
 # 開発者は↓の2つを一度だけ記入すれば、配布した全サーバーが同じ伝言板を使う。
 # （個別に変えたい場合のみ manga_server_config.json の "firebase" で上書き可能）
-# このEXEの版。インストーラー(archive_setup.iss の AppVersion)と必ず揃える。
-# 起動時に GitHub の最新リリースと比べ、古ければ画面とトレイで知らせる。
-APP_VERSION = "1.2.2"
-
 DEFAULT_FIREBASE: dict = {
     "api_key":      "AIzaSyCHz05od7Ta6wJFKSWcTisWfhJh_kg1fKQ",
     "database_url": "https://comicserver-default-rtdb.asia-southeast1.firebasedatabase.app",
@@ -1027,7 +1032,7 @@ def get_global_ipv6() -> str:
     実アドレスの検出自体は _detect_global_ipv6() が行う。LAN/外部の判定
     （_conn_type）はこの広告トグルの影響を受けてはいけないので、そちらは
     _detect_global_ipv6() を直接呼ぶこと。"""
-    if not _config.get("report_ipv6", True):
+    if not _config.get("report_ipv6", True) or _support_state.get("blocked"):
         return ""
     return _detect_global_ipv6()
 
@@ -1167,6 +1172,46 @@ def get_local_ip() -> str:
 
 # ─── FastAPI アプリ ────────────────────────────────────────────────────────────
 api       = FastAPI(title="MangaServer", docs_url=None, redoc_url=None, openapi_url=None)
+
+
+# 安全装置の状態（_evaluate_support が作る）。blocked=True の間は外部からの直接接続を止める。
+_support_state: dict = {"blocked": False, "reason": "", "days_left": None, "deadline": "", "message": ""}
+
+
+def _is_outside_lan(host: str) -> bool:
+    """接続元がLANの外（グローバルアドレス）か。IPv4射影IPv6(::ffff:a.b.c.d)はIPv4として見る。"""
+    try:
+        ip = ipaddress.ip_address(host.split("%")[0])
+    except ValueError:
+        return False
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
+        ip = ip.ipv4_mapped
+    return ip.is_global
+
+
+class _DirectBlockMiddleware:
+    """安全装置が働いている間、LANの外から直接届いたHTTPを断る（403）。
+    ポート開放とアドレスの広告は監視スレッドが止めるが、IPv6はルーターの設定次第で
+    直接届いてしまうので、ここでも断る。WebRTC経由（プロセス内で処理）、LAN内、
+    127.0.0.1（Cloudflareトンネル等）は通す。"""
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") == "http" and _support_state.get("blocked"):
+            client = scope.get("client")
+            if client and _is_outside_lan(str(client[0])):
+                body = b'{"error":"direct access is disabled on this server version"}'
+                await send({"type": "http.response.start", "status": 403,
+                            "headers": [(b"content-type", b"application/json"),
+                                        (b"content-length", str(len(body)).encode()),
+                                        (b"connection", b"close")]})
+                await send({"type": "http.response.body", "body": body})
+                return
+        await self.app(scope, receive, send)
+
+
+api.add_middleware(_DirectBlockMiddleware)
 
 def _extract_token(authorization: str | None) -> str:
     """Authorization ヘッダからトークンを取り出す（2方式に対応）。
@@ -3422,7 +3467,11 @@ def _upnp_open_ipv4(internal_ip: str, port: int) -> str:
     照会結果で維持を判定すると外部ポートが数分おきに入れ替わり続けるため。"""
     global _external_ipv4, _external_ipv4_port, _upnp_fresh_add_done, _upnp_last_conflict_note
     global _upnp_fail_streak, _upnp_ever_opened, _upnp_probe_cooldown_until, _upnp_last_fail_note
-    if not _config.get("upnp_ipv4_open", True):
+    if not _config.get("upnp_ipv4_open", True) or _support_state.get("blocked"):
+        # 設定でOFFにされた／安全装置が働いた。開けていた転送があれば消す
+        # （以前はOFFにしてもルーターに穴が残った）。呼び出し元が _upnp_lock を持っている。
+        if _upnp_v4.get("mapped"):
+            _upnp_release_mapping()
         _external_ipv4 = ""
         _external_ipv4_port = 0
         return ""
@@ -3874,29 +3923,34 @@ def _upnp_close_ipv4(timeout: float = 5.0) -> None:
     開けっぱなしにすると、使い終わった後もルーターに穴が残り、利用者からは見えない。
     PR-400NE は削除で他の登録を巻き込むことがあるが、それは毎分〜数分ごとに登録し直す
     他のArcHiveやPlexなら一時的で済む。穴を残し続けるほうを重く見て、終了時に1回だけ消す。"""
-    global _external_ipv4, _external_ipv4_port
     if not _upnp_lock.acquire(timeout=timeout):
         _log_queue.put("[IPv4] UPnP: ポート開放の処理中だったため、転送の削除を見送りました"
                        f"（期限付きなら最長{_UPNP_LEASE // 60}分で閉じます）")
         return
     try:
-        m = _upnp_v4.get("mapped")
-        url, stype = _upnp_v4.get("url", ""), _upnp_v4.get("stype", "")
-        _upnp_v4["mapped"] = None
-        _external_ipv4 = ""
-        _external_ipv4_port = 0
-        if not m or not url:
-            return
-        ext_port, internal_ip, port, desc = m
-        try:
-            ok = _upnp_delete_if_mine(url, stype, ext_port, internal_ip, port, desc)
-        except Exception:
-            ok = False
-        _log_queue.put(f"[IPv4] UPnP: 外部ポート {ext_port} の転送を" +
-                       ("閉じました" if ok else
-                        "閉じられませんでした（ルーターが応答しないか、既に閉じています）"))
+        _upnp_release_mapping()
     finally:
         _upnp_lock.release()
+
+
+def _upnp_release_mapping() -> None:
+    """開けている転送を消す本体。呼ぶ側が _upnp_lock を持っていること。"""
+    global _external_ipv4, _external_ipv4_port
+    m = _upnp_v4.get("mapped")
+    url, stype = _upnp_v4.get("url", ""), _upnp_v4.get("stype", "")
+    _upnp_v4["mapped"] = None
+    _external_ipv4 = ""
+    _external_ipv4_port = 0
+    if not m or not url:
+        return
+    ext_port, internal_ip, port, desc = m
+    try:
+        ok = _upnp_delete_if_mine(url, stype, ext_port, internal_ip, port, desc)
+    except Exception:
+        ok = False
+    _log_queue.put(f"[IPv4] UPnP: 外部ポート {ext_port} の転送を" +
+                   ("閉じました" if ok else
+                    "閉じられませんでした（ルーターが応答しないか、既に閉じています）"))
 
 
 def _upnp_cleanup_for_uninstall(cfg: dict) -> int:
@@ -3955,8 +4009,8 @@ def _ipv6_monitor_thread() -> None:
     while _ipv6_monitor_running:
         changed = False
         ipv6 = get_global_ipv6()
-        if not _config.get("report_ipv6", True):
-            # 設定でOFFにされた場合は即座に空へ倒す（テスト用トグルなので、通常の
+        if not _config.get("report_ipv6", True) or _support_state.get("blocked"):
+            # 設定でOFFにされた／安全装置が働いた場合は即座に空へ倒す（通常の
             # 一時的な取得失敗と違い「静かに保持」せず確実にFirebaseへ反映する）。
             if last_ipv6:
                 last_ipv6 = ""
@@ -4024,10 +4078,95 @@ def _fetch_latest_release() -> str:
     return str(data.get("tag_name") or "")
 
 
-def start_update_check(on_found) -> None:
-    """起動1分後と以後1日1回、新しい版を確かめる。見つかったら on_found(tag) を呼ぶ。"""
+# ─── 安全装置（更新が止まったときに外部公開を自動で止める） ─────────────────────────
+# 開発が止まったり、利用者が更新しなかったりすると、古い部品（OpenSSL等）の穴を抱えたまま
+# インターネットに公開され続ける。そこで次のどちらかになったら、外部からの直接接続
+# （UPnPのポート開放・IPv6/IPv4直結の広告・LAN外からのHTTP）を自動で止める。
+#   1) support.json の min_safe_version より古い版（開発者が「この版は危ない」と宣言した）
+#   2) サポート期限切れ: 期限 = max(APP_BUILD_DATE + 365日, support.json の supported_until)
+#      開発者が新しい版を出すか supported_until を延ばし続ける限り止まらない（生存確認）。
+# 止めてもLAN内とWebRTC経由（ポートを開けず、部屋IDを知らないと届かない）は使える。
+# support.json は GitHub に置き、取れなければ前回の内容で判断する（消されても期限で止まる）。
+_SUPPORT_URL = "https://raw.githubusercontent.com/tozionsdoor/ComicServer/master/support.json"
+_SUPPORT_GRACE_DAYS = 365
+_SUPPORT_WARN_DAYS = 30
+
+
+def _parse_date(v):
+    try:
+        return datetime.date.fromisoformat(str(v)[:10])
+    except (TypeError, ValueError):
+        return None
+
+
+def _fetch_support_manifest() -> dict | None:
+    """GitHub の support.json を読む。取れなければ例外。知っている項目だけ取り出す。"""
+    req = urllib.request.Request(_SUPPORT_URL, headers={
+        "User-Agent": f"ArcHiveServer/{APP_VERSION}", "Cache-Control": "no-cache"})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        data = json.loads(r.read(64 * 1024).decode("utf-8", "replace"))
+    if not isinstance(data, dict):
+        return None
+    return {k: data[k][:300] for k in ("min_safe_version", "supported_until", "message")
+            if isinstance(data.get(k), str)}
+
+
+def _evaluate_support(manifest, today=None) -> dict:
+    """この版で外部公開を続けてよいかを判断する（ネット不要。manifest は前回取れた内容）。"""
+    today = today or datetime.date.today()
+    m = manifest if isinstance(manifest, dict) else {}
+    msg = str(m.get("message") or "")
+    minv = str(m.get("min_safe_version") or "")
+    if minv and _version_tuple(minv) and _version_tuple(APP_VERSION) < _version_tuple(minv):
+        return {"blocked": True, "days_left": 0, "deadline": "", "message": msg,
+                "reason": f"この版（v{APP_VERSION}）には安全上の問題が見つかっています"}
+    built = _parse_date(APP_BUILD_DATE) or today
+    deadline = built + datetime.timedelta(days=_SUPPORT_GRACE_DAYS)
+    su = _parse_date(m.get("supported_until"))
+    if su and su > deadline:
+        deadline = su
+    left = (deadline - today).days
+    if left < 0:
+        return {"blocked": True, "days_left": left, "deadline": deadline.isoformat(), "message": msg,
+                "reason": f"この版（v{APP_VERSION}）のサポート期限（{deadline.isoformat()}）を過ぎました"}
+    return {"blocked": False, "days_left": left, "deadline": deadline.isoformat(), "message": msg,
+            "reason": ""}
+
+
+def support_check_now(today=None) -> tuple:
+    """保存済みの support.json と今日の日付で判断し、状態を更新する。(状態, 変わったか) を返す。"""
+    st = _evaluate_support(_config.get("support_manifest"), today)
+    before = dict(_support_state)
+    _support_state.update(st)
+    changed = (before.get("blocked"), before.get("days_left")) != (st["blocked"], st["days_left"])
+    if changed:
+        extra = f"（{st['message']}）" if st["message"] else ""
+        if st["blocked"]:
+            if not before.get("blocked"):
+                _log_queue.put(f"[安全] {st['reason']}。外部からの直接接続（ポート開放・IPv6/IPv4直結）を"
+                               f"止めました。LAN内とWebRTC経由は使えます。新しい版に更新してください{extra}: "
+                               f"{_UPDATE_PAGE}")
+        elif before.get("blocked"):
+            _log_queue.put("[安全] サポート期間内に戻ったため、外部からの直接接続を再開します"
+                           "（IPv6直結はサーバーの再起動後に戻ります）")
+        elif st["days_left"] is not None and st["days_left"] <= _SUPPORT_WARN_DAYS:
+            _log_queue.put(f"[安全] あと{st['days_left']}日（{st['deadline']}）で、この版の外部からの"
+                           f"直接接続を止めます。新しい版に更新してください{extra}: {_UPDATE_PAGE}")
+    return dict(_support_state), changed
+
+
+def support_notice_due(st: dict) -> bool:
+    """画面・トレイで知らせるべき状態か（止めている／期限が近い）。"""
+    return bool(st.get("blocked")) or (st.get("days_left") is not None
+                                       and st["days_left"] <= _SUPPORT_WARN_DAYS)
+
+
+def start_update_check(on_found, on_support=None) -> None:
+    """起動1分後と以後1日1回: support.json と最新リリースを確かめ（設定 update_check がOFFなら
+    ネットには出ない）、安全装置の判断をし直す。新しい版は on_found(tag)、安全装置の
+    状態の変化や期限の接近は on_support(状態) で知らせる。"""
     global _update_started
-    if _update_started or not _config.get("update_check", True):
+    if _update_started:
         return
     _update_started = True
 
@@ -4035,15 +4174,29 @@ def start_update_check(on_found) -> None:
         global _update_latest
         time.sleep(60)
         while True:
+            if _config.get("update_check", True):
+                try:
+                    m = _fetch_support_manifest()
+                    if m is not None and m != _config.get("support_manifest"):
+                        _config["support_manifest"] = m
+                        save_config(_config)
+                except Exception:
+                    pass   # オフライン・GitHub障害等。前回の内容で判断する
+                try:
+                    tag = _fetch_latest_release()
+                    if tag and _version_tuple(tag) > _version_tuple(APP_VERSION) and tag != _update_latest:
+                        _update_latest = tag
+                        _log_queue.put(f"[更新] 新しい版 {tag} が公開されています（今は v{APP_VERSION}）。"
+                                       f"安全のため更新してください: {_UPDATE_PAGE}")
+                        on_found(tag)
+                except Exception:
+                    pass   # オフライン等。次の日にまた確かめる
             try:
-                tag = _fetch_latest_release()
-                if tag and _version_tuple(tag) > _version_tuple(APP_VERSION) and tag != _update_latest:
-                    _update_latest = tag
-                    _log_queue.put(f"[更新] 新しい版 {tag} が公開されています（今は v{APP_VERSION}）。"
-                                   f"安全のため更新してください: {_UPDATE_PAGE}")
-                    on_found(tag)
+                st, changed = support_check_now()
+                if on_support and (changed or support_notice_due(st)):
+                    on_support(st)
             except Exception:
-                pass   # オフライン等。次の日にまた確かめる
+                pass
             time.sleep(24 * 3600)
     threading.Thread(target=_loop, daemon=True).start()
 
@@ -4177,7 +4330,11 @@ class App(tk.Tk):
         self._update_dir_list()
         self._update_device_list()
         self._log(f"MangaServer v{APP_VERSION} 起動 | Python {sys.version.split()[0]}")
-        start_update_check(lambda tag: self.after(0, lambda: self._show_update(tag)))
+        self._update_tag = ""
+        st, _ = support_check_now()   # 前回の support.json と今日の日付で、起動前に判断しておく
+        self._refresh_notice(notify=support_notice_due(st))
+        start_update_check(lambda tag: self.after(0, lambda: self._show_update(tag)),
+                           lambda st: self.after(0, lambda: self._refresh_notice(notify=True)))
         if not UNRAR_AVAILABLE:
             self._log(f"[警告] WinRAR が見つかりません（RAR/CBR は使用不可）: {UNRAR_PATH}")
         self.after(2000, self._poll_devices)
@@ -4214,7 +4371,7 @@ class App(tk.Tk):
                                      font=("Yu Gothic UI", 10))
         self._status_lbl.grid(row=0, column=2, sticky="w")
 
-        # 新しい版があるときだけ出す（start_update_check から）
+        # 新しい版がある／安全装置が働いた・期限が近いときだけ出す（_refresh_notice）
         self._update_lbl = tk.Label(f, text="", bg="#f9e2af", fg=PANEL,
                                     font=("Yu Gothic UI", 9, "bold"), cursor="hand2")
         self._update_lbl.bind("<Button-1>", lambda e: webbrowser.open(_UPDATE_PAGE))
@@ -4811,6 +4968,11 @@ class App(tk.Tk):
             # uvicornのIPv6ソケットはIPv4空間も掴む(V6ONLY=0)ため、同じポートでIPv4側と
             # 衝突しWindowsで10048エラーになっていた。1本に統合してこれを解消する。
             listen_host = "::" if host in ("0.0.0.0", "") else host
+            if _support_state.get("blocked") and listen_host in ("::", "::0"):
+                # 安全装置が働いている間はIPv6で待ち受けない（IPv6はルーター次第で外から
+                # 直接届く）。LAN内のアプリはIPv4で繋ぐので影響しない。
+                listen_host = "0.0.0.0"
+                self._log("[安全] 外部からの直接接続を止めているため、IPv4（LAN）だけで待ち受けます")
             _server_thread = _UvicornThread(listen_host, port, cert, key)
             self._log("[DEBUG] start() 呼び出し...")
             _server_thread.start()
@@ -4947,12 +5109,36 @@ class App(tk.Tk):
 
     def _show_update(self, tag: str) -> None:
         """新しい版があることをヘッダーとトレイ通知で知らせる。"""
-        self._update_lbl.configure(text=f" 新しい版 {tag} があります（クリックで開く） ")
+        self._update_tag = tag
+        self._refresh_notice(notify=False)
+        self._tray_notify(f"新しい版 {tag} が公開されています。安全のため更新してください。")
+
+    def _refresh_notice(self, notify: bool = False) -> None:
+        """ヘッダーのお知らせを出し直す。安全装置 > 期限が近い > 新しい版 の順に優先。"""
+        st = _support_state
+        days = st.get("days_left")
+        if st.get("blocked"):
+            text, bg = " 外部からの直接接続を止めています。更新してください（クリックで開く） ", "#f38ba8"
+            tray = (f"{st.get('reason')}。外部からの直接接続を止めました（LAN内とWebRTCは使えます）。"
+                    "新しい版に更新してください。")
+        elif days is not None and days <= _SUPPORT_WARN_DAYS:
+            text, bg = f" あと{days}日で外部からの直接接続を止めます。更新してください ", "#f9e2af"
+            tray = f"あと{days}日で、この版の外部からの直接接続を止めます。新しい版に更新してください。"
+        elif self._update_tag:
+            text, bg = f" 新しい版 {self._update_tag} があります（クリックで開く） ", "#f9e2af"
+            tray = ""
+        else:
+            self._update_lbl.grid_remove()
+            return
+        self._update_lbl.configure(text=text, bg=bg)
         self._update_lbl.grid(row=0, column=3, padx=(8, 0), sticky="e")
+        if notify and tray:
+            self._tray_notify(tray)
+
+    def _tray_notify(self, msg: str) -> None:
         if self._tray is not None:
             try:
-                self._tray.notify(f"新しい版 {tag} が公開されています。安全のため更新してください。",
-                                  "ArcHive Server")
+                self._tray.notify(msg, "ArcHive Server")
             except Exception:
                 pass
 

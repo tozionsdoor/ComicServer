@@ -1,0 +1,6 @@
+{
+  "_説明": "PCサーバー(manga_server_app.py)が1日1回読む安全装置の設定。min_safe_version より古い版、または期限 max(その版のAPP_BUILD_DATE+365日, supported_until) を過ぎた版は、外部からの直接接続を自動で止める（LAN内とWebRTCは使える）。開発を続けている間は年に1回 supported_until を延ばす。危ない穴が見つかったら修正版を出してから min_safe_version を上げる。",
+  "min_safe_version": "1.2.2",
+  "supported_until": "2027-11-23",
+  "message": ""
+}
