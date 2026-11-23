@@ -2345,6 +2345,7 @@ def api_scan(_: str = Depends(_check_auth)):
 import struct
 import urllib.request
 import urllib.error
+import urllib.parse
 
 _signaling_running: bool = False        # シグナリングを動かすべきか（終了時/恒久的な設定不備でFalse）
 _signaling_auth:    dict | None = None   # 終了時の presence 削除用
@@ -4090,16 +4091,112 @@ def _version_tuple(v: str) -> tuple:
     return tuple(int(x) for x in re.findall(r"\d+", v)[:3])
 
 
-def _fetch_latest_release() -> str:
-    """GitHubの最新リリースのタグを返す。取れなければ空。送るのは問い合わせだけ。"""
+_UPDATE_ASSET = "ArcHive_Setup.exe"
+# インストーラーを取りに行ってよい場所（GitHubのリリース配布元だけ。転送先も含めて確かめる）
+_UPDATE_HOSTS = {"github.com", "objects.githubusercontent.com",
+                 "release-assets.githubusercontent.com"}
+_UPDATE_MAX_BYTES = 400 * 1024 * 1024
+
+
+def _fetch_latest_release_info() -> dict:
+    """GitHubの最新リリースを調べる。{"tag", "url", "size", "sha256"}（無い項目は空/0）。
+    取れなければ例外。送るのは問い合わせだけ。"""
     req = urllib.request.Request(_UPDATE_API, headers={
         "User-Agent": f"ArcHiveServer/{APP_VERSION}",
         "Accept": "application/vnd.github+json"})
     with urllib.request.urlopen(req, timeout=15) as r:
         data = json.loads(r.read(2 * 1024 * 1024).decode("utf-8", "replace"))
+    return _parse_release_info(data)
+
+
+def _parse_release_info(data) -> dict:
+    info = {"tag": "", "url": "", "size": 0, "sha256": ""}
     if not isinstance(data, dict) or data.get("draft") or data.get("prerelease"):
-        return ""
-    return str(data.get("tag_name") or "")
+        return info
+    info["tag"] = str(data.get("tag_name") or "")[:50]
+    for a in data.get("assets") or []:
+        if not isinstance(a, dict) or a.get("name") != _UPDATE_ASSET:
+            continue
+        url = str(a.get("browser_download_url") or "")
+        if not _update_url_ok(url):
+            break
+        info["url"] = url
+        try:
+            info["size"] = max(0, int(a.get("size") or 0))
+        except (TypeError, ValueError):
+            info["size"] = 0
+        dg = str(a.get("digest") or "")
+        if re.fullmatch(r"sha256:[0-9a-fA-F]{64}", dg):
+            info["sha256"] = dg[7:].lower()
+        break
+    return info
+
+
+def _fetch_latest_release() -> str:
+    """GitHubの最新リリースのタグを返す。取れなければ空。"""
+    return _fetch_latest_release_info()["tag"]
+
+
+def _update_url_ok(url: str) -> bool:
+    try:
+        u = urllib.parse.urlsplit(url)
+    except ValueError:
+        return False
+    return u.scheme == "https" and (u.hostname or "").lower() in _UPDATE_HOSTS
+
+
+class _UpdateRedirect(urllib.request.HTTPRedirectHandler):
+    """転送先もGitHubの配布元（https）に限る。"""
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not _update_url_ok(newurl):
+            raise urllib.error.URLError(f"想定外の転送先です: {urllib.parse.urlsplit(newurl).hostname}")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _download_update(info: dict, dest: Path, progress=None, cancel=None) -> None:
+    """インストーラーを dest に保存する。サイズとSHA-256（GitHubが公開している値）を確かめ、
+    合わなければ消して例外。progress(済み, 全体) を時々呼ぶ。cancel() が真なら中止。"""
+    url = info.get("url") or ""
+    if not _update_url_ok(url):
+        raise ValueError("ダウンロード先がGitHubではありません")
+    size = int(info.get("size") or 0)
+    if size > _UPDATE_MAX_BYTES:
+        raise ValueError("ファイルが大きすぎます")
+    opener = urllib.request.build_opener(_UpdateRedirect)
+    req = urllib.request.Request(url, headers={"User-Agent": f"ArcHiveServer/{APP_VERSION}"})
+    h = hashlib.sha256()
+    got = 0
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_suffix(".part")
+    try:
+        with opener.open(req, timeout=30) as r, open(tmp, "wb") as f:
+            if not _update_url_ok(r.geturl()):
+                raise ValueError("想定外の転送先です")
+            total = size or int(r.headers.get("Content-Length") or 0)
+            while True:
+                if cancel and cancel():
+                    raise InterruptedError("中止しました")
+                chunk = r.read(256 * 1024)
+                if not chunk:
+                    break
+                got += len(chunk)
+                if got > _UPDATE_MAX_BYTES or (size and got > size):
+                    raise ValueError("ファイルの大きさが公開されている値と違います")
+                h.update(chunk)
+                f.write(chunk)
+                if progress:
+                    progress(got, total)
+        if size and got != size:
+            raise ValueError("ダウンロードが途中で切れました")
+        want = info.get("sha256") or ""
+        if want and h.hexdigest() != want:
+            raise ValueError("ファイルの中身が公開されているもの（SHA-256）と一致しません")
+        if dest.exists():
+            dest.unlink()
+        tmp.replace(dest)
+    finally:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
 
 
 # ─── 安全装置（更新が止まったときに外部公開を自動で止める） ─────────────────────────
@@ -4363,6 +4460,15 @@ class App(tk.Tk):
             self._log(f"[警告] WinRAR が見つかりません（RAR/CBR は使用不可）: {UNRAR_PATH}")
         self.after(2000, self._poll_devices)
 
+        resume = _config.pop("resume_server_after_update", None)
+        if resume is not None:
+            save_config(_config)
+        if (isinstance(resume, (int, float)) and 0 <= time.time() - resume < 3600
+                and not (os.environ.get("ARCHIVE_AUTOSTART") == "1" or AUTOSTART_ARG in sys.argv[1:])):
+            # 「更新を確認」からインストールして起動し直した: 動いていたサーバーを再開する
+            self._log(f"[更新] v{APP_VERSION} に更新しました。サーバーを再開します")
+            self.after(500, self._start_server)
+
         if os.environ.get("ARCHIVE_AUTOSTART") == "1" or AUTOSTART_ARG in sys.argv[1:]:
             # 無人運用インスタンス(ARCHIVE_AUTOSTART=1)、または Windows起動時の
             # スタートアップ登録経由(--autostart引数)での起動:
@@ -4383,26 +4489,36 @@ class App(tk.Tk):
     def _build_header(self):
         f = tk.Frame(self, bg=PANEL, pady=8)
         f.grid(row=0, column=0, sticky="ew")
-        f.columnconfigure(2, weight=1)
+        f.columnconfigure(3, weight=1)
 
         tk.Label(f, text="MangaServer", bg=PANEL, fg=FG,
-                 font=("Yu Gothic UI", 13, "bold")).grid(row=0, column=0, padx=14)
+                 font=("Yu Gothic UI", 13, "bold")).grid(row=0, column=0, padx=(14, 4))
+
+        # いまの版（パッと見で分かるように、タイトルのすぐ横）
+        tk.Label(f, text=f"v{APP_VERSION}", bg=PANEL, fg=FG_DIM,
+                 font=("Yu Gothic UI", 9)).grid(row=0, column=1, padx=(0, 12), sticky="s", pady=(0, 3))
 
         self._dot = tk.Label(f, text="●", bg=PANEL, fg=FG_RED, font=("", 16))
-        self._dot.grid(row=0, column=1, padx=(0, 4))
+        self._dot.grid(row=0, column=2, padx=(0, 4))
 
         self._status_lbl = tk.Label(f, text="停止中", bg=PANEL, fg=FG_DIM,
                                      font=("Yu Gothic UI", 10))
-        self._status_lbl.grid(row=0, column=2, sticky="w")
+        self._status_lbl.grid(row=0, column=3, sticky="w")
 
         # 新しい版がある／安全装置が働いた・期限が近いときだけ出す（_refresh_notice）
+        # クリックで「更新を確認」と同じ流れ（ダウンロード→インストール画面）
         self._update_lbl = tk.Label(f, text="", bg="#f9e2af", fg=PANEL,
                                     font=("Yu Gothic UI", 9, "bold"), cursor="hand2")
-        self._update_lbl.bind("<Button-1>", lambda e: webbrowser.open(_UPDATE_PAGE))
+        self._update_lbl.bind("<Button-1>", lambda e: self._check_update_manual())
+
+        self._update_btn = tk.Button(f, text="更新を確認", bg="#2a2a4a", fg=FG, relief="flat",
+                                     font=("Yu Gothic UI", 9), padx=8, cursor="hand2",
+                                     command=self._check_update_manual)
+        self._update_btn.grid(row=0, column=5, padx=(8, 0), sticky="e")
 
         help_lbl = tk.Label(f, text=" ？ ", bg=ACCENT, fg=PANEL,
                             font=("Yu Gothic UI", 10, "bold"), cursor="hand2")
-        help_lbl.grid(row=0, column=4, padx=14, sticky="e")
+        help_lbl.grid(row=0, column=6, padx=14, sticky="e")
         help_lbl.bind("<Button-1>", lambda e: self._open_help())
 
     def _build_main(self):
@@ -5149,15 +5265,156 @@ class App(tk.Tk):
             text, bg = f" あと{days}日で外部からの直接接続を止めます。更新してください ", "#f9e2af"
             tray = f"あと{days}日で、この版の外部からの直接接続を止めます。新しい版に更新してください。"
         elif self._update_tag:
-            text, bg = f" 新しい版 {self._update_tag} があります（クリックで開く） ", "#f9e2af"
+            text, bg = f" 新しい版 {self._update_tag} があります（クリックで更新） ", "#f9e2af"
             tray = ""
         else:
             self._update_lbl.grid_remove()
             return
         self._update_lbl.configure(text=text, bg=bg)
-        self._update_lbl.grid(row=0, column=3, padx=(8, 0), sticky="e")
+        self._update_lbl.grid(row=0, column=4, padx=(8, 0), sticky="e")
         if notify and tray:
             self._tray_notify(tray)
+
+    def _check_update_manual(self) -> None:
+        """「更新を確認」: 最新リリースを調べ、新しければダウンロードしてインストール画面を開く。
+        設定 update_check がOFFでも、押したときだけは確かめる。"""
+        if getattr(self, "_update_busy", False):
+            return
+        self._update_busy = True
+        self._update_btn.configure(state=tk.DISABLED, text="確認中…")
+
+        def _work():
+            try:
+                info = _fetch_latest_release_info()
+                err = ""
+            except Exception as e:
+                info, err = None, str(e)[:200]
+            self.after(0, lambda: self._on_update_checked(info, err))
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _update_idle(self) -> None:
+        self._update_busy = False
+        try:
+            self._update_btn.configure(state=tk.NORMAL, text="更新を確認")
+        except Exception:
+            pass
+
+    def _on_update_checked(self, info, err: str) -> None:
+        tag = (info or {}).get("tag", "")
+        if not tag:
+            self._update_idle()
+            if messagebox.askyesno(
+                    "更新を確認",
+                    "新しい版を確認できませんでした。\n"
+                    + (f"（{err}）\n" if err else "")
+                    + "\n配布ページをブラウザで開きますか？", parent=self):
+                webbrowser.open(_UPDATE_PAGE)
+            return
+        if _version_tuple(tag) <= _version_tuple(APP_VERSION):
+            self._update_idle()
+            messagebox.showinfo("更新を確認", f"お使いの v{APP_VERSION} が最新です。", parent=self)
+            return
+        self._update_tag = tag
+        self._refresh_notice(notify=False)
+        if not info.get("url"):
+            self._update_idle()
+            if messagebox.askyesno(
+                    "更新を確認",
+                    f"新しい版 {tag} があります（今は v{APP_VERSION}）。\n"
+                    "インストーラーが見つからなかったため、配布ページを開きますか？", parent=self):
+                webbrowser.open(_UPDATE_PAGE)
+            return
+        mb = f"約{info['size'] / 1024 / 1024:.0f}MB" if info.get("size") else ""
+        if not messagebox.askyesno(
+                "更新を確認",
+                f"新しい版 {tag} があります（今は v{APP_VERSION}）。\n\n"
+                f"インストーラー（{mb}）をダウンロードして、インストール画面を開きますか？\n"
+                "開いたあと、このアプリはいったん終了します（サーバーも止まります）。\n"
+                "インストールが終わると起動し直し、動いていたサーバーは再開します。", parent=self):
+            self._update_idle()
+            return
+        self._download_and_install(info)
+
+    def _download_and_install(self, info: dict) -> None:
+        dlg = tk.Toplevel(self)
+        dlg.title("更新をダウンロード中")
+        dlg.configure(bg=BG)
+        dlg.resizable(False, False)
+        dlg.transient(self)
+        lbl = tk.Label(dlg, text=f"{info['tag']} をダウンロードしています…", bg=BG, fg=FG,
+                       font=("Yu Gothic UI", 10))
+        lbl.pack(padx=20, pady=(16, 8))
+        bar = ttk.Progressbar(dlg, length=320, mode="determinate", maximum=1000)
+        bar.pack(padx=20)
+        state = {"cancel": False, "last": 0.0}
+
+        def _cancel():
+            state["cancel"] = True
+        tk.Button(dlg, text="キャンセル", bg="#2a2a4a", fg=FG, relief="flat",
+                  font=("Yu Gothic UI", 9), padx=8, command=_cancel).pack(pady=12)
+        dlg.protocol("WM_DELETE_WINDOW", _cancel)
+
+        def _progress(got, total):
+            now = time.monotonic()
+            if now - state["last"] < 0.15 and got != total:
+                return
+            state["last"] = now
+
+            def _ui():
+                with contextlib.suppress(Exception):
+                    if total:
+                        bar.configure(value=got * 1000 // total)
+                        lbl.configure(text=f"{info['tag']} をダウンロードしています… "
+                                           f"{got / 1048576:.1f} / {total / 1048576:.1f} MB")
+                    else:
+                        lbl.configure(text=f"{info['tag']} をダウンロードしています… "
+                                           f"{got / 1048576:.1f} MB")
+            self.after(0, _ui)
+
+        dest = Path(os.environ.get("TEMP") or Path.home()) / "ArcHiveUpdate" / _UPDATE_ASSET
+
+        def _work():
+            try:
+                _download_update(info, dest, _progress, lambda: state["cancel"])
+                err = ""
+            except InterruptedError:
+                err = "cancel"
+            except Exception as e:
+                err = str(e)[:200] or type(e).__name__
+            self.after(0, lambda: _done(err))
+
+        def _done(err):
+            with contextlib.suppress(Exception):
+                dlg.destroy()
+            if err:
+                self._update_idle()
+                if err != "cancel" and messagebox.askyesno(
+                        "更新", f"ダウンロードできませんでした。\n（{err}）\n\n"
+                        "配布ページをブラウザで開きますか？", parent=self):
+                    webbrowser.open(_UPDATE_PAGE)
+                return
+            self._launch_installer(dest)
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _launch_installer(self, path: Path) -> None:
+        """インストーラーを普通に（画面ありで）起動し、このアプリは終了する。
+        インストーラーの最後の「ArcHive Server を起動する」で新しい版が立ち上がる。"""
+        try:
+            subprocess.Popen([str(path)], close_fds=True,
+                             creationflags=getattr(subprocess, "DETACHED_PROCESS", 0))
+        except Exception as e:
+            self._update_idle()
+            messagebox.showerror("更新", f"インストーラーを起動できませんでした。\n{e}\n\n"
+                                 f"保存先: {path}", parent=self)
+            return
+        self._log(f"[更新] インストーラーを起動しました（{path}）。アプリを終了します")
+        if _server_thread:
+            # 起動し直したらサーバーを再開する（1時間以内のみ）
+            _config["resume_server_after_update"] = time.time()
+            with contextlib.suppress(Exception):
+                save_config(_config)
+        self.after(300, self._quit_app)
 
     def _tray_notify(self, msg: str) -> None:
         if self._tray is not None:
