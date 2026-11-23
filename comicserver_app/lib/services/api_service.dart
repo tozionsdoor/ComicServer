@@ -476,6 +476,49 @@ class ApiService {
   /// 接続情報（ipv6 など）を取得。次回接続のため保存に使う。
   /// 新たに判明したIPv6は今回のセッションの候補リストにも反映する
   /// （次回起動を待たずに reconnect() でレースに参加できるように）。
+  /// これより古いPCサーバーには「更新してください」を案内する（安全のための修正が入った版）。
+  static const minRecommendedServerVersion = '1.2.2';
+
+  /// 接続先サーバーの版を返す。認証後の /api/status に載る `server_version`。
+  /// 1.2.2より前のサーバーはこの項目を返さないので、その場合は空文字（＝旧版）。
+  /// 通信や解析に失敗した時は null（判定できない＝案内も出さない）。
+  Future<String?> getServerVersion() async {
+    try {
+      final res = await _getWithRecovery('/api/status');
+      if (res.statusCode != 200) return null;
+      final j = jsonDecode(res.body);
+      if (j is! Map) return null;
+      return (j['server_version'] ?? '').toString().trim();
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// 版が空（旧サーバー）か、推奨版より古ければ true。
+  static bool isServerOutdated(String version) {
+    if (version.isEmpty) return true;
+    List<int> parse(String v) => v
+        .split(RegExp(r'[^0-9]+'))
+        .where((s) => s.isNotEmpty)
+        .map(int.parse)
+        .toList();
+    final a = parse(version);
+    final b = parse(minRecommendedServerVersion);
+    if (a.isEmpty) return true;
+    for (int i = 0; i < b.length; i++) {
+      final x = i < a.length ? a[i] : 0;
+      if (x != b[i]) return x < b[i];
+    }
+    return false;
+  }
+
+  /// 「サーバー更新のお願い」を出し分けるための接続先の目印（同じPCなら同じ値）。
+  String get serverKey {
+    if ((roomId ?? '').isNotEmpty) return 'room:$roomId';
+    final first = candidates.isNotEmpty ? candidates.first : baseUrl;
+    return 'host:${Uri.tryParse(first)?.host ?? first}';
+  }
+
   Future<Map<String, dynamic>?> getConnectionInfo() async {
     try {
       final res = await _getWithRecovery('/api/connection-info');

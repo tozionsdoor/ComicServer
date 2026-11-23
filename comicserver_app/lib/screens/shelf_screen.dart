@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:flutter/material.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import '../models/book.dart';
 import '../services/api_service.dart';
 import 'reader_screen.dart';
@@ -48,6 +49,7 @@ class _ShelfScreenState extends State<ShelfScreen> with WidgetsBindingObserver {
     WidgetsBinding.instance.addObserver(this);
     _load('');
     _loadAllBooks();
+    _checkServerVersion();
     // ネットワーク変化（WiFi→モバイル等）を検知して自動再接続
     _connectivitySub = Connectivity().onConnectivityChanged.listen((results) {
       if (results.any((r) => r != ConnectivityResult.none)) {
@@ -63,6 +65,49 @@ class _ShelfScreenState extends State<ShelfScreen> with WidgetsBindingObserver {
     _searchCtrl.dispose();
     _gridScroll.dispose();
     super.dispose();
+  }
+
+  /// 接続先のPCサーバーが古い版なら「更新してください」を案内する。
+  /// 毎回出すとうるさいので、同じ接続先には1日1回まで。
+  Future<void> _checkServerVersion() async {
+    // 本棚の読み込みと取り合わないよう少し待ってから聞く。
+    await Future.delayed(const Duration(seconds: 2));
+    if (!mounted) return;
+    final version = await widget.api.getServerVersion();
+    if (!mounted || version == null) return;   // 判定できない時は何もしない
+    if (!ApiService.isServerOutdated(version)) return;
+
+    final key = 'server_update_notice_${widget.api.serverKey}';
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final last = prefs.getInt(key) ?? 0;
+      final now = DateTime.now().millisecondsSinceEpoch;
+      if (now - last < const Duration(hours: 24).inMilliseconds) return;
+      await prefs.setInt(key, now);
+    } catch (_) {/* 保存できなくても案内は出す */}
+    if (!mounted) return;
+
+    final shown = version.isEmpty ? '古い版' : 'v$version';
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('PCサーバーの更新をお願いします'),
+        content: Text(
+          '接続先のArcHive Server（PC）が$shownのままです。\n\n'
+          '安全のための修正を入れた新しい版'
+          '（v${ApiService.minRecommendedServerVersion}以降）が出ています。'
+          'PCで配布ページ（comicserver.web.app）から最新版をダウンロードし、'
+          '上書きインストールしてください。\n\n'
+          '本棚や端末の登録はそのまま引き継がれます。',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: const Text('OK'),
+          ),
+        ],
+      ),
+    );
   }
 
   @override
