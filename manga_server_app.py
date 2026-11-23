@@ -127,6 +127,10 @@ PAGE_CACHE_MAX = 10000
 # 同梱される）ため、ここ（＝全配布コピー共通の既定値）に直接書いてよい。
 # 開発者は↓の2つを一度だけ記入すれば、配布した全サーバーが同じ伝言板を使う。
 # （個別に変えたい場合のみ manga_server_config.json の "firebase" で上書き可能）
+# このEXEの版。インストーラー(archive_setup.iss の AppVersion)と必ず揃える。
+# 起動時に GitHub の最新リリースと比べ、古ければ画面とトレイで知らせる。
+APP_VERSION = "1.2.2"
+
 DEFAULT_FIREBASE: dict = {
     "api_key":      "AIzaSyCHz05od7Ta6wJFKSWcTisWfhJh_kg1fKQ",
     "database_url": "https://comicserver-default-rtdb.asia-southeast1.firebasedatabase.app",
@@ -138,6 +142,7 @@ DEFAULT_CONFIG: dict = {
     "port":         8765,
     "host":         "0.0.0.0",
     "upnp_ipv4_open": True,  # UPnPでルーターのIPv4ポートを自動開放（PPPoE等でグローバルIPv4を持つ回線向け）
+    "update_check": True,  # 起動時と1日1回、GitHubに新しい版が出ていないか確かめる（送るのは版の問い合わせだけ）
     "report_ipv6": True,  # IPv6直結をアプリに広告する（OFFでWebRTCフォールバックのテストがしやすい）
     "on_close":     "exit",  # ウィンドウ×ボタン押下時: "exit"/"tray"
     "on_minimize":  "minimize",  # 最小化ボタン押下時: "minimize"/"tray"
@@ -174,7 +179,12 @@ def ensure_tls_cert() -> str:
             pass  # 壊れていれば再生成
     # 新規生成
     key = ec.generate_private_key(ec.SECP256R1())
-    subject = issuer = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "ComicServer")])
+    # CN に製品名を入れると、Censys/Shodan のような全ネット走査サイトで「このソフトを
+    # 動かしている家」の一覧が作れてしまう。アプリは名前ではなく指紋(SHA-256)で照合
+    # するので、名前は意味のないランダム文字列でよい。
+    # （既にある証明書は作り直さない。作り直すと指紋が変わり、ペアリング済みの端末が
+    #   繋がらなくなるため。新しく入れた人から順に効く）
+    subject = issuer = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, secrets.token_hex(8))])
     cert = (
         x509.CertificateBuilder()
         .subject_name(subject)
@@ -1115,6 +1125,15 @@ def _discovery_responder() -> None:
         except OSError:
             break
         if data.strip() != DISCOVERY_PROBE:
+            continue
+        # 応答には部屋IDと登録用ノンスが入る。PCがグローバルアドレスを直接持つ回線や
+        # DMZ設定だとインターネットから問い合わせが届いてしまうので、LANの外
+        # （グローバルアドレス）からの問い合わせには答えない。小さな問い合わせに大きな
+        # 応答を返す性質があり、送信元を偽った反射攻撃の踏み台にもなりうる。
+        try:
+            if ipaddress.ip_address(addr[0]).is_global:
+                continue
+        except ValueError:
             continue
         try:
             sock.sendto(json.dumps(_connection_info(addr[0])).encode("utf-8"), addr)
@@ -3165,6 +3184,12 @@ _external_ipv4_port: int = 0                  # UPnPで開けた外部ポート�
 _upnp_v4: dict = {"url": "", "stype": ""}     # 探索済みWAN接続サービスのキャッシュ（再SSDP回避）
 _upnp_cleanup_done: bool = False              # 起動後1回限りの古いArcHiveマッピング削除が済んだか
 _upnp_fresh_add_done: bool = False           # 起動直後の Delete→新規Add（ルーターの転送状態リセット）が済んだか
+# ポート転送の期限（秒）。毎分の監視で延長するので動いている間は閉じず、アプリが落ちたり
+# PCの電源が切れたりしても最長1時間でルーターが自分で閉じる（以前は永続=0で、使わなく
+# なった後も穴が残り続けた）。
+_UPNP_LEASE = 3600
+_upnp_permanent_only: bool = False  # ルーターが期限付きを断った（NTT系PR-400NE等は725）ので永続で登録中
+_upnp_lock = threading.Lock()       # 開放（監視スレッド）と後始末（停止・終了時）がすれ違わないように
 _http_conn_log: dict[str, str] = {}          # IP → 直前の接続種別（種別が変わった時だけログ）
 
 
@@ -3477,6 +3502,24 @@ def _upnp_open_ipv4(internal_ip: str, port: int) -> str:
                 f"<NewExternalPort>{ext_port}</NewExternalPort>"
                 "<NewProtocol>TCP</NewProtocol>")
 
+        def _add_leased(ext_port: int):
+            """期限付きで登録（延長）し、フォルトを返す（None=成功、718=既に登録あり）。
+            期限付きを断るルーター（725）では永続(0)で登録し、以降は最初から永続で登録する。
+            永続の登録はサーバー停止・アプリ終了時（_upnp_close_ipv4）と
+            アンインストール時（--uninstall-cleanup）に自分で消す。"""
+            global _upnp_permanent_only
+            lf = None
+            if not _upnp_permanent_only:
+                lf = _upnp_fault(_add(ext_port, _UPNP_LEASE))
+                if lf is None or lf[0] == "718":
+                    return lf
+            f = _upnp_fault(_add(ext_port, 0))
+            if f is None and lf is not None and lf[0] == "725":
+                _upnp_permanent_only = True
+                _log_queue.put("[IPv4] UPnP: ルーターが期限付きの登録を受け付けないため、永続で登録しました"
+                               "（サーバーの停止・終了時に自分で消します）")
+            return f
+
         def _entry(ext_port: int):
             """個別照会でその外部ポートの登録内容を返す。None = 無い/答えなかった。"""
             chk = _upnp_soap(
@@ -3569,9 +3612,7 @@ def _upnp_open_ipv4(internal_ip: str, port: int) -> str:
                 _note_conflict(ext_port)
                 return (False, None, "占有")
             if who == "mine":
-                f = _upnp_fault(_add(ext_port, 0))  # リース更新（冪等）
-                if f and f[0] != "718":
-                    _add(ext_port, 3600)  # 永続リース拒否(725)のルーター向け
+                _add_leased(ext_port)  # リース延長（冪等）
                 if _owner(ext_port) == "other":
                     _upnp_abandoned.add(ext_port)
                     return (False, None, "占有")
@@ -3581,7 +3622,7 @@ def _upnp_open_ipv4(internal_ip: str, port: int) -> str:
                     _del(ext_port)  # 自分の古い登録（説明文完全一致・同じ機器）なので作り直す
                 except Exception:
                     pass
-            f = _upnp_fault(_add(ext_port, 0))  # 永続リース(0)優先（NTT系は有限リースを725で拒否）
+            f = _add_leased(ext_port)
             if f and f[0] == "718":
                 # 衝突と言うが登録は見えない（RemoteHost指定付きの登録やMAP-Eの許可帯外）。
                 # 奪いにいかず次の候補へ。
@@ -3590,9 +3631,7 @@ def _upnp_open_ipv4(internal_ip: str, port: int) -> str:
                     return (True, None, "")
                 return (False, None, "不明") if after == "unknown" else (False, f, "")
             elif f:
-                f = _upnp_fault(_add(ext_port, 3600))
-                if f:
-                    return (False, f, "")
+                return (False, f, "")
             # 追加が通った（フォルト無し）。これが一番確かな信号なので、照会に見えなくても
             # 開いたものとして扱う。唯一の例外は「別の機器/アプリのものになっていた」場合。
             if _owner(ext_port) == "other":
@@ -3630,9 +3669,7 @@ def _upnp_open_ipv4(internal_ip: str, port: int) -> str:
                         _del(prev)
                     except Exception:
                         pass
-                f = _upnp_fault(_add(prev, 0))
-                if f is not None and f[0] != "718":
-                    f = _upnp_fault(_add(prev, 3600))
+                f = _add_leased(prev)
                 if f is None or f[0] == "718":
                     # 通った、または「既に登録がある」。他人のものでないことは上で確かめた。
                     chosen = prev
@@ -3778,8 +3815,9 @@ def _upnp_open_ipv4(internal_ip: str, port: int) -> str:
             if prev and chosen != prev:
                 _log_queue.put(f"[IPv4] UPnP: 外部ポートを {prev} から {chosen} に変更しました"
                                "（アプリ側は伝言板経由で新しいポートを受け取ります）")
-                # 古い方の登録はあえて消さない。PR-400NE では DeletePortMapping が
-                # 他のエントリまで巻き込んで消すことがある。
+                # 古い方の登録はここでは消さない。PR-400NE では DeletePortMapping が
+                # 他のエントリまで巻き込んで消すことがある。期限付きなら1時間で閉じ、
+                # 永続しか受け付けないルーターでもアンインストール時の掃除で消える。
             _config["upnp_external_port"] = chosen   # 次回最優先で試す（外部ポートの安定化）
             save_config(_config)                      # 再起動後もポートを記憶
 
@@ -3791,6 +3829,7 @@ def _upnp_open_ipv4(internal_ip: str, port: int) -> str:
                     f"[IPv4] UPnP: 外部ポート {chosen}→内部 {port} を自動開放しました（外部 {ext}:{chosen}）")
         _external_ipv4 = ext
         _external_ipv4_port = chosen
+        _upnp_v4["mapped"] = (chosen, internal_ip, port, my_desc)   # 停止・終了時に消す対象
         return ext
     except Exception as e:
         msg = f"[IPv4] UPnP: 失敗 ({e})"
@@ -3804,6 +3843,86 @@ def _upnp_open_ipv4(internal_ip: str, port: int) -> str:
         _external_ipv4 = ""
         _external_ipv4_port = 0
         return ""
+
+
+def _upnp_delete_if_mine(url: str, stype: str, ext_port: int,
+                         internal_ip: str, port: int, desc: str) -> bool:
+    """その外部ポートの転送が自分のものなら消す。消せたら True。
+    照会で「別の機器/アプリのもの」と分かったら触らない。PR-400NE は照会の答えが
+    当てにならない（実在する登録を無いと言う）ので、答えが無いときは消しにいく
+    （無い登録の削除はエラーが返るだけで害はない）。"""
+    chk = _upnp_soap(url, stype, "GetSpecificPortMappingEntry",
+                     "<NewRemoteHost></NewRemoteHost>"
+                     f"<NewExternalPort>{ext_port}</NewExternalPort>"
+                     "<NewProtocol>TCP</NewProtocol>")
+    if chk and _upnp_fault(chk) is None:
+        client = _upnp_g1(chk, "NewInternalClient")
+        mine = client == internal_ip and (
+            _upnp_g1(chk, "NewInternalPort") == str(port)
+            or _upnp_g1(chk, "NewPortMappingDescription") == desc)
+        if not mine:
+            return False
+    resp = _upnp_soap(url, stype, "DeletePortMapping",
+                      "<NewRemoteHost></NewRemoteHost>"
+                      f"<NewExternalPort>{ext_port}</NewExternalPort>"
+                      "<NewProtocol>TCP</NewProtocol>")
+    return bool(resp) and _upnp_fault(resp) is None
+
+
+def _upnp_close_ipv4(timeout: float = 5.0) -> None:
+    """このプロセスがUPnPで開けたIPv4の転送を消す（サーバー停止・アプリ終了時）。
+    開けっぱなしにすると、使い終わった後もルーターに穴が残り、利用者からは見えない。
+    PR-400NE は削除で他の登録を巻き込むことがあるが、それは毎分〜数分ごとに登録し直す
+    他のArcHiveやPlexなら一時的で済む。穴を残し続けるほうを重く見て、終了時に1回だけ消す。"""
+    global _external_ipv4, _external_ipv4_port
+    if not _upnp_lock.acquire(timeout=timeout):
+        _log_queue.put("[IPv4] UPnP: ポート開放の処理中だったため、転送の削除を見送りました"
+                       f"（期限付きなら最長{_UPNP_LEASE // 60}分で閉じます）")
+        return
+    try:
+        m = _upnp_v4.get("mapped")
+        url, stype = _upnp_v4.get("url", ""), _upnp_v4.get("stype", "")
+        _upnp_v4["mapped"] = None
+        _external_ipv4 = ""
+        _external_ipv4_port = 0
+        if not m or not url:
+            return
+        ext_port, internal_ip, port, desc = m
+        try:
+            ok = _upnp_delete_if_mine(url, stype, ext_port, internal_ip, port, desc)
+        except Exception:
+            ok = False
+        _log_queue.put(f"[IPv4] UPnP: 外部ポート {ext_port} の転送を" +
+                       ("閉じました" if ok else
+                        "閉じられませんでした（ルーターが応答しないか、既に閉じています）"))
+    finally:
+        _upnp_lock.release()
+
+
+def _upnp_cleanup_for_uninstall(cfg: dict) -> int:
+    """アンインストール時: この設定の待受ポートで登録したArcHiveの転送をルーターから全部消す。
+    以前の版が永続で登録した分や、外部ポートを切り替えたときの古い登録もここで拾う。"""
+    port = int(cfg.get("port", 8765) or 8765)
+    desc = f"{_UPNP_MAP_DESC}:{port}"
+    ip = get_local_ip()
+    url, stype = _upnp_discover_wan_ipv4()
+    if not url:
+        return 0
+    targets: set = set()
+    prev = int(cfg.get("upnp_external_port", 0) or 0)
+    if prev:
+        targets.add(prev)
+    for i in range(64):   # 先に全件読む（消しながら読むと番号がずれる）
+        chk = _upnp_soap(url, stype, "GetGenericPortMappingEntry",
+                         f"<NewPortMappingIndex>{i}</NewPortMappingIndex>")
+        if not chk or _upnp_fault(chk) is not None:
+            break
+        ext = _upnp_g1(chk, "NewExternalPort")
+        if (_upnp_g1(chk, "NewPortMappingDescription") == desc
+                and _upnp_g1(chk, "NewInternalClient") == ip and ext.isdigit()):
+            targets.add(int(ext))
+    return sum(1 for p in sorted(targets)
+               if _upnp_delete_if_mine(url, stype, p, ip, port, desc))
 
 
 def _ipv6_monitor_thread() -> None:
@@ -3848,7 +3967,12 @@ def _ipv6_monitor_thread() -> None:
             changed = True
 
         # IPv4は毎ループ呼び出し＝ポートマッピングのリース更新も兼ねる（設定OFF/非対応なら""）。
-        ext_v4 = _upnp_open_ipv4(get_local_ip(), port)
+        # 停止・終了の後始末（_upnp_close_ipv4）とすれ違って開け直さないよう、ロックの中で
+        # 停止フラグを見てから開ける。
+        with _upnp_lock:
+            if not _ipv6_monitor_running:
+                break
+            ext_v4 = _upnp_open_ipv4(get_local_ip(), port)
         if (ext_v4, _external_ipv4_port) != (last_ipv4, last_ipv4_port):
             last_ipv4 = ext_v4
             last_ipv4_port = _external_ipv4_port
@@ -3873,6 +3997,55 @@ def _ipv6_monitor_thread() -> None:
             if not _ipv6_monitor_running:
                 break
             time.sleep(1)
+
+
+# ─── 新しい版の通知 ─────────────────────────────────────────────────────────────
+# 外からの接続を受けるソフトは、古い部品（Python/OpenSSL/uvicorn）のまま動き続けるのが
+# 一番危ない。自動で入れ替えまではしないが、新しい版が出たことは必ず目に入るようにする。
+_UPDATE_API  = "https://api.github.com/repos/tozionsdoor/ComicServer/releases/latest"
+_UPDATE_PAGE = "https://github.com/tozionsdoor/ComicServer/releases/latest"
+_update_started: bool = False
+_update_latest: str = ""          # 見つかった新しい版（例 "v1.2.3"）。無ければ空
+
+
+def _version_tuple(v: str) -> tuple:
+    return tuple(int(x) for x in re.findall(r"\d+", v)[:3])
+
+
+def _fetch_latest_release() -> str:
+    """GitHubの最新リリースのタグを返す。取れなければ空。送るのは問い合わせだけ。"""
+    req = urllib.request.Request(_UPDATE_API, headers={
+        "User-Agent": f"ArcHiveServer/{APP_VERSION}",
+        "Accept": "application/vnd.github+json"})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        data = json.loads(r.read(2 * 1024 * 1024).decode("utf-8", "replace"))
+    if not isinstance(data, dict) or data.get("draft") or data.get("prerelease"):
+        return ""
+    return str(data.get("tag_name") or "")
+
+
+def start_update_check(on_found) -> None:
+    """起動1分後と以後1日1回、新しい版を確かめる。見つかったら on_found(tag) を呼ぶ。"""
+    global _update_started
+    if _update_started or not _config.get("update_check", True):
+        return
+    _update_started = True
+
+    def _loop():
+        global _update_latest
+        time.sleep(60)
+        while True:
+            try:
+                tag = _fetch_latest_release()
+                if tag and _version_tuple(tag) > _version_tuple(APP_VERSION) and tag != _update_latest:
+                    _update_latest = tag
+                    _log_queue.put(f"[更新] 新しい版 {tag} が公開されています（今は v{APP_VERSION}）。"
+                                   f"安全のため更新してください: {_UPDATE_PAGE}")
+                    on_found(tag)
+            except Exception:
+                pass   # オフライン等。次の日にまた確かめる
+            time.sleep(24 * 3600)
+    threading.Thread(target=_loop, daemon=True).start()
 
 
 def start_ipv6_monitor() -> None:
@@ -3901,8 +4074,9 @@ class _UvicornThread(threading.Thread):
         # 「Connection closed before full header was received」で即死するため、
         # 書棚を眺めてから本を開いた時の1ページ目がブロークンアイコンになっていた。
         # クライアントの保持時間より長くして、切るのは常にクライアント側にする。
+        # server_header=False: 全応答の「server: uvicorn」を出さない（走査サイトの目印になる）
         kw: dict = dict(host=host, port=port, log_config=None,
-                        timeout_keep_alive=75)
+                        timeout_keep_alive=75, server_header=False)
         if ssl_certfile and ssl_keyfile:
             kw["ssl_certfile"] = ssl_certfile
             kw["ssl_keyfile"]  = ssl_keyfile
@@ -4002,7 +4176,8 @@ class App(tk.Tk):
         self._build()
         self._update_dir_list()
         self._update_device_list()
-        self._log(f"MangaServer 起動 | Python {sys.version.split()[0]}")
+        self._log(f"MangaServer v{APP_VERSION} 起動 | Python {sys.version.split()[0]}")
+        start_update_check(lambda tag: self.after(0, lambda: self._show_update(tag)))
         if not UNRAR_AVAILABLE:
             self._log(f"[警告] WinRAR が見つかりません（RAR/CBR は使用不可）: {UNRAR_PATH}")
         self.after(2000, self._poll_devices)
@@ -4039,9 +4214,14 @@ class App(tk.Tk):
                                      font=("Yu Gothic UI", 10))
         self._status_lbl.grid(row=0, column=2, sticky="w")
 
+        # 新しい版があるときだけ出す（start_update_check から）
+        self._update_lbl = tk.Label(f, text="", bg="#f9e2af", fg=PANEL,
+                                    font=("Yu Gothic UI", 9, "bold"), cursor="hand2")
+        self._update_lbl.bind("<Button-1>", lambda e: webbrowser.open(_UPDATE_PAGE))
+
         help_lbl = tk.Label(f, text=" ？ ", bg=ACCENT, fg=PANEL,
                             font=("Yu Gothic UI", 10, "bold"), cursor="hand2")
-        help_lbl.grid(row=0, column=3, padx=14, sticky="e")
+        help_lbl.grid(row=0, column=4, padx=14, sticky="e")
         help_lbl.bind("<Button-1>", lambda e: self._open_help())
 
     def _build_main(self):
@@ -4688,6 +4868,7 @@ class App(tk.Tk):
             _server_thread.stop()
             _server_thread = None
         _ipv6_monitor_running = False   # IPv6監視スレッドを停止
+        threading.Thread(target=_upnp_close_ipv4, daemon=True).start()   # ルーターの転送も閉じる
         self._dot.configure(fg=FG_RED)
         self._status_lbl.configure(text="停止中", fg=FG_DIM)
         self._start_btn.configure(state=tk.NORMAL)
@@ -4764,6 +4945,17 @@ class App(tk.Tk):
             threading.Thread(target=self._tray.run, daemon=True).start()
         self._log("システムトレイに格納しました（トレイアイコンから復帰）")
 
+    def _show_update(self, tag: str) -> None:
+        """新しい版があることをヘッダーとトレイ通知で知らせる。"""
+        self._update_lbl.configure(text=f" 新しい版 {tag} があります（クリックで開く） ")
+        self._update_lbl.grid(row=0, column=3, padx=(8, 0), sticky="e")
+        if self._tray is not None:
+            try:
+                self._tray.notify(f"新しい版 {tag} が公開されています。安全のため更新してください。",
+                                  "ArcHive Server")
+            except Exception:
+                pass
+
     def _open_help(self):
         help_src = _app_dir() / "help.html"
         if help_src.exists():
@@ -4793,8 +4985,12 @@ class App(tk.Tk):
             except Exception: pass
             self._tray = None
         # Firebase の presence ノードを削除してから終了（蓄積防止）
-        global _server_thread, _signaling_running
+        global _server_thread, _signaling_running, _ipv6_monitor_running
         _signaling_running = False
+        _ipv6_monitor_running = False
+        # ルーターに開けた転送を閉じる（presence削除と並行。最大約5秒）
+        upnp_t = threading.Thread(target=_upnp_close_ipv4, daemon=True)
+        upnp_t.start()
         if _signaling_auth:
             def _delete_presence():
                 try:
@@ -4809,6 +5005,7 @@ class App(tk.Tk):
             t = threading.Thread(target=_delete_presence, daemon=True)
             t.start()
             t.join(timeout=3)   # 最大3秒待って終了
+        upnp_t.join(timeout=6)
         if _server_thread:
             try: _server_thread.stop()
             except Exception: pass
@@ -4938,12 +5135,46 @@ def _start_ipc_listener(app: App) -> None:
                     conn.close()
                 if b"show" in data:
                     app.after(0, app._show_window)
+                elif b"quit" in data:   # アンインストーラーから（--uninstall-cleanup）
+                    app.after(0, app._quit_app)
             except Exception:
                 break  # ソケットが閉じられた（アプリ終了）
     threading.Thread(target=_listen, daemon=True).start()
 
 
+UNINSTALL_CLEANUP_ARG = "--uninstall-cleanup"
+
+
+def _run_uninstall_cleanup() -> int:
+    """アンインストーラーから呼ばれる。動いているサーバーを終了させ、ルーターに開けた
+    転送を消す。何が起きてもアンインストールは止めない（常に0を返す）。"""
+    try:   # 動いていれば終了してもらう（終了処理の中でも転送を閉じる）
+        s = socket.create_connection(("127.0.0.1", _SINGLE_INSTANCE_PORT), timeout=2)
+        s.sendall(b"quit\n")
+        s.close()
+        # 終了まで待つ（フォルダのロックファイルは終了時に閉じられ、閉じるまで消せない）
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            try:
+                FOLDER_LOCK_PATH.unlink(missing_ok=True)
+                break
+            except OSError:
+                time.sleep(0.3)
+    except OSError:
+        pass
+    try:
+        if CONFIG_PATH.exists():
+            cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+            if isinstance(cfg, dict):
+                _upnp_cleanup_for_uninstall(cfg)
+    except Exception:
+        pass
+    return 0
+
+
 if __name__ == "__main__":
+    if UNINSTALL_CLEANUP_ARG in sys.argv[1:]:
+        sys.exit(_run_uninstall_cleanup())
     if not _acquire_single_instance():
         sys.exit(0)
     # 起動中にフォルダごと移動されると、設定の保存先を見失ったまま動き続けてしまう。

@@ -3,7 +3,7 @@
 ; Build:  build_archive_setup_inno.bat  ->  dist\ArcHive_Setup.exe
 
 #define AppName "ArcHive Server"
-#define AppVersion "1.2.1"
+#define AppVersion "1.2.2"
 #define AppPublisher "ArcHive"
 #define AppExeName "ArcHiveServer.exe"
 
@@ -64,6 +64,12 @@ Type: files;          Name: "{userstartup}\ArcHiveServer.lnk"
 ;  しておき、万一USERPROFILEが空でもドライブ直下を消しにいかないようにする)
 Type: filesandordirs; Name: "{%USERPROFILE|C:\__no_such_dir__}\.manga_server"
 Type: dirifempty;     Name: "{app}"
+
+[UninstallRun]
+; 動いているサーバーを終了させ、UPnPでルーターに開けたポート転送を消す。
+; ルーターによっては期限付きの転送を受け付けず永続で登録しているので、ここで消さないと
+; アンインストール後もルーターに穴が残る。失敗してもアンインストールは止まらない。
+Filename: "{app}\{#AppExeName}"; Parameters: "--uninstall-cleanup"; Flags: runhidden waituntilterminated; RunOnceId: "ArcHiveUninstallCleanup"
 
 [Run]
 Filename: "{app}\{#AppExeName}"; Description: "ArcHive Server を起動する"; Flags: nowait postinstall skipifsilent
