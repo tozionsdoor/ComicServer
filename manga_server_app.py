@@ -2187,6 +2187,8 @@ def status(request: Request, _: str = Depends(_check_auth)):
         "books": len(_books),
         "unrar": UNRAR_AVAILABLE,
         "version": "1.0",
+        # 認証後だけ返す（認証前の応答には版を出さない＝目印削減の方針を維持）。
+        "server_version": APP_VERSION,
     }
 
 @api.get("/api/books")
@@ -2582,6 +2584,19 @@ def _push_id_time_ms(sid: str) -> int | None:
         return None
 
 
+def _offer_is_datachannel_only(offer_sdp) -> bool:
+    """offer が DataChannel(m=application) だけか。
+
+    アプリは本の転送に DataChannel しか使わない。映像・音声(m=audio/m=video)を含む
+    offer はアプリ以外からのものなので、aiortc のメディア処理（コーデック解析）に
+    渡さず捨てる。m= 行が1つも無いもの・文字列でないものも捨てる。
+    """
+    if not isinstance(offer_sdp, str):
+        return False
+    mlines = [l.strip() for l in offer_sdp.splitlines() if l.strip().startswith("m=")]
+    return bool(mlines) and all(l.startswith("m=application ") for l in mlines)
+
+
 def _offer_origin(offer_sdp: str) -> str:
     """offer SDP の ICE candidate から接続元を要約（自分のLAN端末か外部かの判別材料）。"""
     pub, lan, mdns = set(), set(), False
@@ -2670,7 +2685,9 @@ def _handle_dc_request(message: bytes | str) -> bytes:
     try:
         if req_type == "status":
             return _dc_response(req_id, 200, "application/json",
-                                json.dumps({"service": "comicserver", "version": "2.0"}).encode())
+                                json.dumps({"service": "comicserver", "version": "2.0",
+                                            # 認証後だけ返す。アプリが「PCサーバーを更新して」を出す材料。
+                                            "server_version": APP_VERSION}).encode())
 
         if req_type == "connection_info":
             return _dc_response(req_id, 200, "application/json",
@@ -2966,6 +2983,13 @@ async def _signaling_loop_async(api_key: str, db_url: str, room_id: str, gen: in
             if ts is not None and time.time() * 1000 - ts > 90_000:
                 _log_queue.put(f"[WebRTC] 古いセッションを破棄: {sid[:8]}")
                 _signaling_beat("古いセッション削除中")
+                await loop.run_in_executor(None, lambda s=sid: _fb_delete_retry(
+                    db_url, f"rooms/{room_id}/sessions/{s}", auth))
+                continue
+            # 映像・音声を含む offer はアプリのものではない → 応答せず破棄する。
+            if not _offer_is_datachannel_only(offer_sdp):
+                _log_queue.put(f"[WebRTC] 映像/音声を含むofferを拒否: {sid[:8]}")
+                _signaling_beat("不正offer削除中")
                 await loop.run_in_executor(None, lambda s=sid: _fb_delete_retry(
                     db_url, f"rooms/{room_id}/sessions/{s}", auth))
                 continue
