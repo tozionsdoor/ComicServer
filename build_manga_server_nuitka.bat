@@ -4,6 +4,11 @@ setlocal
 rem Nuitka build script for ArcHiveServer (Python 3.14 + ziglang)
 set NUITKA_PY=C:\Users\taka\AppData\Local\Programs\Python\Python313\python.exe
 set WORK_DIR=%~dp0
+rem Nuitka's work dir (thousands of generated C and object files) lives on the local
+rem C: drive. This project sits on the NAS share (Z:), and writing the build tree
+rem there over SMB made the build crawl and slowed the NAS for everyone else.
+rem Only the finished exe folder is copied back to dist\ArcHiveServer at the end.
+set BUILD_DIR=%LOCALAPPDATA%\NuitkaBuild\ArcHiveServer
 
 rem Nuitka's default for the zig backend embeds the constants blob with the C23
 rem "#embed" directive. zig's compile cache does not hash the embedded file, and the
@@ -34,9 +39,13 @@ echo NOTE: First run compiles everything to C. This takes 20-40 min.
 echo.
 cd /d "%WORK_DIR%"
 
-rem Clean old builds
+rem Clean old builds. %BUILD_DIR%\manga_server_app.build is kept so Nuitka can reuse it.
 if exist dist\ArcHiveServer         rmdir /s /q dist\ArcHiveServer
-if exist dist\manga_server_app.dist rmdir /s /q dist\manga_server_app.dist
+rem Leftovers from when the work dir was dist\ on Z:
+if exist dist\manga_server_app.dist  rmdir /s /q dist\manga_server_app.dist
+if exist dist\manga_server_app.build rmdir /s /q dist\manga_server_app.build
+if exist "%BUILD_DIR%\manga_server_app.dist" rmdir /s /q "%BUILD_DIR%\manga_server_app.dist"
+if not exist "%BUILD_DIR%" mkdir "%BUILD_DIR%"
 
 echo Stripping av's Cython pure-mode .py sources so Nuitka can't pick them...
 "%NUITKA_PY%" nuitka_strip_av_cython.py strip
@@ -47,7 +56,7 @@ echo Stripping av's Cython pure-mode .py sources so Nuitka can't pick them...
   --assume-yes-for-downloads ^
   --windows-console-mode=disable ^
   --windows-icon-from-ico=assets\icon\app_icon.ico ^
-  --output-dir=dist ^
+  --output-dir="%BUILD_DIR%" ^
   --output-filename=ArcHiveServer.exe ^
   --enable-plugin=tk-inter ^
   --include-data-dir=assets/icon=assets/icon ^
@@ -81,13 +90,15 @@ echo Restoring av's Cython pure-mode .py sources...
 if not "%BUILD_RESULT%"=="0" ( echo. & echo === Nuitka Build FAILED === & pause & exit /b 1 )
 
 echo.
-echo [3/3] Renaming output folder to ArcHiveServer...
-if exist dist\manga_server_app.dist (
-    rename dist\manga_server_app.dist ArcHiveServer
-    echo Renamed OK
-) else (
-    echo WARNING: dist\manga_server_app.dist not found. Check output manually.
+echo [3/3] Copying the built folder to dist\ArcHiveServer...
+if not exist "%BUILD_DIR%\manga_server_app.dist" (
+    echo WARNING: %BUILD_DIR%\manga_server_app.dist not found. Check output manually.
+    pause & exit /b 1
 )
+robocopy "%BUILD_DIR%\manga_server_app.dist" dist\ArcHiveServer /E /NFL /NDL /NJH /NJS /NP > nul
+rem robocopy: 0-7 = success, 8 and up = failure
+if errorlevel 8 ( echo Copy FAILED & pause & exit /b 1 )
+echo Copied OK
 
 rem Copy UnRAR.exe if available
 if exist "C:\Program Files\WinRAR\UnRAR.exe" (
